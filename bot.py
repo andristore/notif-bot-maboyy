@@ -20,6 +20,13 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 CHECK_INTERVAL = max(60, int(os.getenv("CHECK_INTERVAL", "120")))
 DB_PATH = os.getenv("DB_PATH", "live_notifier.db")
 
+# Server Discord owner/support yang wajib diikuti oleh owner server pengguna.
+# Contoh:
+# REQUIRED_GUILD_ID=123456789012345678
+# REQUIRED_GUILD_INVITE=https://discord.gg/xxxxxx
+REQUIRED_GUILD_ID = int(os.getenv("REQUIRED_GUILD_ID", "0") or 0)
+REQUIRED_GUILD_INVITE = os.getenv("REQUIRED_GUILD_INVITE", "").strip()
+
 OWNER_IDS = {
     int(x.strip())
     for x in os.getenv("OWNER_IDS", "").split(",")
@@ -33,7 +40,7 @@ logging.basicConfig(
 log = logging.getLogger("hi-notifku")
 
 intents = discord.Intents.default()
-intents.message_content = True
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 http: Optional[aiohttp.ClientSession] = None
@@ -557,6 +564,162 @@ def update_tiktok_post_state(
         conn.commit()
 
 
+
+# ============================================================
+# REQUIRED OWNER/SUPPORT SERVER MEMBERSHIP
+# ============================================================
+
+async def is_user_in_required_guild(user_id: int) -> bool:
+    """
+    True bila user merupakan member server owner/support.
+    Jika REQUIRED_GUILD_ID=0, fitur gate dinonaktifkan.
+    """
+    if not REQUIRED_GUILD_ID:
+        return True
+
+    required_guild = bot.get_guild(REQUIRED_GUILD_ID)
+
+    if required_guild is None:
+        log.error(
+            "REQUIRED_GUILD_ID=%s tetapi bot tidak berada di server tersebut.",
+            REQUIRED_GUILD_ID
+        )
+        return False
+
+    member = required_guild.get_member(user_id)
+
+    if member is not None:
+        return True
+
+    try:
+        member = await required_guild.fetch_member(user_id)
+        return member is not None
+    except discord.NotFound:
+        return False
+    except discord.Forbidden:
+        log.error(
+            "Tidak dapat fetch member di required guild. "
+            "Aktifkan Server Members Intent dan pastikan bot berada di server owner."
+        )
+        return False
+    except discord.HTTPException as exc:
+        log.warning(
+            "Gagal cek membership user_id=%s: %s",
+            user_id,
+            exc
+        )
+        return False
+
+
+async def is_guild_owner_verified(guild: discord.Guild) -> bool:
+    return await is_user_in_required_guild(guild.owner_id)
+
+
+def required_join_text() -> str:
+    if REQUIRED_GUILD_INVITE:
+        return (
+            "🔒 **Akses Hi Notifku terkunci**\\n"
+            "Owner server ini wajib bergabung ke server Discord Owner/Support terlebih dahulu.\\n\\n"
+            f"➡️ Join: {REQUIRED_GUILD_INVITE}\\n\\n"
+            "Setelah join, coba lagi menu/command."
+        )
+
+    return (
+        "🔒 **Akses Hi Notifku terkunci**\\n"
+        "Owner server ini wajib bergabung ke server Discord Owner/Support terlebih dahulu.\\n"
+        "Link invite support belum dikonfigurasi oleh pemilik bot."
+    )
+
+
+async def require_guild_owner_membership(
+    interaction: discord.Interaction
+) -> bool:
+    """
+    Gate fitur server.
+    Global bot owner selalu boleh mengakses.
+    """
+    if is_global_owner_user(interaction.user.id):
+        return True
+
+    guild = interaction.guild
+
+    if guild is None:
+        return True
+
+    verified = await is_guild_owner_verified(guild)
+
+    if verified:
+        return True
+
+    message = required_join_text()
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message,
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message,
+            ephemeral=True
+        )
+
+    return False
+
+
+async def send_required_join_notice(guild: discord.Guild):
+    """
+    Kirim notice ketika bot baru masuk server tetapi owner server belum join support.
+    """
+    if not REQUIRED_GUILD_ID:
+        return
+
+    if await is_guild_owner_verified(guild):
+        return
+
+    channel = guild.system_channel
+
+    if channel is None:
+        # Cari text channel pertama yang bisa ditulis bot
+        me = guild.me
+        for candidate in guild.text_channels:
+            if me is None:
+                continue
+            perms = candidate.permissions_for(me)
+            if perms.view_channel and perms.send_messages:
+                channel = candidate
+                break
+
+    if channel is None:
+        return
+
+    try:
+        embed = discord.Embed(
+            title="🔒 Hi Notifku • Verifikasi Wajib",
+            description=required_join_text(),
+            color=discord.Color.orange()
+        )
+        embed.add_field(
+            name="Owner Server",
+            value=f"<@{guild.owner_id}>",
+            inline=False
+        )
+        embed.set_footer(
+            text="Setelah owner server join Discord support, fitur akan terbuka otomatis."
+        )
+
+        await channel.send(
+            content=f"<@{guild.owner_id}>",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=True)
+        )
+    except Exception:
+        log.exception(
+            "Gagal mengirim required join notice ke guild %s",
+            guild.id
+        )
+
+
 # ============================================================
 # PERMISSION
 # ============================================================
@@ -580,23 +743,31 @@ def is_owner_or_admin(interaction: discord.Interaction) -> bool:
 
 
 async def require_owner_or_admin(interaction: discord.Interaction) -> bool:
-    if is_owner_or_admin(interaction):
+    if not is_owner_or_admin(interaction):
+        message = "❌ Menu ini hanya dapat digunakan oleh **Owner/Admin**."
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
+
+        return False
+
+    # Global bot owner bypass gate.
+    if is_global_owner_user(interaction.user.id):
         return True
 
-    message = "❌ Menu ini hanya dapat digunakan oleh **Owner/Admin**."
+    # Untuk command/menu di server, owner server wajib join support server.
+    if not await require_guild_owner_membership(interaction):
+        return False
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True
-        )
-
-    return False
+    return True
 
 
 # ============================================================
@@ -1270,8 +1441,8 @@ def dashboard_embed(guild_id: int):
     embed = discord.Embed(
         title="🔔 Hi Notifku",
         description=(
-            "Kelola notifikasi **YouTube Live Stream**, **TikTok LIVE**, "
-            "dan **postingan TikTok baru** menggunakan tombol di bawah."
+            "Kelola **host** dan **channel notifikasi** di sini. "
+            "Tombol test tersedia di panel masing-masing host."
         ),
         color=discord.Color.blue()
     )
@@ -2035,111 +2206,7 @@ class DashboardView(discord.ui.View):
                     ephemeral=True
                 )
 
-    @discord.ui.button(
-        label="Test YouTube",
-        emoji="📺",
-        style=discord.ButtonStyle.danger,
-        custom_id="hi_notifku:test_youtube",
-        row=1
-    )
-    async def test_youtube_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if not await require_owner_or_admin(interaction):
-            return
 
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
-        ok = await send_live_notification(
-            interaction.guild_id,
-            "youtube",
-            "Test Creator",
-            "Test YouTube Live Stream",
-            "https://www.youtube.com/"
-        )
-
-        await interaction.followup.send(
-            (
-                "✅ Test YouTube dikirim."
-                if ok
-                else
-                "❌ Atur channel YouTube terlebih dahulu."
-            ),
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Test Post TikTok",
-        emoji="🆕",
-        style=discord.ButtonStyle.danger,
-        custom_id="hi_notifku:test_tiktok_post",
-        row=2
-    )
-    async def test_tiktok_post_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if not await require_owner_or_admin(interaction):
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        ok = await send_tiktok_post_notification(
-            guild_id=interaction.guild_id,
-            username="testcreator",
-            post_id="TEST123",
-            post_url="https://www.tiktok.com/",
-            description="Ini adalah contoh notifikasi postingan TikTok baru."
-        )
-
-        await interaction.followup.send(
-            "✅ Test postingan TikTok dikirim."
-            if ok else
-            "❌ Atur channel TikTok terlebih dahulu.",
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Test TikTok",
-        emoji="🎵",
-        style=discord.ButtonStyle.danger,
-        custom_id="hi_notifku:test_tiktok",
-        row=1
-    )
-    async def test_tiktok_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if not await require_owner_or_admin(interaction):
-            return
-
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
-        ok = await send_live_notification(
-            interaction.guild_id,
-            "tiktok",
-            "testcreator",
-            "Test TikTok LIVE",
-            "https://www.tiktok.com/"
-        )
-
-        await interaction.followup.send(
-            (
-                "✅ Test TikTok dikirim."
-                if ok
-                else
-                "❌ Atur channel TikTok terlebih dahulu."
-            ),
-            ephemeral=True
-        )
 
 
 # ============================================================
@@ -2324,6 +2391,16 @@ def dm_server_embed(guild: discord.Guild):
     embed.add_field(name="📺 Channel YouTube", value=yt_channel, inline=False)
     embed.add_field(name="🎵 Channel TikTok", value=tt_channel, inline=False)
     embed.add_field(name="🔔 Mention Role", value=role, inline=False)
+
+    if REQUIRED_GUILD_ID:
+        embed.add_field(
+            name="🔐 Required Discord",
+            value=(
+                f"Server ID: `{REQUIRED_GUILD_ID}`\n"
+                "Owner server pengguna wajib menjadi member."
+            ),
+            inline=False
+        )
 
     embed.set_footer(text="Hi Notifku • Owner DM Control")
     return embed
@@ -2558,78 +2635,171 @@ class OwnerAddHostModal(discord.ui.Modal):
 
 class OwnerHostActionsView(discord.ui.View):
     def __init__(self, guild_id: int, host_id: int):
-        super().__init__(timeout=600)
+        super().__init__(timeout=900)
         self.guild_id = guild_id
         self.host_id = host_id
 
-    @discord.ui.button(
-        label="Test",
-        emoji="🧪",
-        style=discord.ButtonStyle.success
-    )
-    async def test_host(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+        row = get_host(host_id)
+
+        # Test hanya ada di panel host yang benar-benar terdaftar.
+        if row:
+            if row["platform"] == "tiktok":
+                live_btn = discord.ui.Button(
+                    label="Test LIVE",
+                    emoji="🧪",
+                    style=discord.ButtonStyle.success,
+                    row=0
+                )
+                live_btn.callback = self.test_tiktok_live_callback
+                self.add_item(live_btn)
+
+                post_btn = discord.ui.Button(
+                    label="Test Post",
+                    emoji="🆕",
+                    style=discord.ButtonStyle.success,
+                    row=0
+                )
+                post_btn.callback = self.test_tiktok_post_callback
+                self.add_item(post_btn)
+
+            elif row["platform"] == "youtube":
+                live_btn = discord.ui.Button(
+                    label="Test LIVE",
+                    emoji="🧪",
+                    style=discord.ButtonStyle.success,
+                    row=0
+                )
+                live_btn.callback = self.test_youtube_live_callback
+                self.add_item(live_btn)
+
+        pause_btn = discord.ui.Button(
+            label="Pause / Resume",
+            emoji="⏯️",
+            style=discord.ButtonStyle.secondary,
+            row=1
+        )
+        pause_btn.callback = self.toggle_host_callback
+        self.add_item(pause_btn)
+
+        delete_btn = discord.ui.Button(
+            label="Hapus",
+            emoji="🗑️",
+            style=discord.ButtonStyle.danger,
+            row=1
+        )
+        delete_btn.callback = self.delete_host_callback
+        self.add_item(delete_btn)
+
+        back_btn = discord.ui.Button(
+            label="Kembali",
+            emoji="⬅️",
+            style=discord.ButtonStyle.secondary,
+            row=2
+        )
+        back_btn.callback = self.back_callback
+        self.add_item(back_btn)
+
+        home_btn = discord.ui.Button(
+            label="Menu Awal",
+            emoji="🏠",
+            style=discord.ButtonStyle.secondary,
+            row=2
+        )
+        home_btn.callback = self.home_callback
+        self.add_item(home_btn)
+
+    async def _validate_owner_and_host(self, interaction: discord.Interaction):
         if not await require_global_owner_dm(interaction):
-            return
+            return None
 
         row = get_host(self.host_id)
 
         if not row or row["guild_id"] != self.guild_id:
-            await interaction.response.send_message(
-                "❌ Host tidak ditemukan.",
-                ephemeral=True
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Host tidak ditemukan.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Host tidak ditemukan.",
+                    ephemeral=True
+                )
+            return None
+
+        return row
+
+    async def test_tiktok_live_callback(self, interaction: discord.Interaction):
+        row = await self._validate_owner_and_host(interaction)
+        if row is None:
             return
 
         await interaction.response.defer(ephemeral=True)
 
-        if row["platform"] == "youtube":
-            ok = await send_live_notification(
-                self.guild_id,
-                "youtube",
-                row["display_name"] or row["target"],
-                "Test YouTube Live Stream",
-                "https://www.youtube.com/"
-            )
-        else:
-            ok = await send_live_notification(
-                self.guild_id,
-                "tiktok",
-                row["target"],
-                "Test TikTok LIVE",
-                f"https://www.tiktok.com/@{row['target']}/live"
-            )
+        ok = await send_live_notification(
+            self.guild_id,
+            "tiktok",
+            row["target"],
+            "Test TikTok LIVE",
+            f"https://www.tiktok.com/@{row['target']}/live"
+        )
 
         await interaction.followup.send(
-            "✅ Test notifikasi berhasil dikirim."
+            "✅ Test LIVE host TikTok berhasil dikirim."
             if ok else
-            "❌ Channel belum diatur atau bot tidak dapat mengirim ke channel.",
+            "❌ Channel TikTok belum diatur atau bot tidak dapat mengirim.",
             ephemeral=True
         )
 
-    @discord.ui.button(
-        label="Pause / Resume",
-        emoji="⏯️",
-        style=discord.ButtonStyle.secondary
-    )
-    async def toggle_host_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if not await require_global_owner_dm(interaction):
+    async def test_tiktok_post_callback(self, interaction: discord.Interaction):
+        row = await self._validate_owner_and_host(interaction)
+        if row is None:
             return
 
-        row = get_host(self.host_id)
+        await interaction.response.defer(ephemeral=True)
 
-        if not row or row["guild_id"] != self.guild_id:
-            await interaction.response.send_message(
-                "❌ Host tidak ditemukan.",
-                ephemeral=True
-            )
+        username = row["target"].lstrip("@")
+
+        ok = await send_tiktok_post_notification(
+            guild_id=self.guild_id,
+            username=username,
+            post_id="TEST123",
+            post_url=f"https://www.tiktok.com/@{username}",
+            description=f"Ini adalah contoh notifikasi postingan baru dari @{username}."
+        )
+
+        await interaction.followup.send(
+            "✅ Test Post host TikTok berhasil dikirim."
+            if ok else
+            "❌ Channel TikTok belum diatur atau bot tidak dapat mengirim.",
+            ephemeral=True
+        )
+
+    async def test_youtube_live_callback(self, interaction: discord.Interaction):
+        row = await self._validate_owner_and_host(interaction)
+        if row is None:
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await send_live_notification(
+            self.guild_id,
+            "youtube",
+            row["display_name"] or row["target"],
+            "Test YouTube Live Stream",
+            "https://www.youtube.com/"
+        )
+
+        await interaction.followup.send(
+            "✅ Test LIVE host YouTube berhasil dikirim."
+            if ok else
+            "❌ Channel YouTube belum diatur atau bot tidak dapat mengirim.",
+            ephemeral=True
+        )
+
+    async def toggle_host_callback(self, interaction: discord.Interaction):
+        row = await self._validate_owner_and_host(interaction)
+        if row is None:
             return
 
         enabled = toggle_host(self.host_id)
@@ -2641,26 +2811,9 @@ class OwnerHostActionsView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(
-        label="Hapus",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger
-    )
-    async def delete_host_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if not await require_global_owner_dm(interaction):
-            return
-
-        row = get_host(self.host_id)
-
-        if not row or row["guild_id"] != self.guild_id:
-            await interaction.response.send_message(
-                "❌ Host tidak ditemukan.",
-                ephemeral=True
-            )
+    async def delete_host_callback(self, interaction: discord.Interaction):
+        row = await self._validate_owner_and_host(interaction)
+        if row is None:
             return
 
         delete_host(self.host_id)
@@ -2675,6 +2828,39 @@ class OwnerHostActionsView(discord.ui.View):
         except Exception:
             pass
 
+    async def back_callback(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        guild = get_bot_guild(self.guild_id)
+
+        if guild is None:
+            await interaction.response.edit_message(
+                embed=owner_dm_home_embed(),
+                view=OwnerDMHomeView()
+            )
+            return
+
+        embed = discord.Embed(
+            title="👤 Kelola Host",
+            description=f"Server: **{guild.name}**\nPilih tindakan host di bawah.",
+            color=discord.Color.blue()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=OwnerHostMenuView(self.guild_id)
+        )
+
+    async def home_callback(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_dm_home_embed(),
+            view=OwnerDMHomeView()
+        )
+
 
 class OwnerServerPanelView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -2686,7 +2872,6 @@ class OwnerServerPanelView(discord.ui.View):
             return None
 
         guild = get_bot_guild(self.guild_id)
-
         if guild is None:
             if interaction.response.is_done():
                 await interaction.followup.send(
@@ -2703,257 +2888,59 @@ class OwnerServerPanelView(discord.ui.View):
         return guild
 
     @discord.ui.button(
-        label="Tambah Host",
-        emoji="➕",
-        style=discord.ButtonStyle.success,
-        row=0
-    )
-    async def add_host_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.send_modal(
-            OwnerAddHostModal(self.guild_id)
-        )
-
-    @discord.ui.button(
-        label="Daftar Host",
-        emoji="📋",
+        label="Kelola Host",
+        emoji="👤",
         style=discord.ButtonStyle.primary,
         row=0
     )
-    async def list_hosts_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def host_menu_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = await self.ensure_owner_and_guild(interaction)
         if guild is None:
             return
 
-        rows = get_hosts(self.guild_id)
-
-        if not rows:
-            await interaction.response.send_message(
-                f"Belum ada host untuk **{guild.name}**.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.send_message(
-            f"📋 Host **{guild.name}**: {len(rows)}",
-            ephemeral=True
+        embed = discord.Embed(
+            title="👤 Kelola Host",
+            description=f"Server: **{guild.name}**\nPilih tindakan host di bawah.",
+            color=discord.Color.blue()
         )
 
-        for row in rows:
-            await interaction.channel.send(
-                embed=host_embed(row),
-                view=OwnerHostActionsView(
-                    self.guild_id,
-                    row["id"]
-                )
-            )
-
-    @discord.ui.button(
-        label="TikTok Channel",
-        emoji="🎵",
-        style=discord.ButtonStyle.secondary,
-        row=1
-    )
-    async def tiktok_channel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.send_modal(
-            SetChannelIdModal(
-                self.guild_id,
-                "tiktok"
-            )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=OwnerHostMenuView(self.guild_id)
         )
 
     @discord.ui.button(
-        label="YouTube Channel",
-        emoji="📺",
-        style=discord.ButtonStyle.secondary,
-        row=1
+        label="Atur Notifikasi",
+        emoji="📣",
+        style=discord.ButtonStyle.primary,
+        row=0
     )
-    async def youtube_channel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def notif_menu_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = await self.ensure_owner_and_guild(interaction)
         if guild is None:
             return
 
-        await interaction.response.send_modal(
-            SetChannelIdModal(
-                self.guild_id,
-                "youtube"
-            )
+        embed = discord.Embed(
+            title="📣 Atur Notifikasi",
+            description=(
+                f"Server: **{guild.name}**\n"
+                "Atur channel TikTok, YouTube, dan mention role."
+            ),
+            color=discord.Color.blue()
         )
 
-    @discord.ui.button(
-        label="Mention Role",
-        emoji="🔔",
-        style=discord.ButtonStyle.secondary,
-        row=1
-    )
-    async def mention_role_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.send_modal(
-            SetRoleIdModal(self.guild_id)
-        )
-
-    @discord.ui.button(
-        label="Matikan Role",
-        emoji="🔕",
-        style=discord.ButtonStyle.secondary,
-        row=2
-    )
-    async def disable_role_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        set_mention_role(
-            self.guild_id,
-            None
-        )
-
-        await interaction.response.send_message(
-            f"✅ Mention role untuk **{guild.name}** dimatikan.",
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Test TikTok",
-        emoji="🧪",
-        style=discord.ButtonStyle.danger,
-        row=2
-    )
-    async def test_tiktok_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        ok = await send_live_notification(
-            self.guild_id,
-            "tiktok",
-            "testcreator",
-            "Test TikTok LIVE",
-            "https://www.tiktok.com/"
-        )
-
-        await interaction.followup.send(
-            f"✅ Test TikTok dikirim ke **{guild.name}**."
-            if ok else
-            f"❌ Channel TikTok **{guild.name}** belum diatur / tidak dapat diakses.",
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Test YouTube",
-        emoji="🧪",
-        style=discord.ButtonStyle.danger,
-        row=2
-    )
-    async def test_youtube_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        ok = await send_live_notification(
-            self.guild_id,
-            "youtube",
-            "Test Creator",
-            "Test YouTube Live Stream",
-            "https://www.youtube.com/"
-        )
-
-        await interaction.followup.send(
-            f"✅ Test YouTube dikirim ke **{guild.name}**."
-            if ok else
-            f"❌ Channel YouTube **{guild.name}** belum diatur / tidak dapat diakses.",
-            ephemeral=True
-        )
-
-    @discord.ui.button(
-        label="Test Post TikTok",
-        emoji="🆕",
-        style=discord.ButtonStyle.danger,
-        row=3
-    )
-    async def test_tiktok_post_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        guild = await self.ensure_owner_and_guild(interaction)
-        if guild is None:
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        ok = await send_tiktok_post_notification(
-            guild_id=self.guild_id,
-            username="testcreator",
-            post_id="TEST123",
-            post_url="https://www.tiktok.com/",
-            description="Ini adalah contoh notifikasi postingan TikTok baru."
-        )
-
-        await interaction.followup.send(
-            f"✅ Test postingan TikTok dikirim ke **{guild.name}**."
-            if ok else
-            f"❌ Channel TikTok **{guild.name}** belum diatur / tidak dapat diakses.",
-            ephemeral=True
+        await interaction.response.edit_message(
+            embed=embed,
+            view=OwnerNotifMenuView(self.guild_id)
         )
 
     @discord.ui.button(
         label="Refresh",
         emoji="🔄",
-        style=discord.ButtonStyle.primary,
-        row=3
+        style=discord.ButtonStyle.secondary,
+        row=1
     )
-    async def refresh_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = await self.ensure_owner_and_guild(interaction)
         if guild is None:
             return
@@ -2965,15 +2952,26 @@ class OwnerServerPanelView(discord.ui.View):
 
     @discord.ui.button(
         label="Ganti Server",
-        emoji="🔙",
+        emoji="🔁",
         style=discord.ButtonStyle.secondary,
-        row=3
+        row=1
     )
-    async def back_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def switch_server_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_dm_home_embed(),
+            view=OwnerDMHomeView()
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner_dm(interaction):
             return
 
@@ -2988,7 +2986,7 @@ def owner_dm_home_embed():
         title="🔐 Hi Notifku • Owner Control",
         description=(
             "Panel ini berada di **DM bot** dan hanya dapat digunakan oleh Owner.\n\n"
-            "Pilih server di menu bawah untuk mengelola notifikasi live."
+            "Pilih server di menu bawah. Setelah itu gunakan **Kelola Host** atau **Atur Notifikasi**."
         ),
         color=discord.Color.blue()
     )
@@ -3184,6 +3182,43 @@ async def owner_panel(
 
 
 
+
+@bot.tree.command(
+    name="owner_check",
+    description="Cek apakah akunmu terdaftar sebagai Owner Hi Notifku."
+)
+async def owner_check(interaction: discord.Interaction):
+    owner = is_global_owner_user(interaction.user.id)
+
+    embed = discord.Embed(
+        title="🔐 Hi Notifku • Owner Check",
+        color=discord.Color.green() if owner else discord.Color.red()
+    )
+
+    embed.add_field(
+        name="Discord User ID",
+        value=f"`{interaction.user.id}`",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Status",
+        value="✅ Terdaftar sebagai Owner" if owner else "❌ Belum terdaftar di OWNER_IDS",
+        inline=False
+    )
+
+    embed.add_field(
+        name="OWNER_IDS terbaca",
+        value=str(len(OWNER_IDS)),
+        inline=False
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
 # ============================================================
 # GLOBAL APP COMMAND ERROR HANDLER
 # ============================================================
@@ -3227,45 +3262,94 @@ async def on_app_command_error(
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Abaikan pesan bot.
+    # Abaikan pesan dari bot.
     if message.author.bot:
         return
 
-    # DM khusus owner: ketik menu/panel/owner untuk membuka panel.
-    if isinstance(message.channel, discord.DMChannel):
-        if not is_global_owner_user(message.author.id):
-            return
+    # Semua pesan private/DM terdeteksi dari guild=None.
+    # Tidak membaca isi pesan, jadi tidak membutuhkan Message Content Intent.
+    if message.guild is None:
+        user_id = message.author.id
 
-        content = (message.content or "").strip().lower()
+        log.info(
+            "DM received from user_id=%s owner=%s",
+            user_id,
+            is_global_owner_user(user_id)
+        )
 
-        if content in {
-            "menu",
-            "panel",
-            "owner",
-            "owner panel",
-            "owner_panel",
-            "hi notifku",
-            "notifku"
-        }:
+        # Hanya OWNER_IDS yang boleh mendapatkan panel.
+        if not is_global_owner_user(user_id):
             try:
                 await message.channel.send(
-                    embed=owner_dm_home_embed(),
-                    view=OwnerDMHomeView()
+                    "🔒 **Hi Notifku Owner Panel**\n"
+                    "Akses DM panel hanya tersedia untuk Owner Bot."
                 )
             except Exception:
-                log.exception("Gagal mengirim Owner DM Panel")
-
+                log.exception("Gagal membalas DM non-owner")
             return
 
-        # Bila owner mengirim pesan lain di DM, beri petunjuk singkat.
-        if content:
+        try:
             await message.channel.send(
-                "Ketik **menu** untuk membuka panel Owner Hi Notifku."
+                embed=owner_dm_home_embed(),
+                view=OwnerDMHomeView()
             )
-            return
+        except discord.Forbidden:
+            log.exception("Discord Forbidden saat membalas DM owner")
+        except discord.HTTPException:
+            log.exception("Discord HTTPException saat membalas DM owner")
+        except Exception:
+            log.exception("Gagal mengirim Owner DM Panel")
 
-    # Tetap proses command prefix bila suatu saat dipakai.
+        return
+
+    # Agar command prefix tetap dapat diproses di server bila diperlukan.
     await bot.process_commands(message)
+
+
+
+@bot.tree.command(
+    name="verify_join",
+    description="Cek apakah owner server sudah join Discord Owner/Support."
+)
+async def verify_join(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "❌ Command ini hanya bisa digunakan di server.",
+            ephemeral=True
+        )
+        return
+
+    if is_global_owner_user(interaction.user.id):
+        await interaction.response.send_message(
+            "✅ Kamu adalah Global Owner Bot dan tidak terkena gate.",
+            ephemeral=True
+        )
+        return
+
+    verified = await is_guild_owner_verified(interaction.guild)
+
+    if verified:
+        await interaction.response.send_message(
+            "✅ Owner server sudah terverifikasi sebagai member Discord Owner/Support. "
+            "Fitur Hi Notifku sudah terbuka.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            required_join_text(),
+            ephemeral=True
+        )
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        await send_required_join_notice(guild)
+    except Exception:
+        log.exception(
+            "Error on_guild_join guild_id=%s",
+            guild.id
+        )
 
 
 # ============================================================
