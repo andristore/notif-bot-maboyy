@@ -1,116 +1,159 @@
-# Discord Live Notifier — Button Dashboard
+# Hi Notifku Complete V4 — DM Only
 
-Versi ini dibuat agar pengelolaan bot dilakukan lewat **Discord buttons / select menu / modal**, bukan banyak slash command.
+Versi ini menggabungkan seluruh 15 pengembangan ke satu kode agar tidak ada patch/fitur ganda.
 
-## Menu Utama
+## 15 Pengembangan
 
-Jalankan:
+1. ✅ Channel & role per host
+2. ✅ Custom pesan per host (`{creator}`, `{url}`, `{platform}`)
+3. ✅ Panel host lengkap
+4. ✅ Retry/error count/cooldown otomatis
+5. ✅ Railway Volume / database persisten
+6. ✅ Activity log + log channel
+7. ✅ Free/Premium host limit
+8. ✅ Owner management + blacklist/whitelist dari DM
+9. ✅ Auto cleanup saat bot keluar server
+10. ✅ Health/status panel
+11. ✅ Notifikasi LIVE selesai
+12. ✅ Interval pengecekan per host
+13. ✅ Import host massal
+14. ✅ Backup/restore JSON
+15. ✅ Setup Wizard
 
-`/live_panel`
+## DM Only
 
-Bot menampilkan dashboard dengan tombol:
+Tidak ada slash command konfigurasi di server.
 
-- ➕ **Tambah Host**
-- 📋 **Daftar Host**
-- 📣 **Channel & Role**
-- 🔄 **Refresh**
-- 📺 **Test YouTube**
-- 🎵 **Test TikTok**
+Global Owner cukup DM bot dengan pesan apa saja.
 
-Ada juga:
+Jika bot dimention di server, bot hanya mengarahkan pengguna ke DM.
 
-`/live_panel_private`
-
-untuk membuka dashboard secara ephemeral/private.
-
-## Tampilan Host
-
-Setiap host ditampilkan sebagai kartu dengan informasi:
-
-- Account Name
-- Target
-- Status Running / Paused
-
-Tombol di setiap kartu:
-
-- ✏️ **Edit**
-- 📣 **Notif**
-- 🖱️ **Test**
-- ⏯️ **Pause / Resume**
-- 🗑️ **Hapus**
-
-Alurnya menyerupai dashboard NotifyMe, tetapi seluruh kontrol berada langsung di Discord.
-
-## Owner/Admin Only
-
-Semua button callback memeriksa permission ulang.
-
-Yang boleh mengubah:
-
-- User ID di `OWNER_IDS`
-- Administrator
-- Permission `Manage Server`
-
-Member biasa tidak dapat menggunakan tombol walaupun pesan panel terlihat.
-
-## Tambah Host
-
-Tekan:
-
-`➕ Tambah Host`
-
-Modal akan muncul.
-
-Isi:
-
-Platform:
-- `tiktok`
-- `youtube`
-
-Target:
-- TikTok: username tanpa @
-- YouTube: Channel ID diawali `UC...`
-
-## Atur Channel
-
-Tekan:
-
-`📣 Channel & Role`
-
-Akan muncul select menu:
-
-- Channel YouTube Live
-- Channel TikTok Live
-- Role yang ingin di-mention
-
-## Notifikasi
-
-YouTube:
-- Hanya dikirim saat stream benar-benar LIVE
-- Scheduled stream tidak dikirim sebelum mulai
-
-TikTok:
-- Dikirim saat status berubah dari offline -> LIVE
-- Tidak spam selama live yang sama
-
-## Setup
-
-Rename `.env.example` menjadi `.env`.
+## Railway Variables
 
 ```env
-DISCORD_TOKEN=TOKEN_BOT
-OWNER_IDS=DISCORD_USER_ID_OWNER
-YOUTUBE_API_KEY=YOUTUBE_API_KEY
+DISCORD_TOKEN=...
+OWNER_IDS=...
+YOUTUBE_API_KEY=...
+
 CHECK_INTERVAL=120
+BASE_MONITOR_TICK=30
+
+DB_PATH=/data/live_notifier.db
+
+REQUIRED_GUILD_ID=...
+REQUIRED_GUILD_INVITE=https://discord.gg/...
+
+FREE_HOST_LIMIT=5
+PREMIUM_HOST_LIMIT=100
 ```
 
-Install:
+## Railway Volume
 
-```bash
-pip install -r requirements.txt
-python bot.py
+Mount Volume ke:
+
+```text
+/data
 ```
 
-## Catatan
+dan gunakan:
 
-TikTok menggunakan library `TikTokLive`, bukan endpoint publik resmi TikTok. Jika TikTok mengubah sistem internalnya, library mungkin perlu diperbarui.
+```env
+DB_PATH=/data/live_notifier.db
+```
+
+Ini sangat disarankan supaya database host/config tidak hilang.
+
+## Discord Developer Portal
+
+Bot → Privileged Gateway Intents:
+
+- ✅ Server Members Intent
+
+Bot permissions:
+
+- View Channels
+- Send Messages
+- Embed Links
+- Read Message History
+- Mention @everyone, @here and All Roles jika memakai ping role
+
+Tidak perlu Administrator.
+
+## Free / Premium
+
+Default:
+
+- FREE: 5 host
+- PREMIUM: 100 host
+
+Bisa diubah melalui Railway:
+
+```env
+FREE_HOST_LIMIT=5
+PREMIUM_HOST_LIMIT=100
+```
+
+Global Owner dapat mengubah plan setiap server melalui DM.
+
+## Custom Pesan
+
+Placeholder:
+
+```text
+{creator}
+{url}
+{platform}
+```
+
+Contoh:
+
+```text
+🔥 {creator} lagi LIVE di {platform}!
+{url}
+```
+
+## Import Massal
+
+Format:
+
+```text
+tiktok,username1
+tiktok,username2
+youtube,UCxxxxxxxxxxxxxxxx
+```
+
+## Backup / Restore
+
+Tekan tombol **Backup** di panel server DM.
+
+Bot mengirim file `.json`.
+
+Untuk restore, kirim file JSON tersebut kembali ke DM bot.
+
+## Activity Log
+
+Atur **Log Channel** pada Default Notif.
+
+Perubahan penting dapat dicatat ke channel tersebut.
+
+## Setup Wizard
+
+DM → pilih server → **Setup Wizard**
+
+Urutan:
+
+1. TikTok Channel
+2. YouTube Channel
+3. Mention Role
+4. Tambah Host
+
+## Upgrade
+
+Replace:
+
+- `bot.py`
+- `requirements.txt`
+
+Database lama akan dimigrasikan otomatis.
+
+Setelah update GitHub, lakukan Redeploy Railway.
