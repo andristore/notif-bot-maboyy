@@ -3148,6 +3148,56 @@ class HostCardView(discord.ui.View):
         )
 
 
+
+# ============================================================
+# ONE GLOBAL SLASH COMMAND
+# ============================================================
+
+@bot.tree.command(
+    name="menu",
+    description="Buka panel lengkap Hi Notifku melalui DM."
+)
+async def menu_command(interaction: discord.Interaction):
+    # Hanya Global Owner yang memiliki akses ke panel lengkap.
+    if not is_global_owner(interaction.user.id):
+        await safe_reply(
+            interaction,
+            "🔒 Menu lengkap Hi Notifku hanya dapat digunakan oleh **Global Owner Bot**."
+        )
+        return
+
+    # Kirim panel lengkap ke DM user.
+    try:
+        dm = interaction.user.dm_channel
+        if dm is None:
+            dm = await interaction.user.create_dm()
+
+        await dm.send(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+        await safe_reply(
+            interaction,
+            "✅ **Panel lengkap Hi Notifku sudah dikirim ke DM kamu.**\n"
+            "Semua pengaturan tetap dilakukan melalui DM."
+        )
+
+    except discord.Forbidden:
+        await safe_reply(
+            interaction,
+            "❌ Saya tidak bisa mengirim DM ke akunmu.\n"
+            "Aktifkan DM dari member server, lalu jalankan `/menu` lagi."
+        )
+
+    except Exception as exc:
+        log.exception("/menu error")
+        await safe_reply(
+            interaction,
+            f"❌ Gagal membuka menu: `{type(exc).__name__}: {exc}`"
+        )
+
+
 # ============================================================
 # DM / SERVER EVENTS
 # ============================================================
@@ -3317,7 +3367,7 @@ async def on_ready():
         bot.user.id
     )
 
-    # Intentionally no slash commands. Sync empty tree to remove old bot commands.
+    # Sync exactly one global slash command: /menu.
     try:
         synced = await bot.tree.sync()
         log.info(

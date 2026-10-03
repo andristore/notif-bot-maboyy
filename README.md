@@ -157,3 +157,18 @@ Replace:
 Database lama akan dimigrasikan otomatis.
 
 Setelah update GitHub, lakukan Redeploy Railway.
+
+## Command
+
+Hi Notifku hanya memiliki **1 slash command**:
+
+```text
+/menu
+```
+
+Fungsi `/menu`:
+- hanya Global Owner yang dapat membuka panel lengkap,
+- panel lengkap dikirim ke DM,
+- pengaturan tidak dilakukan di channel server,
+- semua akses tetap melalui panel DM.
+
