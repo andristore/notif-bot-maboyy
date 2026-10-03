@@ -33,6 +33,7 @@ logging.basicConfig(
 log = logging.getLogger("hi-notifku")
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 http: Optional[aiohttp.ClientSession] = None
@@ -3090,7 +3091,7 @@ async def send_owner_dm_panel(user: discord.User | discord.Member):
 
 @bot.tree.command(
     name="owner_dm",
-    description="Kirim panel kontrol Hi Notifku ke DM Owner."
+    description="Buka/kirim panel kontrol khusus Owner."
 )
 async def owner_dm(
     interaction: discord.Interaction
@@ -3114,7 +3115,7 @@ async def owner_dm(
             )
 
             await interaction.followup.send(
-                "✅ Panel Owner sudah dikirim ke DM kamu.",
+                "✅ Panel Owner sudah dikirim ke DM. Setelah ini kamu juga bisa cukup ketik `menu` langsung di DM bot.",
                 ephemeral=True
             )
 
@@ -3221,6 +3222,50 @@ async def on_app_command_error(
             )
     except Exception:
         pass
+
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Abaikan pesan bot.
+    if message.author.bot:
+        return
+
+    # DM khusus owner: ketik menu/panel/owner untuk membuka panel.
+    if isinstance(message.channel, discord.DMChannel):
+        if not is_global_owner_user(message.author.id):
+            return
+
+        content = (message.content or "").strip().lower()
+
+        if content in {
+            "menu",
+            "panel",
+            "owner",
+            "owner panel",
+            "owner_panel",
+            "hi notifku",
+            "notifku"
+        }:
+            try:
+                await message.channel.send(
+                    embed=owner_dm_home_embed(),
+                    view=OwnerDMHomeView()
+                )
+            except Exception:
+                log.exception("Gagal mengirim Owner DM Panel")
+
+            return
+
+        # Bila owner mengirim pesan lain di DM, beri petunjuk singkat.
+        if content:
+            await message.channel.send(
+                "Ketik **menu** untuk membuka panel Owner Hi Notifku."
+            )
+            return
+
+    # Tetap proses command prefix bila suatu saat dipakai.
+    await bot.process_commands(message)
 
 
 # ============================================================
