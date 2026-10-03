@@ -3749,19 +3749,22 @@ def fmt_time(ts: Optional[int]) -> str:
 
 
 def owner_home_embed():
+    free_count = len(guilds_by_plan("free"))
+    premium_count = len(guilds_by_plan("premium"))
+
     embed = discord.Embed(
-        title="🔐 Hi Notifku • Global Owner",
-        description=(
-            "Semua pengaturan dilakukan **hanya melalui DM bot**.\n"
-            "Pilih server yang ingin dikelola."
-        ),
+        title="🔐 Hi Notifku • Owner",
+        description="Kelola server, Premium, pembayaran, dan monitor.",
         color=discord.Color.blue()
     )
-
     embed.add_field(
-        name="Server",
-        value=str(len(bot.guilds)),
-        inline=True
+        name="Ringkasan",
+        value=(
+            f"Server **{len(bot.guilds)}** • "
+            f"FREE **{free_count}** • "
+            f"PREMIUM **{premium_count}**"
+        ),
+        inline=False
     )
     embed.add_field(
         name="Uptime",
@@ -3769,21 +3772,11 @@ def owner_home_embed():
         inline=True
     )
     embed.add_field(
-        name="Owner Aktif",
+        name="Owner",
         value=str(len(OWNER_IDS | db_owner_ids())),
         inline=True
     )
-    embed.add_field(
-        name="🆓 FREE",
-        value=str(len(guilds_by_plan("free"))),
-        inline=True
-    )
-    embed.add_field(
-        name="⭐ PREMIUM",
-        value=str(len(guilds_by_plan("premium"))),
-        inline=True
-    )
-
+    embed.set_footer(text="Semua pengaturan melalui DM bot.")
     return embed
 
 
@@ -3792,96 +3785,95 @@ def server_embed(guild: discord.Guild):
     settings = get_guild_settings(guild.id)
     hosts = get_hosts(guild.id)
 
-    embed = discord.Embed(
-        title="🔔 Hi Notifku",
-        description=f"Server: **{guild.name}**",
-        color=discord.Color.blue()
+    tt_channel = (
+        f"<#{cfg['tiktok_channel_id']}>"
+        if cfg["tiktok_channel_id"] else "-"
+    )
+    yt_channel = (
+        f"<#{cfg['youtube_channel_id']}>"
+        if cfg["youtube_channel_id"] else "-"
+    )
+    mention_role = (
+        f"<@&{cfg['mention_role_id']}>"
+        if cfg["mention_role_id"] else "-"
+    )
+    log_channel = (
+        f"<#{cfg['log_channel_id']}>"
+        if cfg["log_channel_id"] else "-"
     )
 
-    embed.add_field(
-        name="Plan",
-        value=settings["plan"].upper(),
-        inline=True
-    )
-    embed.add_field(
-        name="Host",
-        value=f"{len(hosts)}/{host_limit_for_guild(guild.id)}",
-        inline=True
-    )
-    embed.add_field(
-        name="Access",
-        value=settings["access_state"],
-        inline=True
+    embed = discord.Embed(
+        title=f"🔔 {guild.name}",
+        description=(
+            f"Plan **{settings['plan'].upper()}** • "
+            f"Host **{len(hosts)}/{host_limit_for_guild(guild.id)}** • "
+            f"Access **{settings['access_state']}**"
+        ),
+        color=(
+            discord.Color.gold()
+            if settings["plan"] == "premium"
+            else discord.Color.blue()
+        )
     )
 
     if settings["plan"] == "premium":
         embed.add_field(
-            name="Premium Aktif Sampai",
+            name="Premium",
             value=premium_expiry_text(guild.id),
             inline=False
         )
 
     embed.add_field(
-        name="TikTok Channel",
-        value=(
-            f"<#{cfg['tiktok_channel_id']}>"
-            if cfg["tiktok_channel_id"]
-            else "Belum diatur"
-        ),
-        inline=False
+        name="Channel",
+        value=f"🎵 {tt_channel}\n📺 {yt_channel}",
+        inline=True
     )
     embed.add_field(
-        name="YouTube Channel",
-        value=(
-            f"<#{cfg['youtube_channel_id']}>"
-            if cfg["youtube_channel_id"]
-            else "Belum diatur"
-        ),
-        inline=False
+        name="Mention / Log",
+        value=f"🔔 {mention_role}\n🧾 {log_channel}",
+        inline=True
     )
-    embed.add_field(
-        name="Mention Role",
-        value=(
-            f"<@&{cfg['mention_role_id']}>"
-            if cfg["mention_role_id"]
-            else "Tidak ada"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Log Channel",
-        value=(
-            f"<#{cfg['log_channel_id']}>"
-            if cfg["log_channel_id"]
-            else "Belum diatur"
-        ),
-        inline=False
-    )
-
+    embed.set_footer(text=f"Server ID: {guild.id}")
     return embed
 
 
 def host_embed(host):
     platform_name = "TikTok" if host["platform"] == "tiktok" else "YouTube"
+    status = host_status_text(host)
+
+    channel_text = (
+        f"<#{host['channel_id']}>"
+        if host["channel_id"] else "Default"
+    )
+    role_text = (
+        f"<@&{host['role_id']}>"
+        if host["role_id"] else "Default"
+    )
 
     embed = discord.Embed(
-        title=f"{'🎵' if host['platform']=='tiktok' else '📺'} {platform_name} Host",
-        color=discord.Color.green() if host["enabled"] else discord.Color.dark_gray()
+        title=f"{'🎵' if host['platform']=='tiktok' else '📺'} {platform_name}",
+        description=(
+            f"`{host['target']}`\n"
+            f"{status} • Interval **{host['check_interval']}s**"
+        ),
+        color=(
+            discord.Color.green()
+            if host["enabled"] and not host["last_error"]
+            else discord.Color.orange()
+        )
     )
 
     embed.add_field(
-        name="Target",
-        value=f"`{host['target']}`",
+        name="Channel / Role",
+        value=f"{channel_text} • {role_text}",
         inline=False
     )
     embed.add_field(
-        name="Status",
-        value="🟢 Running" if host["enabled"] else "⏸️ Paused",
-        inline=True
-    )
-    embed.add_field(
-        name="Interval",
-        value=f"{host['check_interval']} detik",
+        name="Monitor",
+        value=(
+            f"Last: {fmt_time(host['last_check'])}\n"
+            f"Error: **{host['error_count'] or 0}**"
+        ),
         inline=True
     )
     embed.add_field(
@@ -3889,81 +3881,15 @@ def host_embed(host):
         value="ON" if host["notify_live_end"] else "OFF",
         inline=True
     )
-    embed.add_field(
-        name="Last Check",
-        value=fmt_time(host["last_check"]),
-        inline=True
-    )
-    embed.add_field(
-        name="Error Count",
-        value=str(host["error_count"] or 0),
-        inline=True
-    )
-    embed.add_field(
-        name="Cooldown",
-        value=fmt_time(host["cooldown_until"]) if host["cooldown_until"] else "Tidak",
-        inline=True
-    )
-    embed.add_field(
-        name="Channel Khusus",
-        value=f"<#{host['channel_id']}>" if host["channel_id"] else "Pakai default",
-        inline=False
-    )
-    embed.add_field(
-        name="Role Khusus",
-        value=f"<@&{host['role_id']}>" if host["role_id"] else "Pakai default",
-        inline=False
-    )
-
-    if host["last_error"]:
-        embed.add_field(
-            name="⚠️ Error Terakhir",
-            value=host["last_error"][:900],
-            inline=False
-        )
-
-    embed.set_footer(text=f"Host ID: {host['id']}")
-
-    now = int(time.time())
-
-    if not host["enabled"]:
-        monitor_status = "⏸️ Paused"
-    elif host["cooldown_until"] and int(host["cooldown_until"]) > now:
-        monitor_status = f"🟡 Cooldown sampai <t:{int(host['cooldown_until'])}:R>"
-    elif host["last_error"]:
-        monitor_status = "🔴 Error"
-    else:
-        monitor_status = "🟢 Normal"
-
-    last_check = (
-        f"<t:{int(host['last_check'])}:R>"
-        if host["last_check"]
-        else "Belum pernah"
-    )
-
-    embed.add_field(
-        name="Status Monitor",
-        value=monitor_status,
-        inline=False
-    )
-    embed.add_field(
-        name="Check Terakhir",
-        value=last_check,
-        inline=True
-    )
-    embed.add_field(
-        name="Error Count",
-        value=str(host["error_count"] or 0),
-        inline=True
-    )
 
     if host["last_error"]:
         embed.add_field(
             name="Error Terakhir",
-            value=str(host["last_error"])[:1000],
+            value=str(host["last_error"])[:700],
             inline=False
         )
 
+    embed.set_footer(text=f"Host ID: {host['id']}")
     return embed
 
 
@@ -4904,7 +4830,7 @@ def start_verify_embed(user_id: int, verified: bool):
         embed = discord.Embed(
             title="✅ Verifikasi Berhasil",
             description=(
-                "Kamu sudah bergabung ke **Server Resmi Owner/Support Hi Notifku**.\n\n"
+                "Kamu sudah bergabung ke **server resmi Hi Notifku**.\n\n"
                 "Sekarang kamu bisa menggunakan `/menu`."
             ),
             color=discord.Color.green()
@@ -5054,6 +4980,148 @@ def user_server_embed(guild: discord.Guild):
     embed.set_footer(
         text="Pengaturan lengkap hanya melalui DM Global Owner."
     )
+    return embed
+
+
+
+def user_owned_guilds(user_id: int):
+    return [
+        guild
+        for guild in bot.guilds
+        if int(guild.owner_id) == int(user_id)
+    ]
+
+
+class DMUserGuildSelect(discord.ui.Select):
+    def __init__(self, user_id: int, page: int = 0):
+        self.user_id = int(user_id)
+        self.page = max(0, int(page))
+
+        guilds = user_owned_guilds(self.user_id)
+        start = self.page * 25
+        current = guilds[start:start + 25]
+
+        options = [
+            discord.SelectOption(
+                label=g.name[:100],
+                value=str(g.id),
+                description=f"Server ID: {g.id}"[:100]
+            )
+            for g in current
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Tidak ada server milikmu",
+                    value="0",
+                    description="Bot harus sudah terpasang di server milikmu."
+                )
+            ]
+
+        super().__init__(
+            placeholder=f"Pilih server • Halaman {self.page + 1}",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Menu ini bukan milikmu."
+            )
+            return
+
+        guild_id = int(self.values[0])
+
+        if guild_id == 0:
+            await safe_reply(
+                interaction,
+                "ℹ️ Tidak ada server milikmu yang sedang memakai Hi Notifku."
+            )
+            return
+
+        guild = bot.get_guild(guild_id)
+
+        if guild is None or int(guild.owner_id) != interaction.user.id:
+            await safe_reply(
+                interaction,
+                "❌ Server tidak ditemukan atau kamu bukan owner server tersebut."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(guild.id)
+        )
+
+
+class DMUserGuildPickerView(discord.ui.View):
+    def __init__(self, user_id: int, page: int = 0):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.page = max(0, int(page))
+        self.add_item(DMUserGuildSelect(self.user_id, self.page))
+
+    @discord.ui.button(
+        label="Sebelumnya",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            view=DMUserGuildPickerView(
+                self.user_id,
+                max(0, self.page - 1)
+            )
+        )
+
+    @discord.ui.button(
+        label="Berikutnya",
+        emoji="➡️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        guilds = user_owned_guilds(self.user_id)
+        max_page = max(0, (len(guilds) - 1) // 25)
+
+        await interaction.response.edit_message(
+            view=DMUserGuildPickerView(
+                self.user_id,
+                min(max_page, self.page + 1)
+            )
+        )
+
+
+def dm_menu_home_embed(user_id: int):
+    guilds = user_owned_guilds(user_id)
+
+    embed = discord.Embed(
+        title="📩 Hi Notifku",
+        description="Pilih server yang ingin dikelola.",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Server",
+        value=str(len(guilds)),
+        inline=True
+    )
+    embed.add_field(
+        name="Mode",
+        value="DM",
+        inline=True
+    )
+    embed.set_footer(text="/menu • Hi Notifku")
     return embed
 
 
@@ -6232,7 +6300,7 @@ class OwnerHomeView(discord.ui.View):
         super().__init__(timeout=900)
         self.add_item(GuildSelect())
 
-    @discord.ui.button(label="Server Free", emoji="🆓", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="FREE", emoji="🆓", style=discord.ButtonStyle.secondary, row=1)
     async def free_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6246,7 +6314,7 @@ class OwnerHomeView(discord.ui.View):
             view=PlanListView("free")
         )
 
-    @discord.ui.button(label="Server Premium", emoji="⭐", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Premium", emoji="⭐", style=discord.ButtonStyle.secondary, row=1)
     async def premium_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6260,7 +6328,7 @@ class OwnerHomeView(discord.ui.View):
             view=PlanListView("premium")
         )
 
-    @discord.ui.button(label="Daftar Plan", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Plan", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
     async def plan_overview(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6269,7 +6337,7 @@ class OwnerHomeView(discord.ui.View):
             view=PlanOverviewView()
         )
 
-    @discord.ui.button(label="Health Bot", emoji="🩺", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Health", emoji="🩺", style=discord.ButtonStyle.secondary, row=2)
     async def health(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6307,7 +6375,7 @@ class OwnerHomeView(discord.ui.View):
             view=OwnerDashboardView()
         )
 
-    @discord.ui.button(label="Permintaan Premium", emoji="💳", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Request", emoji="💳", style=discord.ButtonStyle.secondary, row=3)
     async def premium_requests(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6324,7 +6392,7 @@ class OwnerHomeView(discord.ui.View):
             view=PremiumOrdersView()
         )
 
-    @discord.ui.button(label="Riwayat Premium", emoji="🧾", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=3)
     async def premium_history(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6352,7 +6420,7 @@ class OwnerHomeView(discord.ui.View):
             view=HealthDetailView()
         )
 
-    @discord.ui.button(label="Kelola Owner", emoji="👑", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Owner", emoji="👑", style=discord.ButtonStyle.secondary, row=2)
     async def owners(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
             await safe_reply(
@@ -6375,7 +6443,7 @@ class OwnerHomeView(discord.ui.View):
             view=OwnerManagementView()
         )
 
-    @discord.ui.button(label="Cari / Semua Server", emoji="🔎", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Server", emoji="🔎", style=discord.ButtonStyle.secondary, row=4)
     async def browse_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
@@ -6903,52 +6971,239 @@ class PlanServerManageView(discord.ui.View):
         )
 
 
+
+class ServerOwnerView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+
+    async def valid(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return None
+
+        guild = bot.get_guild(self.guild_id)
+
+        if guild is None:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return None
+
+        return guild
+
+    @discord.ui.button(
+        label="Host",
+        emoji="📡",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def hosts(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"📡 Host • {guild.name}",
+                description=f"Total **{len(get_hosts(guild.id))}** host.",
+                color=discord.Color.blue()
+            ),
+            view=HostMenuView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Default",
+        emoji="⚙️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def defaults(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"⚙️ Default • {guild.name}",
+                description="Atur channel, role, dan log.",
+                color=discord.Color.blue()
+            ),
+            view=DefaultConfigView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Wizard",
+        emoji="🧭",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def wizard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"🧭 Setup • {guild.name}",
+                description="Atur 4 langkah utama.",
+                color=discord.Color.blue()
+            ),
+            view=WizardView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Plan",
+        emoji="⭐",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def plan(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        settings = get_guild_settings(guild.id)
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"⭐ Plan • {guild.name}",
+                description=(
+                    f"Plan **{settings['plan'].upper()}**\n"
+                    f"{premium_expiry_text(guild.id) if settings['plan']=='premium' else 'FREE'}"
+                ),
+                color=discord.Color.gold()
+            ),
+            view=PlanServerManageView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Backup",
+        emoji="💾",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        payload = export_guild_backup(guild.id)
+        raw = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
+
+        await interaction.response.send_message(
+            content=f"💾 Backup **{guild.name}**",
+            file=discord.File(
+                io.BytesIO(raw),
+                filename=f"hi-notifku-{guild.id}.json"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=server_embed(guild),
+            view=ServerOwnerView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_global_owner(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
 class HostMenuView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=900)
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Tambah Host", emoji="➕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Tambah", emoji="➕", style=discord.ButtonStyle.success)
     async def add_host_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_global_owner(interaction):
+            return
         await interaction.response.send_modal(
             AddHostModal(self.guild_id)
         )
 
-    @discord.ui.button(label="Import Massal", emoji="📥", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Import", emoji="📥", style=discord.ButtonStyle.secondary)
     async def bulk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_global_owner(interaction):
+            return
         await interaction.response.send_modal(
             BulkImportModal(self.guild_id)
         )
 
-    @discord.ui.button(label="Daftar Host", emoji="📋", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Daftar", emoji="📋", style=discord.ButtonStyle.primary)
     async def list_hosts_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_global_owner(interaction):
+            return
+
         rows = get_hosts(self.guild_id)
 
         if not rows:
             await safe_reply(interaction, "Belum ada host.")
             return
 
-        await safe_reply(
-            interaction,
-            f"📋 Menampilkan **{len(rows)} host**."
+        lines = []
+        for host in rows[:20]:
+            lines.append(
+                f"**#{host['id']}** • "
+                f"{'🎵' if host['platform']=='tiktok' else '📺'} "
+                f"`{host['target']}` • {host_status_text(host)}"
+            )
+
+        if len(rows) > 20:
+            lines.append(f"… +{len(rows)-20} host lainnya")
+
+        embed = discord.Embed(
+            title="📋 Daftar Host",
+            description="\n".join(lines),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(
+            text="Gunakan ID host dari daftar untuk pengelolaan detail."
         )
 
-        for host in rows:
-            await interaction.channel.send(
-                embed=host_embed(host),
-                view=HostCardView(self.guild_id, host["id"])
-            )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=HostMenuView(self.guild_id)
+        )
 
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = bot.get_guild(self.guild_id)
-        if guild:
-            await interaction.response.edit_message(
-                embed=server_embed(guild),
-                view=ServerOwnerView(self.guild_id)
-            )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=server_embed(guild),
+            view=ServerOwnerView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
@@ -7481,7 +7736,7 @@ async def ping_command(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="start",
-    description="Verifikasi join Server Resmi Owner/Support Hi Notifku."
+    description="Verifikasi join server resmi Hi Notifku."
 )
 async def start_command(interaction: discord.Interaction):
     if is_user_blacklisted(interaction.user.id):
@@ -7541,7 +7796,7 @@ async def start_command(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="menu",
-    description="Lihat status dan paket Premium Hi Notifku."
+    description="Buka menu pengguna Hi Notifku melalui DM."
 )
 async def menu_command(interaction: discord.Interaction):
     if is_user_blacklisted(interaction.user.id):
@@ -7558,15 +7813,20 @@ async def menu_command(interaction: discord.Interaction):
         )
         return
 
-    try:
-        if interaction.guild is None:
-            await safe_reply(
-                interaction,
-                "ℹ️ Jalankan `/menu` dari server tempat Hi Notifku terpasang."
+    # /menu is intentionally DM-only.
+    if interaction.guild is not None:
+        await safe_reply(
+            interaction,
+            (
+                "📩 **`/menu` hanya digunakan melalui DM Hi Notifku.**\n"
+                "Buka profil bot → **Message/Kirim Pesan** → jalankan `/menu` di DM."
             )
-            return
+        )
+        return
 
-        # Global owner bypass.
+    try:
+        # Global owners may use /owner for administration.
+        # /menu remains the normal user/server-owner interface.
         if not is_global_owner(interaction.user.id):
             if not REQUIRED_GUILD_ID:
                 await safe_reply(
@@ -7585,7 +7845,7 @@ async def menu_command(interaction: discord.Interaction):
                     (
                         "🔒 Kamu belum terverifikasi.\n"
                         "Gunakan **`/start`** terlebih dahulu dan join "
-                        "Server Resmi Owner/Support Hi Notifku."
+                        "server resmi Hi Notifku."
                     ),
                     embed=start_verify_embed(
                         interaction.user.id,
@@ -7595,33 +7855,35 @@ async def menu_command(interaction: discord.Interaction):
                 )
                 return
 
-        dm = interaction.user.dm_channel
+        guilds = user_owned_guilds(interaction.user.id)
 
-        if dm is None:
-            dm = await interaction.user.create_dm()
+        if not guilds:
+            await safe_reply(
+                interaction,
+                (
+                    "ℹ️ Saya tidak menemukan server milikmu yang memakai Hi Notifku.\n"
+                    "Pastikan bot sudah ditambahkan ke server dan akunmu adalah **owner server**."
+                )
+            )
+            return
 
-        await dm.send(
-            embed=user_server_embed(interaction.guild),
-            view=UserServerMenuView(interaction.guild.id)
-        )
-
-        await safe_reply(
-            interaction,
-            "✅ Menu Hi Notifku sudah dikirim ke DM kamu."
-        )
-
-    except discord.Forbidden:
-        await safe_reply(
-            interaction,
-            "❌ Saya tidak bisa mengirim DM ke akunmu. Aktifkan DM lalu jalankan `/menu` lagi."
+        await interaction.response.send_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            view=DMUserGuildPickerView(interaction.user.id),
+            ephemeral=False
         )
 
     except Exception as exc:
         log.exception("/menu error")
-        await safe_reply(
-            interaction,
-            f"❌ Gagal membuka menu: `{type(exc).__name__}: {exc}`"
-        )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ Gagal membuka menu: `{type(exc).__name__}: {exc}`"
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Gagal membuka menu: `{type(exc).__name__}: {exc}`"
+            )
 
 
 @bot.tree.command(
@@ -7841,8 +8103,8 @@ async def on_message(message: discord.Message):
 
         try:
             await message.channel.send(
-                "ℹ️ Gunakan `/menu` dari server tempat Hi Notifku terpasang "
-                "untuk melihat paket FREE/PREMIUM dan mengajukan upgrade."
+                "📩 Gunakan **`/menu` di DM ini** untuk membuka menu Hi Notifku.\n"
+                "Menu pengguna tidak lagi dibuka dari channel server."
             )
         except Exception:
             pass
@@ -7856,7 +8118,7 @@ async def on_message(message: discord.Message):
                 title="📩 Hi Notifku",
                 description=(
                     "Gunakan **`/start`** untuk verifikasi join Server Support.\n"
-                    "Lalu gunakan **`/menu`** untuk paket FREE/PREMIUM.\n"
+                    "Lalu buka **DM bot** dan gunakan **`/menu`** untuk paket FREE/PREMIUM.\n"
                     "Global Owner menggunakan **`/owner`** untuk pengaturan lengkap."
                 ),
                 color=discord.Color.blue()
