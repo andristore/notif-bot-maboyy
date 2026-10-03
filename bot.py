@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from TikTokLive import TikTokLiveClient
+from yt_dlp import YoutubeDL
 
 load_dotenv()
 
@@ -191,6 +192,18 @@ def migrate_database():
                 )
             """)
 
+        # ---------------- tiktok_post_state ----------------
+        if not table_exists(conn, "tiktok_post_state"):
+            conn.execute("""
+                CREATE TABLE tiktok_post_state (
+                    guild_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    last_post_id TEXT,
+                    initialized INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(guild_id, username)
+                )
+            """)
+
         conn.commit()
         log.info("Database schema ready.")
 
@@ -363,6 +376,15 @@ def update_host(host_id: int, target: str, display_name: Optional[str] = None):
                 target
             ))
 
+            if row["platform"] == "tiktok":
+                conn.execute("""
+                    DELETE FROM tiktok_post_state
+                    WHERE guild_id=? AND username=?
+                """, (
+                    row["guild_id"],
+                    old_target.lstrip("@")
+                ))
+
         conn.commit()
         return True
 
@@ -390,6 +412,15 @@ def delete_host(host_id: int):
             row["platform"],
             row["target"]
         ))
+
+        if row["platform"] == "tiktok":
+            conn.execute("""
+                DELETE FROM tiktok_post_state
+                WHERE guild_id=? AND username=?
+            """, (
+                row["guild_id"],
+                row["target"].lstrip("@")
+            ))
 
         conn.commit()
 
@@ -482,6 +513,46 @@ def update_state(
             live_key
         ))
 
+        conn.commit()
+
+
+
+def get_tiktok_post_state(guild_id: int, username: str):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM tiktok_post_state
+            WHERE guild_id=? AND username=?
+        """, (
+            guild_id,
+            username
+        )).fetchone()
+
+
+def update_tiktok_post_state(
+    guild_id: int,
+    username: str,
+    last_post_id: Optional[str],
+    initialized: bool = True
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO tiktok_post_state(
+                guild_id,
+                username,
+                last_post_id,
+                initialized
+            )
+            VALUES(?,?,?,?)
+            ON CONFLICT(guild_id, username)
+            DO UPDATE SET
+                last_post_id=excluded.last_post_id,
+                initialized=excluded.initialized
+        """, (
+            guild_id,
+            username,
+            last_post_id,
+            int(initialized)
+        ))
         conn.commit()
 
 
@@ -714,6 +785,237 @@ async def send_live_notification(
         return False
 
 
+
+async def send_tiktok_post_notification(
+    guild_id: int,
+    username: str,
+    post_id: str,
+    post_url: str,
+    description: str = "",
+    thumbnail: Optional[str] = None,
+):
+    config = get_config(guild_id)
+
+    if not config:
+        return False
+
+    channel_id = config["tiktok_channel_id"]
+    channel = await resolve_discord_channel(channel_id)
+
+    if not channel:
+        return False
+
+    content = None
+    allowed_mentions = discord.AllowedMentions.none()
+
+    role_id = config["mention_role_id"]
+    if role_id:
+        content = f"<@&{role_id}>"
+        allowed_mentions = discord.AllowedMentions(roles=True)
+
+    clean_description = (description or "").strip()
+    if len(clean_description) > 700:
+        clean_description = clean_description[:697] + "..."
+
+    embed = discord.Embed(
+        title="🆕 TikTok Post Baru",
+        description=(
+            f"**@{username}** baru saja mengunggah postingan baru."
+            + (f"\\n\\n{clean_description}" if clean_description else "")
+        ),
+        url=post_url,
+        color=discord.Color.from_rgb(0, 170, 255)
+    )
+
+    embed.add_field(
+        name="Lihat Postingan",
+        value=f"[Buka di TikTok]({post_url})",
+        inline=False
+    )
+
+    embed.add_field(
+        name="Post ID",
+        value=f"`{post_id}`",
+        inline=False
+    )
+
+    if thumbnail:
+        embed.set_image(url=thumbnail)
+
+    embed.set_footer(
+        text="Hi Notifku • TikTok New Post"
+    )
+
+    try:
+        await channel.send(
+            content=content,
+            embed=embed,
+            allowed_mentions=allowed_mentions
+        )
+        return True
+
+    except discord.Forbidden:
+        log.error(
+            "Bot tidak punya permission kirim TikTok post ke channel %s",
+            channel_id
+        )
+        return False
+
+    except discord.HTTPException as exc:
+        log.error(
+            "Discord HTTP error saat kirim TikTok post: %s",
+            exc
+        )
+        return False
+
+
+def _extract_latest_tiktok_post_sync(username: str):
+    """
+    Ambil post TikTok terbaru via yt-dlp.
+    Tidak butuh API key, tetapi bergantung pada akses publik TikTok.
+    """
+    profile_url = f"https://www.tiktok.com/@{username}"
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "playlistend": 3,
+        "skip_download": True,
+        "ignoreerrors": True,
+        "socket_timeout": 20,
+    }
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(
+            profile_url,
+            download=False
+        )
+
+    if not info:
+        return None
+
+    entries = info.get("entries") or []
+
+    for entry in entries:
+        if not entry:
+            continue
+
+        post_id = str(
+            entry.get("id")
+            or entry.get("display_id")
+            or ""
+        ).strip()
+
+        if not post_id:
+            continue
+
+        url = (
+            entry.get("webpage_url")
+            or entry.get("url")
+            or f"https://www.tiktok.com/@{username}/video/{post_id}"
+        )
+
+        # yt-dlp extract_flat bisa memberi URL bukan webpage URL.
+        if isinstance(url, str) and not url.startswith("http"):
+            url = f"https://www.tiktok.com/@{username}/video/{post_id}"
+
+        title = (
+            entry.get("title")
+            or entry.get("description")
+            or ""
+        )
+
+        thumbnail = entry.get("thumbnail")
+
+        return {
+            "id": post_id,
+            "url": url,
+            "description": title,
+            "thumbnail": thumbnail,
+        }
+
+    return None
+
+
+async def get_latest_tiktok_post(username: str):
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _extract_latest_tiktok_post_sync,
+                username
+            ),
+            timeout=35
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Timeout saat cek postingan TikTok @{username}"
+        )
+
+
+async def check_tiktok_new_post(row):
+    username = row["target"].strip().lstrip("@")
+    guild_id = row["guild_id"]
+
+    latest = await get_latest_tiktok_post(username)
+
+    if not latest:
+        log.warning(
+            "Tidak menemukan posting TikTok terbaru untuk @%s",
+            username
+        )
+        return
+
+    state = get_tiktok_post_state(
+        guild_id,
+        username
+    )
+
+    latest_id = latest["id"]
+
+    # First run = bootstrap saja. Jangan kirim post lama sebagai notifikasi baru.
+    if not state or not state["initialized"]:
+        update_tiktok_post_state(
+            guild_id,
+            username,
+            latest_id,
+            True
+        )
+        log.info(
+            "TikTok post baseline @%s = %s",
+            username,
+            latest_id
+        )
+        return
+
+    previous_id = state["last_post_id"]
+
+    if latest_id != previous_id:
+        sent = await send_tiktok_post_notification(
+            guild_id=guild_id,
+            username=username,
+            post_id=latest_id,
+            post_url=latest["url"],
+            description=latest.get("description", ""),
+            thumbnail=latest.get("thumbnail")
+        )
+
+        # Tetap update state meskipun channel belum diset agar tidak spam post lama berulang.
+        update_tiktok_post_state(
+            guild_id,
+            username,
+            latest_id,
+            True
+        )
+
+        log.info(
+            "TikTok new post @%s: %s sent=%s",
+            username,
+            latest_id,
+            sent
+        )
+
+
 # ============================================================
 # LIVE CHECKER
 # ============================================================
@@ -909,6 +1211,14 @@ async def live_checker():
             elif row["platform"] == "tiktok":
                 await check_tiktok_host(row)
 
+                try:
+                    await check_tiktok_new_post(row)
+                except Exception:
+                    log.exception(
+                        "Gagal cek postingan baru TikTok @%s",
+                        row["target"]
+                    )
+
         except Exception:
             log.exception(
                 "Gagal cek host %s:%s",
@@ -959,8 +1269,8 @@ def dashboard_embed(guild_id: int):
     embed = discord.Embed(
         title="🔔 Hi Notifku",
         description=(
-            "Kelola notifikasi **YouTube Live Stream** "
-            "dan **TikTok LIVE** menggunakan tombol di bawah."
+            "Kelola notifikasi **YouTube Live Stream**, **TikTok LIVE**, "
+            "dan **postingan TikTok baru** menggunakan tombol di bawah."
         ),
         color=discord.Color.blue()
     )
@@ -1762,6 +2072,38 @@ class DashboardView(discord.ui.View):
         )
 
     @discord.ui.button(
+        label="Test Post TikTok",
+        emoji="🆕",
+        style=discord.ButtonStyle.danger,
+        custom_id="hi_notifku:test_tiktok_post",
+        row=2
+    )
+    async def test_tiktok_post_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await require_owner_or_admin(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await send_tiktok_post_notification(
+            guild_id=interaction.guild_id,
+            username="testcreator",
+            post_id="TEST123",
+            post_url="https://www.tiktok.com/",
+            description="Ini adalah contoh notifikasi postingan TikTok baru."
+        )
+
+        await interaction.followup.send(
+            "✅ Test postingan TikTok dikirim."
+            if ok else
+            "❌ Atur channel TikTok terlebih dahulu.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
         label="Test TikTok",
         emoji="🎵",
         style=discord.ButtonStyle.danger,
@@ -1909,6 +2251,936 @@ async def live_panel_private(
                 f"❌ `{type(exc).__name__}: {exc}`",
                 ephemeral=True
             )
+
+
+
+# ============================================================
+# OWNER-ONLY DM CONTROL PANEL
+# ============================================================
+
+def is_global_owner_user(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+async def require_global_owner_dm(interaction: discord.Interaction) -> bool:
+    if is_global_owner_user(interaction.user.id):
+        return True
+
+    message = "❌ Panel DM ini hanya dapat digunakan oleh **Owner Bot**."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+    return False
+
+
+def get_bot_guild(guild_id: int) -> Optional[discord.Guild]:
+    return bot.get_guild(guild_id)
+
+
+def dm_server_embed(guild: discord.Guild):
+    cfg = get_config(guild.id)
+    hosts = get_hosts(guild.id)
+
+    yt_count = sum(1 for h in hosts if h["platform"] == "youtube")
+    tt_count = sum(1 for h in hosts if h["platform"] == "tiktok")
+    running_count = sum(1 for h in hosts if h["enabled"])
+
+    yt_channel = (
+        f"<#{cfg['youtube_channel_id']}> (`{cfg['youtube_channel_id']}`)"
+        if cfg["youtube_channel_id"]
+        else "Belum diatur"
+    )
+
+    tt_channel = (
+        f"<#{cfg['tiktok_channel_id']}> (`{cfg['tiktok_channel_id']}`)"
+        if cfg["tiktok_channel_id"]
+        else "Belum diatur"
+    )
+
+    role = (
+        f"<@&{cfg['mention_role_id']}> (`{cfg['mention_role_id']}`)"
+        if cfg["mention_role_id"]
+        else "Tidak ada"
+    )
+
+    embed = discord.Embed(
+        title="🔐 Hi Notifku • Owner DM Panel",
+        description=(
+            f"Server: **{guild.name}**\n"
+            f"Server ID: `{guild.id}`\n\n"
+            "Semua pengaturan pada panel ini khusus **Owner Bot**."
+        ),
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(name="📺 YouTube Hosts", value=str(yt_count), inline=True)
+    embed.add_field(name="🎵 TikTok Hosts", value=str(tt_count), inline=True)
+    embed.add_field(name="🟢 Running", value=str(running_count), inline=True)
+
+    embed.add_field(name="📺 Channel YouTube", value=yt_channel, inline=False)
+    embed.add_field(name="🎵 Channel TikTok", value=tt_channel, inline=False)
+    embed.add_field(name="🔔 Mention Role", value=role, inline=False)
+
+    embed.set_footer(text="Hi Notifku • Owner DM Control")
+    return embed
+
+
+class SetChannelIdModal(discord.ui.Modal):
+    channel_id_input = discord.ui.TextInput(
+        label="Discord Channel ID",
+        placeholder="Contoh: 123456789012345678",
+        max_length=25
+    )
+
+    def __init__(self, guild_id: int, platform: str):
+        title = "Set Channel TikTok" if platform == "tiktok" else "Set Channel YouTube"
+        super().__init__(title=title, timeout=300)
+        self.guild_id = guild_id
+        self.platform = platform
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        raw = self.channel_id_input.value.strip()
+
+        if not raw.isdigit():
+            await interaction.response.send_message(
+                "❌ Channel ID harus berupa angka.",
+                ephemeral=True
+            )
+            return
+
+        channel_id = int(raw)
+        guild = get_bot_guild(self.guild_id)
+
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ Bot sudah tidak berada di server tersebut.",
+                ephemeral=True
+            )
+            return
+
+        channel = guild.get_channel(channel_id)
+
+        if channel is None:
+            try:
+                fetched = await guild.fetch_channel(channel_id)
+                channel = fetched
+            except Exception:
+                channel = None
+
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "❌ ID tersebut bukan text channel yang dapat dipakai bot di server ini.",
+                ephemeral=True
+            )
+            return
+
+        perms = channel.permissions_for(guild.me)
+        if not perms.view_channel or not perms.send_messages or not perms.embed_links:
+            await interaction.response.send_message(
+                "❌ Bot belum punya permission **View Channel + Send Messages + Embed Links** di channel tersebut.",
+                ephemeral=True
+            )
+            return
+
+        set_platform_channel(
+            self.guild_id,
+            self.platform,
+            channel_id
+        )
+
+        label = "TikTok" if self.platform == "tiktok" else "YouTube"
+
+        await interaction.response.send_message(
+            f"✅ Channel {label} untuk **{guild.name}** diatur ke <#{channel_id}>.",
+            ephemeral=True
+        )
+
+
+class SetRoleIdModal(discord.ui.Modal):
+    role_id_input = discord.ui.TextInput(
+        label="Discord Role ID",
+        placeholder="Contoh: 123456789012345678",
+        max_length=25
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__(title="Set Mention Role", timeout=300)
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        raw = self.role_id_input.value.strip()
+
+        if not raw.isdigit():
+            await interaction.response.send_message(
+                "❌ Role ID harus berupa angka.",
+                ephemeral=True
+            )
+            return
+
+        role_id = int(raw)
+        guild = get_bot_guild(self.guild_id)
+
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ Bot sudah tidak berada di server tersebut.",
+                ephemeral=True
+            )
+            return
+
+        role = guild.get_role(role_id)
+
+        if role is None:
+            try:
+                roles = await guild.fetch_roles()
+                role = discord.utils.get(roles, id=role_id)
+            except Exception:
+                role = None
+
+        if role is None:
+            await interaction.response.send_message(
+                "❌ Role tidak ditemukan di server tersebut.",
+                ephemeral=True
+            )
+            return
+
+        set_mention_role(self.guild_id, role_id)
+
+        await interaction.response.send_message(
+            f"✅ Mention role untuk **{guild.name}** diatur ke **{role.name}** (`{role.id}`).",
+            ephemeral=True
+        )
+
+
+class OwnerAddHostModal(discord.ui.Modal):
+    platform = discord.ui.TextInput(
+        label="Platform",
+        placeholder="tiktok atau youtube",
+        max_length=10
+    )
+
+    target = discord.ui.TextInput(
+        label="Username / YouTube Channel ID",
+        placeholder="TikTok: username | YouTube: UCxxxxxxxx",
+        max_length=120
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__(title="Owner • Tambah Host", timeout=300)
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        guild = get_bot_guild(self.guild_id)
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ Bot sudah tidak berada di server tersebut.",
+                ephemeral=True
+            )
+            return
+
+        platform = self.platform.value.strip().lower()
+        target = self.target.value.strip()
+
+        if platform not in ("tiktok", "youtube"):
+            await interaction.response.send_message(
+                "❌ Platform harus `tiktok` atau `youtube`.",
+                ephemeral=True
+            )
+            return
+
+        if platform == "tiktok":
+            username = (
+                target
+                .replace("https://www.tiktok.com/@", "")
+                .replace("https://tiktok.com/@", "")
+                .split("/")[0]
+                .lstrip("@")
+                .strip()
+            )
+
+            if not username:
+                await interaction.response.send_message(
+                    "❌ Username TikTok tidak valid.",
+                    ephemeral=True
+                )
+                return
+
+            add_host(
+                self.guild_id,
+                "tiktok",
+                username,
+                f"@{username}",
+                None
+            )
+
+            await interaction.response.send_message(
+                f"✅ TikTok **@{username}** ditambahkan ke **{guild.name}**.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            name, uploads = await resolve_youtube_channel(target)
+
+            add_host(
+                self.guild_id,
+                "youtube",
+                target,
+                name,
+                uploads
+            )
+
+            await interaction.followup.send(
+                f"✅ YouTube **{name}** ditambahkan ke **{guild.name}**.",
+                ephemeral=True
+            )
+
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Gagal menambahkan YouTube: `{exc}`",
+                ephemeral=True
+            )
+
+
+class OwnerHostActionsView(discord.ui.View):
+    def __init__(self, guild_id: int, host_id: int):
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+        self.host_id = host_id
+
+    @discord.ui.button(
+        label="Test",
+        emoji="🧪",
+        style=discord.ButtonStyle.success
+    )
+    async def test_host(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        row = get_host(self.host_id)
+
+        if not row or row["guild_id"] != self.guild_id:
+            await interaction.response.send_message(
+                "❌ Host tidak ditemukan.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if row["platform"] == "youtube":
+            ok = await send_live_notification(
+                self.guild_id,
+                "youtube",
+                row["display_name"] or row["target"],
+                "Test YouTube Live Stream",
+                "https://www.youtube.com/"
+            )
+        else:
+            ok = await send_live_notification(
+                self.guild_id,
+                "tiktok",
+                row["target"],
+                "Test TikTok LIVE",
+                f"https://www.tiktok.com/@{row['target']}/live"
+            )
+
+        await interaction.followup.send(
+            "✅ Test notifikasi berhasil dikirim."
+            if ok else
+            "❌ Channel belum diatur atau bot tidak dapat mengirim ke channel.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Pause / Resume",
+        emoji="⏯️",
+        style=discord.ButtonStyle.secondary
+    )
+    async def toggle_host_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        row = get_host(self.host_id)
+
+        if not row or row["guild_id"] != self.guild_id:
+            await interaction.response.send_message(
+                "❌ Host tidak ditemukan.",
+                ephemeral=True
+            )
+            return
+
+        enabled = toggle_host(self.host_id)
+
+        await interaction.response.send_message(
+            "✅ Host sekarang **Running**."
+            if enabled else
+            "⏸️ Host sekarang **Paused**.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Hapus",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger
+    )
+    async def delete_host_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        row = get_host(self.host_id)
+
+        if not row or row["guild_id"] != self.guild_id:
+            await interaction.response.send_message(
+                "❌ Host tidak ditemukan.",
+                ephemeral=True
+            )
+            return
+
+        delete_host(self.host_id)
+
+        await interaction.response.send_message(
+            "🗑️ Host berhasil dihapus.",
+            ephemeral=True
+        )
+
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+
+
+class OwnerServerPanelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = guild_id
+
+    async def ensure_owner_and_guild(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return None
+
+        guild = get_bot_guild(self.guild_id)
+
+        if guild is None:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Bot sudah tidak berada di server tersebut.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Bot sudah tidak berada di server tersebut.",
+                    ephemeral=True
+                )
+            return None
+
+        return guild
+
+    @discord.ui.button(
+        label="Tambah Host",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+        row=0
+    )
+    async def add_host_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.send_modal(
+            OwnerAddHostModal(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Daftar Host",
+        emoji="📋",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def list_hosts_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        rows = get_hosts(self.guild_id)
+
+        if not rows:
+            await interaction.response.send_message(
+                f"Belum ada host untuk **{guild.name}**.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"📋 Host **{guild.name}**: {len(rows)}",
+            ephemeral=True
+        )
+
+        for row in rows:
+            await interaction.channel.send(
+                embed=host_embed(row),
+                view=OwnerHostActionsView(
+                    self.guild_id,
+                    row["id"]
+                )
+            )
+
+    @discord.ui.button(
+        label="TikTok Channel",
+        emoji="🎵",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def tiktok_channel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.send_modal(
+            SetChannelIdModal(
+                self.guild_id,
+                "tiktok"
+            )
+        )
+
+    @discord.ui.button(
+        label="YouTube Channel",
+        emoji="📺",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def youtube_channel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.send_modal(
+            SetChannelIdModal(
+                self.guild_id,
+                "youtube"
+            )
+        )
+
+    @discord.ui.button(
+        label="Mention Role",
+        emoji="🔔",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def mention_role_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.send_modal(
+            SetRoleIdModal(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Matikan Role",
+        emoji="🔕",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def disable_role_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        set_mention_role(
+            self.guild_id,
+            None
+        )
+
+        await interaction.response.send_message(
+            f"✅ Mention role untuk **{guild.name}** dimatikan.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Test TikTok",
+        emoji="🧪",
+        style=discord.ButtonStyle.danger,
+        row=2
+    )
+    async def test_tiktok_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await send_live_notification(
+            self.guild_id,
+            "tiktok",
+            "testcreator",
+            "Test TikTok LIVE",
+            "https://www.tiktok.com/"
+        )
+
+        await interaction.followup.send(
+            f"✅ Test TikTok dikirim ke **{guild.name}**."
+            if ok else
+            f"❌ Channel TikTok **{guild.name}** belum diatur / tidak dapat diakses.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Test YouTube",
+        emoji="🧪",
+        style=discord.ButtonStyle.danger,
+        row=2
+    )
+    async def test_youtube_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await send_live_notification(
+            self.guild_id,
+            "youtube",
+            "Test Creator",
+            "Test YouTube Live Stream",
+            "https://www.youtube.com/"
+        )
+
+        await interaction.followup.send(
+            f"✅ Test YouTube dikirim ke **{guild.name}**."
+            if ok else
+            f"❌ Channel YouTube **{guild.name}** belum diatur / tidak dapat diakses.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Test Post TikTok",
+        emoji="🆕",
+        style=discord.ButtonStyle.danger,
+        row=3
+    )
+    async def test_tiktok_post_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        ok = await send_tiktok_post_notification(
+            guild_id=self.guild_id,
+            username="testcreator",
+            post_id="TEST123",
+            post_url="https://www.tiktok.com/",
+            description="Ini adalah contoh notifikasi postingan TikTok baru."
+        )
+
+        await interaction.followup.send(
+            f"✅ Test postingan TikTok dikirim ke **{guild.name}**."
+            if ok else
+            f"❌ Channel TikTok **{guild.name}** belum diatur / tidak dapat diakses.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.primary,
+        row=3
+    )
+    async def refresh_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.ensure_owner_and_guild(interaction)
+        if guild is None:
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_server_embed(guild),
+            view=OwnerServerPanelView(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Ganti Server",
+        emoji="🔙",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_dm_home_embed(),
+            view=OwnerDMHomeView()
+        )
+
+
+def owner_dm_home_embed():
+    embed = discord.Embed(
+        title="🔐 Hi Notifku • Owner Control",
+        description=(
+            "Panel ini berada di **DM bot** dan hanya dapat digunakan oleh Owner.\n\n"
+            "Pilih server di menu bawah untuk mengelola notifikasi live."
+        ),
+        color=discord.Color.blue()
+    )
+
+    embed.add_field(
+        name="Server aktif",
+        value=str(len(bot.guilds)),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Owner terdaftar",
+        value=str(len(OWNER_IDS)),
+        inline=True
+    )
+
+    embed.set_footer(
+        text="Hi Notifku • Private Owner DM Panel"
+    )
+
+    return embed
+
+
+class OwnerGuildSelect(discord.ui.Select):
+    def __init__(self):
+        guilds = list(bot.guilds)[:25]
+
+        options = [
+            discord.SelectOption(
+                label=guild.name[:100],
+                value=str(guild.id),
+                description=f"ID: {guild.id}"[:100],
+                emoji="🏠"
+            )
+            for guild in guilds
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Bot belum ada di server",
+                    value="0",
+                    description="Invite bot ke server terlebih dahulu."
+                )
+            ]
+
+        super().__init__(
+            placeholder="Pilih server yang ingin diatur...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="hi_notifku:owner_dm:guild_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_global_owner_dm(interaction):
+            return
+
+        guild_id = int(self.values[0])
+
+        if guild_id == 0:
+            await interaction.response.send_message(
+                "❌ Bot belum berada di server mana pun.",
+                ephemeral=True
+            )
+            return
+
+        guild = get_bot_guild(guild_id)
+
+        if guild is None:
+            await interaction.response.send_message(
+                "❌ Server tidak ditemukan.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_server_embed(guild),
+            view=OwnerServerPanelView(guild_id)
+        )
+
+
+class OwnerDMHomeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+        self.add_item(OwnerGuildSelect())
+
+
+async def send_owner_dm_panel(user: discord.User | discord.Member):
+    dm = user.dm_channel
+
+    if dm is None:
+        dm = await user.create_dm()
+
+    await dm.send(
+        embed=owner_dm_home_embed(),
+        view=OwnerDMHomeView()
+    )
+
+
+@bot.tree.command(
+    name="owner_dm",
+    description="Kirim panel kontrol Hi Notifku ke DM Owner."
+)
+async def owner_dm(
+    interaction: discord.Interaction
+):
+    try:
+        if not is_global_owner_user(interaction.user.id):
+            await interaction.response.send_message(
+                "❌ Command ini hanya untuk **Owner Bot**.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+
+        try:
+            await send_owner_dm_panel(
+                interaction.user
+            )
+
+            await interaction.followup.send(
+                "✅ Panel Owner sudah dikirim ke DM kamu.",
+                ephemeral=True
+            )
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Bot tidak bisa mengirim DM. Aktifkan **Allow direct messages from server members** lalu coba lagi.",
+                ephemeral=True
+            )
+
+    except Exception as exc:
+        log.exception("Error /owner_dm")
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                f"❌ `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+
+@bot.tree.command(
+    name="owner_panel",
+    description="Buka panel Owner langsung jika command digunakan di DM."
+)
+async def owner_panel(
+    interaction: discord.Interaction
+):
+    if not is_global_owner_user(interaction.user.id):
+        await interaction.response.send_message(
+            "❌ Command ini hanya untuk **Owner Bot**.",
+            ephemeral=True
+        )
+        return
+
+    # Bila command digunakan di guild, kirim panel ke DM agar tetap private.
+    if interaction.guild_id is not None:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+
+        try:
+            await send_owner_dm_panel(
+                interaction.user
+            )
+
+            await interaction.followup.send(
+                "✅ Panel Owner sudah dikirim ke DM.",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Bot tidak dapat mengirim DM ke akunmu.",
+                ephemeral=True
+            )
+        return
+
+    await interaction.response.send_message(
+        embed=owner_dm_home_embed(),
+        view=OwnerDMHomeView()
+    )
+
 
 
 # ============================================================
