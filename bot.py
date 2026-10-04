@@ -8751,6 +8751,571 @@ def user_owned_guilds(user_id: int):
     ]
 
 
+async def user_mutual_guilds(user_id: int):
+    result = []
+
+    for guild in bot.guilds:
+        if int(guild.owner_id) == int(user_id):
+            # Already handled as a server owner.
+            continue
+
+        member = guild.get_member(int(user_id))
+
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except Exception:
+                member = None
+
+        if member is not None:
+            result.append(guild)
+
+    return result
+
+
+def guild_host_count(guild_id: int) -> int:
+    return len(get_hosts(int(guild_id)))
+
+
+def server_owner_contact_embed(
+    user_id: int,
+    guild_ids: list[int]
+):
+    embed = discord.Embed(
+        title="🎙️ Belum Memiliki Host",
+        description=(
+            "Kamu belum ditugaskan sebagai Host Manager.\n\n"
+            "Pilih **server tempat host berada**, lalu kamu bisa melihat "
+            "**pemilik server** atau mengirim **permintaan akses Host Manager** "
+            "langsung kepadanya.\n\n"
+            "ℹ️ Yang dimaksud **pemilik server** adalah owner server Discord, "
+            "bukan Global Owner Hi Notifku."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Server yang Ditemukan",
+        value=str(len(guild_ids)),
+        inline=True
+    )
+    embed.add_field(
+        name="Akses /owner",
+        value="❌ Tidak ada",
+        inline=True
+    )
+    embed.set_footer(
+        text="Pilih server terlebih dahulu"
+    )
+    return embed
+
+
+class ServerOwnerContactSelect(discord.ui.Select):
+    def __init__(
+        self,
+        user_id: int,
+        guild_ids: list[int]
+    ):
+        self.user_id = int(user_id)
+        self.guild_ids = [
+            int(x)
+            for x in guild_ids
+        ]
+
+        options = []
+        for guild_id in self.guild_ids[:25]:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+
+            options.append(
+                discord.SelectOption(
+                    label=guild.name[:100],
+                    description=(
+                        f"{guild_host_count(guild.id)} host • "
+                        f"Owner ID {guild.owner_id}"
+                    )[:100],
+                    value=str(guild.id),
+                    emoji="🏢"
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Tidak ada server mutual",
+                    description="Tidak ditemukan server yang sama dengan bot.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih server tempat host berada",
+            options=options,
+            row=0
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Menu ini bukan milikmu."
+            )
+            return
+
+        guild_id = int(self.values[0])
+
+        if not guild_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Tidak ada server yang dapat dipilih."
+            )
+            return
+
+        if guild_id not in self.guild_ids:
+            await safe_reply(
+                interaction,
+                "🔒 Server tidak tersedia pada menu ini."
+            )
+            return
+
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await safe_reply(
+                interaction,
+                "❌ Server tidak ditemukan."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=selected_server_owner_embed(
+                guild,
+                self.user_id
+            ),
+            view=SelectedServerOwnerView(
+                self.user_id,
+                guild.id,
+                self.guild_ids
+            )
+        )
+
+
+def selected_server_owner_embed(
+    guild: discord.Guild,
+    user_id: int
+):
+    owner = guild.owner
+    owner_text = (
+        owner.mention
+        if owner
+        else f"<@{guild.owner_id}>"
+    )
+
+    hosts = get_hosts(guild.id)
+
+    embed = discord.Embed(
+        title=f"👑 Pemilik Server • {guild.name}",
+        description=(
+            f"Pemilik server: **{owner_text}**\n"
+            f"Server ID: `{guild.id}`\n"
+            f"Host tersedia: **{len(hosts)}**\n\n"
+            "Tekan **📨 Minta Akses Host** untuk mengirim permintaan "
+            "langsung ke pemilik server."
+        ),
+        color=discord.Color.gold()
+    )
+
+    if not hosts:
+        embed.add_field(
+            name="Belum Ada Host",
+            value=(
+                "Pemilik server perlu membuat host terlebih dahulu melalui "
+                "`/menu → pilih server → Kelola Host → Tambah Host`."
+            ),
+            inline=False
+        )
+
+    embed.set_footer(
+        text="Pemilik server Discord • bukan Global Owner bot"
+    )
+    return embed
+
+
+class ServerOwnerHostGrantSelect(discord.ui.Select):
+    def __init__(
+        self,
+        requester_id: int,
+        guild_id: int
+    ):
+        self.requester_id = int(requester_id)
+        self.guild_id = int(guild_id)
+
+        hosts = get_hosts(self.guild_id)
+        options = []
+
+        for host in hosts[:25]:
+            label = (
+                host["display_name"]
+                or host["target"]
+                or f"Host {host['id']}"
+            )
+            options.append(
+                discord.SelectOption(
+                    label=(
+                        f"{platform_display_name(host['platform'])} • {label}"
+                    )[:100],
+                    description=f"Host ID {host['id']}"[:100],
+                    value=str(host["id"]),
+                    emoji=platform_icon(host["platform"])
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Belum ada host",
+                    description="Tambahkan host ke server terlebih dahulu.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih host yang akan diberikan",
+            options=options,
+            row=0
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        guild = bot.get_guild(self.guild_id)
+
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya pemilik server ini yang dapat memberikan akses."
+            )
+            return
+
+        host_id = int(self.values[0])
+
+        if not host_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Server belum mempunyai host."
+            )
+            return
+
+        host = get_host(host_id)
+
+        if (
+            not host
+            or int(host["guild_id"]) != self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "❌ Host bukan milik server ini."
+            )
+            return
+
+        assign_host_manager(
+            host_id,
+            self.requester_id,
+            assigned_by=interaction.user.id,
+            permissions=set(HOST_MANAGER_PERMISSION_COLUMNS)
+        )
+
+        log_host_manager_action(
+            host_id,
+            self.requester_id,
+            "assigned_by_server_owner",
+            f"assigned_by={interaction.user.id}"
+        )
+
+        try:
+            requester = (
+                bot.get_user(self.requester_id)
+                or await bot.fetch_user(self.requester_id)
+            )
+            await requester.send(
+                embed=discord.Embed(
+                    title="✅ Akses Host Disetujui",
+                    description=(
+                        f"Pemilik server **{guild.name}** memberikan akses ke:\n"
+                        f"**{platform_display_name(host['platform'])} • "
+                        f"{host['display_name'] or host['target']}**\n\n"
+                        "Buka `/menu → 🎙️ Host Saya` untuk mengelolanya."
+                    ),
+                    color=discord.Color.green()
+                )
+            )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ <@{self.requester_id}> sekarang menjadi Host Manager "
+                f"untuk **{platform_display_name(host['platform'])} • "
+                f"{host['display_name'] or host['target']}**."
+            ),
+            embed=None,
+            view=None
+        )
+
+
+class ServerOwnerHostGrantView(discord.ui.View):
+    def __init__(
+        self,
+        requester_id: int,
+        guild_id: int
+    ):
+        super().__init__(timeout=86400)
+        self.requester_id = int(requester_id)
+        self.guild_id = int(guild_id)
+        self.add_item(
+            ServerOwnerHostGrantSelect(
+                self.requester_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Tolak Permintaan",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
+    async def deny(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = bot.get_guild(self.guild_id)
+
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya pemilik server ini yang dapat menolak request."
+            )
+            return
+
+        try:
+            requester = (
+                bot.get_user(self.requester_id)
+                or await bot.fetch_user(self.requester_id)
+            )
+            await requester.send(
+                f"❌ Permintaan Host Manager untuk server **{guild.name}** ditolak."
+            )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            content="❌ Permintaan ditolak.",
+            embed=None,
+            view=None
+        )
+
+
+class SelectedServerOwnerView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        guild_ids: list[int]
+    ):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.guild_ids = [
+            int(x)
+            for x in guild_ids
+        ]
+
+    async def valid(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Menu ini bukan milikmu."
+            )
+            return None
+
+        if self.guild_id not in self.guild_ids:
+            await safe_reply(
+                interaction,
+                "🔒 Server tidak tersedia."
+            )
+            return None
+
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await safe_reply(
+                interaction,
+                "❌ Server tidak ditemukan."
+            )
+            return None
+
+        return guild
+
+    @discord.ui.button(
+        label="Pemilik Server",
+        emoji="👑",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def server_owner(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        owner = guild.owner
+        owner_name = (
+            str(owner)
+            if owner
+            else f"User ID {guild.owner_id}"
+        )
+
+        await safe_reply(
+            interaction,
+            (
+                f"👑 Pemilik **{guild.name}** adalah "
+                f"<@{guild.owner_id}> (`{owner_name}`).\n"
+                "Tekan mention tersebut untuk membuka profil Discord pemilik server."
+            )
+        )
+
+    @discord.ui.button(
+        label="Minta Akses Host",
+        emoji="📨",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def request_access(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        hosts = get_hosts(guild.id)
+
+        if not hosts:
+            await safe_reply(
+                interaction,
+                (
+                    "ℹ️ Server ini belum mempunyai host.\n"
+                    "Pemilik server perlu menambahkan host terlebih dahulu."
+                )
+            )
+            return
+
+        try:
+            owner = (
+                guild.owner
+                or await bot.fetch_user(int(guild.owner_id))
+            )
+
+            await owner.send(
+                content=(
+                    f"📨 **Permintaan Host Manager**\n"
+                    f"Server: **{guild.name}**\n"
+                    f"User: <@{self.user_id}> (`{self.user_id}`)\n\n"
+                    "Pilih host di bawah untuk memberikan akses kepada user ini."
+                ),
+                view=ServerOwnerHostGrantView(
+                    self.user_id,
+                    guild.id
+                )
+            )
+            sent = True
+        except Exception:
+            sent = False
+
+        await safe_reply(
+            interaction,
+            (
+                f"✅ Permintaan sudah dikirim ke pemilik server "
+                f"<@{guild.owner_id}>."
+                if sent
+                else (
+                    f"⚠️ Pemilik server adalah <@{guild.owner_id}>, tetapi bot "
+                    "tidak dapat mengirim DM kepadanya. "
+                    "Kamu bisa menekan mention tersebut dan menghubunginya langsung."
+                )
+            )
+        )
+
+    @discord.ui.button(
+        label="Pilih Server Lain",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Menu ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=server_owner_contact_embed(
+                self.user_id,
+                self.guild_ids
+            ),
+            view=ServerOwnerContactView(
+                self.user_id,
+                self.guild_ids
+            )
+        )
+
+
+class ServerOwnerContactView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        guild_ids: list[int]
+    ):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.guild_ids = [
+            int(x)
+            for x in guild_ids
+        ]
+        self.add_item(
+            ServerOwnerContactSelect(
+                self.user_id,
+                self.guild_ids
+            )
+        )
+
+
+
 class DMUserGuildSelect(discord.ui.Select):
     def __init__(self, user_id: int, page: int = 0):
         self.user_id = int(user_id)
@@ -8878,9 +9443,28 @@ class DMUserGuildPickerView(discord.ui.View):
             return
 
         if not host_manager_rows(self.user_id):
-            await safe_reply(
-                interaction,
-                "ℹ️ Belum ada host yang ditugaskan kepadamu."
+            mutual = await user_mutual_guilds(self.user_id)
+            guild_ids = [int(g.id) for g in mutual]
+
+            if not guild_ids:
+                await safe_reply(
+                    interaction,
+                    (
+                        "ℹ️ Belum ada host yang ditugaskan kepadamu dan "
+                        "tidak ditemukan server mutual yang memakai Hi Notifku."
+                    )
+                )
+                return
+
+            await interaction.response.edit_message(
+                embed=server_owner_contact_embed(
+                    self.user_id,
+                    guild_ids
+                ),
+                view=ServerOwnerContactView(
+                    self.user_id,
+                    guild_ids
+                )
             )
             return
 
@@ -16823,12 +17407,34 @@ async def menu_command(interaction: discord.Interaction):
         managed_hosts = host_manager_rows(interaction.user.id)
 
         if not guilds and not managed_hosts:
-            await safe_reply(
-                interaction,
-                (
-                    "ℹ️ Tidak ada server milikmu dan belum ada host yang ditugaskan kepadamu.\n"
-                    "Jika kamu adalah creator/host, minta owner bot menambahkanmu sebagai **Host Manager**."
+            mutual = await user_mutual_guilds(
+                interaction.user.id
+            )
+            guild_ids = [
+                int(guild.id)
+                for guild in mutual
+            ]
+
+            if not guild_ids:
+                await safe_reply(
+                    interaction,
+                    (
+                        "ℹ️ Kamu belum memiliki server atau akses Host Manager, "
+                        "dan tidak ditemukan server mutual yang memakai Hi Notifku."
+                    )
                 )
+                return
+
+            await interaction.response.send_message(
+                embed=server_owner_contact_embed(
+                    interaction.user.id,
+                    guild_ids
+                ),
+                view=ServerOwnerContactView(
+                    interaction.user.id,
+                    guild_ids
+                ),
+                ephemeral=False
             )
             return
 
