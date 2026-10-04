@@ -1,0 +1,12 @@
+HI NOTIFKU — PRE-DEPLOY SECURITY CHECKLIST
+
+1. Jangan commit DISCORD_TOKEN asli.
+2. Jangan commit YOUTUBE_API_KEY asli.
+3. Jangan commit PAYMENT_WEBHOOK_SECRET asli.
+4. Jangan commit AUDIT_WEBHOOK_URL rahasia.
+5. Jika DB_PATH=/data/live_notifier.db, Railway Volume harus mount /data.
+6. Jalankan:
+   python preflight_test.py
+   pip install -r requirements.txt
+   python smoke_test.py
+7. Setelah deploy, cek Startup Integrity dan /owner > Health.

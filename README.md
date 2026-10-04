@@ -1380,3 +1380,209 @@ Peningkatan:
 - tombol `🔄 Refresh` pada `/ping`.
 
 Catatan: public IP dideteksi best-effort melalui endpoint IP lookup. Jika akses IPv6 tidak tersedia pada runtime/provider, IPv6 akan tampil `Tidak tersedia` atau fallback alamat lokal runtime.
+
+## Premium UI v2 — Ringkas
+
+Alur Premium Pemilik Server:
+```text
+/menu
+→ Pemilik Server
+→ pilih server
+→ ⭐ Premium
+→ pilih paket dari dropdown
+→ konfirmasi
+→ buat invoice
+→ pilih metode pembayaran
+```
+
+Peningkatan:
+- satu tombol Premium di dashboard server;
+- dropdown paket menggantikan banyak tombol;
+- tampilan paket satu baris;
+- konfirmasi sebelum invoice;
+- validasi ulang harga saat konfirmasi;
+- rate-limit pembuatan invoice;
+- riwayat Premium per server;
+- queue Global Owner lebih ringkas;
+- detail invoice lebih singkat;
+- Kembali dan Menu Awal tetap tersedia.
+
+## Advanced Operations v4
+
+Tambahan utama:
+- Premium lifecycle: downgrade FREE mem-pause host berlebih, upgrade Premium mengaktifkan kembali host tersebut;
+- Host auto-recovery setiap 30 menit;
+- deteksi gangguan platform berdasarkan error massal;
+- health alert ke Pemilik Server;
+- dashboard Insights 7/30 hari + Health Score;
+- audit timeline server;
+- export JSON + CSV;
+- maintenance per-platform;
+- onboarding/setup checklist;
+- risk state dengan alasan + expiry;
+- Integrity & Repair Center untuk Global Owner;
+- promo code Premium;
+- event timeline transaksi Premium;
+- rollback snapshot helper;
+- Verification Retention tetap 30 hari.
+
+## User Verification Retention — 30 Hari
+
+Retensi verifikasi berlaku untuk **semua user Hi Notifku kecuali Global Owner Bot**.
+
+Default:
+```env
+VERIFICATION_RETENTION_DAYS=30
+```
+
+Alur:
+```text
+User join Server Owner/Support
+→ otomatis verified
+→ record user disimpan
+→ setiap interaksi dengan bot memperbarui last_active_at
+→ tidak aktif 30 hari
+→ record verifikasi user dihapus otomatis
+```
+
+Global Owner Bot:
+- bypass verifikasi user;
+- tidak dibuatkan record `user_verifications`;
+- tidak pernah terkena cleanup retensi 30 hari.
+
+Jika user keluar dari Server Owner/Support, status user langsung menjadi tidak terverifikasi. Reconciliation membership berjalan berkala sebagai recovery bila event Discord terlewat.
+
+Verifikasi kepemilikan server (`guild_owner_verification`) tetap terpisah dan tidak lagi menjadi sasaran cleanup 30 hari user.
+
+## Production Hardening v5
+
+Fitur baru:
+- notification retry + Dead Letter Queue;
+- retry tidak lagi menghapus queue saat delivery gagal;
+- validasi channel, role dan webhook berkala;
+- warning verifikasi user sebelum retensi 30 hari habis;
+- dashboard verifikasi Global Owner;
+- Premium entitlements + priority polling;
+- bulk pause/resume/recheck host + rollback snapshot;
+- Coupon Admin UI;
+- Diagnostic Bundle tanpa secret;
+- Safe Mode jika schema kritis bermasalah;
+- graceful shutdown + WAL checkpoint;
+- tombol Kembali/Menu Awal tetap dipertahankan.
+
+## Payment Verification & Auto Activation v2
+
+Alur pembayaran Premium:
+```text
+pilih paket
+→ pilih metode pembayaran
+→ Saya Sudah Bayar
+→ isi nama pengirim, rekening/e-wallet, waktu, referensi, nominal
+→ upload screenshot bukti
+→ technical proof screening
+→ payment/amount verification
+→ Premium otomatis aktif sesuai jumlah hari paket
+```
+
+Screening bukti:
+- SHA-256 duplicate detection;
+- validasi signature PNG/JPEG/WEBP;
+- batas ukuran file;
+- resolusi gambar;
+- entropy/detail visual;
+- EXIF Software check untuk metadata editing;
+- risk score 0–100;
+- status LULUS / REVIEW / DITOLAK.
+
+Penting: screening gambar tidak menjamin secara mutlak bahwa screenshot asli. Sumber utama aktivasi tetap payment/amount verification. Jika nominal yang benar-benar masuk sudah terverifikasi dan bukti valid sudah tersedia, Premium otomatis aktif.
+
+Environment:
+```env
+AUTO_ACTIVATE_VERIFIED_PAYMENTS=true
+PAYMENT_PROOF_MAX_MB=10
+```
+
+### Instruksi Bukti Transfer
+
+Bukti pembayaran yang disarankan:
+- screenshot asli langsung dari aplikasi pembayaran;
+- transaksi terlihat utuh;
+- nominal, waktu, referensi dan identitas pengirim terlihat;
+- tidak blur pada bagian penting;
+- tidak diedit, diberi filter, stiker, coretan atau watermark;
+- bukan bukti yang pernah dipakai pada invoice lain;
+- gunakan PNG/JPG/JPEG/WEBP.
+
+Mengikuti format ini membantu screening teknis, tetapi tidak menjamin pembayaran dianggap sah tanpa verifikasi transaksi/nominal yang benar-benar masuk.
+
+### Nominal Transfer & Kode Unik
+
+Nominal pembayaran harus **persis sama dengan Total Transfer invoice**, bukan hanya harga paket.
+
+Contoh:
+```text
+Harga paket : Rp25.000
+Kode unik   : 137
+Total bayar : Rp25.137
+```
+
+User wajib transfer **Rp25.137**. Jika transfer Rp25.000, Rp25.100, Rp25.140, atau nominal lain, pembayaran dianggap tidak sesuai. Nominal tidak boleh dibulatkan dan kode unik tidak boleh diubah.
+
+## Professional Payment Core v3
+
+Payment system sekarang memiliki:
+- strict payment state machine;
+- satu invoice aktif per user/server;
+- unique payment reference;
+- underpaid / overpaid / late-payment handling;
+- risk score transaksi;
+- automatic reconciliation;
+- signed webhook-ready callback dengan HMAC SHA-256 + timestamp anti-replay;
+- callback idempotency;
+- payment event retry + DLQ;
+- Payment Health & Settlement dashboard;
+- receipt otomatis setelah Premium aktif;
+- refund status tracking;
+- Super Owner manual override dengan alasan wajib;
+- test mode tanpa mengubah transaksi.
+
+### Normalized webhook payload
+
+```json
+{
+  "event_id": "evt-unique",
+  "invoice_ref": "INV-YYYYMMDD-XXXXXX",
+  "reference_id": "provider-reference",
+  "status": "paid",
+  "amount": 25137
+}
+```
+
+Headers:
+```text
+X-Payment-Timestamp: unix_timestamp
+X-Payment-Signature: sha256_hmac_hex
+```
+
+String yang ditandatangani:
+```text
+{timestamp}.{raw_json_body}
+```
+
+Catatan: callback ini provider-agnostic. Jika provider pembayaran memakai payload/signature berbeda, gunakan adapter sesuai dokumentasi provider tanpa menampilkan nama provider di UI bot.
+
+
+## Pre-Deploy Hardening v6
+
+- server-owner verification missing-row auto repair;
+- host auto-recovery menghormati FREE limit/access/maintenance/platform;
+- TikTok maintenance mematikan live + post;
+- coupon redemption atomic/idempotent;
+- notification dedupe dilepas jika queue write gagal;
+- pending notification unique event index;
+- refund/override duplicate guard;
+- Railway Volume/DB preflight;
+- QRIS + backup storage checks;
+- backup restore smoke-test;
+- request recovery tiap jam;
+- preflight + runtime smoke-test scripts.

@@ -2,6 +2,7 @@ import os
 import io
 import json
 import hashlib
+import hmac
 import time
 import asyncio
 import csv
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
@@ -24,10 +26,11 @@ from TikTokLive import TikTokLiveClient
 from yt_dlp import YoutubeDL
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageStat
 except Exception:
     Image = None
     ImageDraw = None
+    ImageStat = None
 
 load_dotenv()
 
@@ -68,6 +71,56 @@ AUTO_PAUSE_ERRORS = max(ERROR_ALERT_THRESHOLD, int(os.getenv("AUTO_PAUSE_ERRORS"
 NOTIFICATION_SEND_CONCURRENCY = max(1, min(10, int(os.getenv("NOTIFICATION_SEND_CONCURRENCY", "3"))))
 NOTIFICATION_MIN_DELAY_MS = max(0, min(5000, int(os.getenv("NOTIFICATION_MIN_DELAY_MS", "250"))))
 EVENT_RETENTION_DAYS = max(7, int(os.getenv("EVENT_RETENTION_DAYS", "30")))
+NOTIFICATION_MAX_RETRIES = max(
+    1,
+    min(10, int(os.getenv("NOTIFICATION_MAX_RETRIES", "3")))
+)
+NOTIFICATION_RETRY_SECONDS = max(
+    15,
+    min(3600, int(os.getenv("NOTIFICATION_RETRY_SECONDS", "60")))
+)
+VERIFICATION_WARNING_DAYS = max(
+    1,
+    min(14, int(os.getenv("VERIFICATION_WARNING_DAYS", "7")))
+)
+AUTO_ACTIVATE_VERIFIED_PAYMENTS = os.getenv(
+    "AUTO_ACTIVATE_VERIFIED_PAYMENTS",
+    "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+PAYMENT_PROOF_MAX_MB = max(
+    2,
+    min(20, int(os.getenv("PAYMENT_PROOF_MAX_MB", "10")))
+)
+PAYMENT_WEBHOOK_ENABLED = os.getenv(
+    "PAYMENT_WEBHOOK_ENABLED",
+    "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+PAYMENT_WEBHOOK_SECRET = os.getenv("PAYMENT_WEBHOOK_SECRET", "").strip()
+PAYMENT_WEBHOOK_PATH = os.getenv(
+    "PAYMENT_WEBHOOK_PATH",
+    "/payment/callback"
+).strip() or "/payment/callback"
+PAYMENT_WEBHOOK_PORT = max(
+    1,
+    min(65535, int(os.getenv("PORT", os.getenv("PAYMENT_WEBHOOK_PORT", "8080"))))
+)
+PAYMENT_WEBHOOK_MAX_SKEW_SECONDS = max(
+    60,
+    min(3600, int(os.getenv("PAYMENT_WEBHOOK_MAX_SKEW_SECONDS", "300")))
+)
+PAYMENT_EVENT_MAX_RETRIES = max(
+    1,
+    min(10, int(os.getenv("PAYMENT_EVENT_MAX_RETRIES", "5")))
+)
+PAYMENT_EVENT_RETRY_SECONDS = max(
+    30,
+    min(3600, int(os.getenv("PAYMENT_EVENT_RETRY_SECONDS", "120")))
+)
+PAYMENT_DUAL_APPROVAL_THRESHOLD = max(
+    0,
+    int(os.getenv("PAYMENT_DUAL_APPROVAL_THRESHOLD", "0"))
+)
 USE_AUTO_SHARDING = os.getenv("USE_AUTO_SHARDING", "false").strip().lower() in {"1", "true", "yes", "on"}
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 PAYMENT_LOG_CHANNEL_ID = int(os.getenv("PAYMENT_LOG_CHANNEL_ID", "0") or 0)
@@ -76,6 +129,10 @@ TRANSACTION_RETENTION_DAYS = max(30, int(os.getenv("TRANSACTION_RETENTION_DAYS",
 ACTIVITY_RETENTION_DAYS = max(7, int(os.getenv("ACTIVITY_RETENTION_DAYS", "90")))
 EXPIRED_INVOICE_RETENTION_DAYS = max(7, int(os.getenv("EXPIRED_INVOICE_RETENTION_DAYS", "30")))
 DB_MAINTENANCE_HOURS = max(6, int(os.getenv("DB_MAINTENANCE_HOURS", "24")))
+VERIFICATION_RETENTION_DAYS = max(
+    7,
+    int(os.getenv("VERIFICATION_RETENTION_DAYS", "30"))
+)
 
 _db_parent = os.path.dirname(os.path.abspath(DB_PATH))
 AUTO_BACKUP_DIR = os.getenv(
@@ -151,6 +208,11 @@ user_action_cooldowns = {}
 pending_restore_previews = {}
 
 notification_send_semaphore = asyncio.Semaphore(NOTIFICATION_SEND_CONCURRENCY)
+SAFE_MODE = False
+SAFE_MODE_REASON = ""
+payment_web_runner = None
+
+
 runtime_metrics = {
     "notifications_sent": 0,
     "notifications_failed": 0,
@@ -865,6 +927,100 @@ def migrate_database():
 
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS host_plan_pause (
+                host_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                paused_at INTEGER NOT NULL,
+                reason TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS host_auto_recovery (
+                host_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                auto_paused_at INTEGER NOT NULL,
+                last_retry_at INTEGER,
+                retry_count INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_risk_meta (
+                guild_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                expires_at INTEGER,
+                updated_by INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS platform_incidents (
+                platform TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'normal',
+                error_hosts INTEGER NOT NULL DEFAULT 0,
+                total_hosts INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_coupons (
+                code TEXT PRIMARY KEY,
+                discount_type TEXT NOT NULL,
+                discount_value INTEGER NOT NULL,
+                expires_at INTEGER,
+                max_uses INTEGER,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_coupon_redemptions (
+                order_id INTEGER PRIMARY KEY,
+                code TEXT NOT NULL,
+                discount_amount INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                redeemed_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_order_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                actor_id INTEGER,
+                detail TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS owner_health_alerts (
+                host_id INTEGER PRIMARY KEY,
+                last_error_count INTEGER NOT NULL,
+                last_sent_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rollback_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_by INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS request_reminders (
                 request_kind TEXT NOT NULL,
                 request_id INTEGER NOT NULL,
@@ -883,6 +1039,24 @@ def migrate_database():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_verifications (
+                user_id INTEGER PRIMARY KEY,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at INTEGER,
+                last_checked_at INTEGER NOT NULL,
+                last_active_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                verification_source TEXT,
+                status_reason TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_verifications_active
+            ON user_verifications(verified, last_active_at)
+        """)
+
         if not table_exists(conn, "guild_owner_verification"):
             conn.execute("""
                 CREATE TABLE guild_owner_verification (
@@ -893,7 +1067,9 @@ def migrate_database():
                     last_checked_at INTEGER NOT NULL,
                     created_at INTEGER NOT NULL,
                     verification_source TEXT,
-                    status_reason TEXT
+                    status_reason TEXT,
+                    last_active_at INTEGER,
+                    inactive_since INTEGER
                 )
             """)
         else:
@@ -914,6 +1090,18 @@ def migrate_database():
                 conn.execute(
                     "ALTER TABLE guild_owner_verification "
                     "ADD COLUMN status_reason TEXT"
+                )
+
+            if "last_active_at" not in verification_columns:
+                conn.execute(
+                    "ALTER TABLE guild_owner_verification "
+                    "ADD COLUMN last_active_at INTEGER"
+                )
+
+            if "inactive_since" not in verification_columns:
+                conn.execute(
+                    "ALTER TABLE guild_owner_verification "
+                    "ADD COLUMN inactive_since INTEGER"
                 )
 
         # Legacy single payment configuration
@@ -1019,6 +1207,97 @@ def migrate_database():
         add_column_if_missing(conn, "premium_orders", "invoice_ref", "TEXT")
         add_column_if_missing(conn, "premium_orders", "processing_by", "INTEGER")
         add_column_if_missing(conn, "premium_orders", "processing_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_sender_name", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_sender_account", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_transfer_time", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_reference", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_declared_amount", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_note", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_details_submitted_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_scan_status", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_scan_score", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_scan_detail", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_scan_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_file_size", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_image_width", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_image_height", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_mime", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_edit_software", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "payment_reference", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "payment_source", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "paid_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "payment_verified_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "risk_score", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing(conn, "premium_orders", "risk_level", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "risk_reasons", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "late_payment", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing(conn, "premium_orders", "refund_status", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "refund_reason", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "refunded_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "override_reason", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "receipt_sent_at", "INTEGER")
+
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_premium_orders_payment_reference
+            ON premium_orders(payment_reference)
+            WHERE payment_reference IS NOT NULL
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_callback_events (
+                event_id TEXT PRIMARY KEY,
+                invoice_ref TEXT,
+                reference_id TEXT,
+                amount INTEGER,
+                payment_status TEXT,
+                payload_hash TEXT NOT NULL,
+                signature_valid INTEGER NOT NULL DEFAULT 0,
+                received_at INTEGER NOT NULL,
+                processed_at INTEGER,
+                process_status TEXT NOT NULL DEFAULT 'received',
+                error TEXT
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_event_dead_letter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_health (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                last_callback_at INTEGER,
+                last_success_at INTEGER,
+                last_failure_at INTEGER,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO payment_health(
+                id, success_count, failure_count
+            )
+            VALUES(1,0,0)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_approvals (
+                order_id INTEGER NOT NULL,
+                approver_id INTEGER NOT NULL,
+                approved_at INTEGER NOT NULL,
+                PRIMARY KEY(order_id, approver_id)
+            )
+        """)
 
         add_column_if_missing(conn, "guild_settings", "premium_grace_until", "INTEGER")
         add_column_if_missing(conn, "guild_settings", "setup_completed", "INTEGER NOT NULL DEFAULT 0")
@@ -1323,6 +1602,43 @@ def migrate_database():
                 )
             """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notification_dead_letter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                host_id INTEGER NOT NULL,
+                event_type TEXT,
+                event_key TEXT,
+                content TEXT,
+                embed_json TEXT NOT NULL,
+                source_url TEXT,
+                failure_reason TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                resolved_at INTEGER
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS validation_alerts (
+                alert_key TEXT PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                host_id INTEGER,
+                alert_type TEXT NOT NULL,
+                sent_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_verification_warnings (
+                user_id INTEGER NOT NULL,
+                expiry_at INTEGER NOT NULL,
+                days_before INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY(user_id, expiry_at, days_before)
+            )
+        """)
+
         if not table_exists(conn, "notification_history"):
             conn.execute("""
                 CREATE TABLE notification_history (
@@ -1369,6 +1685,31 @@ def migrate_database():
                     created_at INTEGER NOT NULL
                 )
             """)
+
+        add_column_if_missing(
+            conn,
+            "pending_notifications",
+            "retry_count",
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+        add_column_if_missing(
+            conn,
+            "pending_notifications",
+            "max_retries",
+            f"INTEGER NOT NULL DEFAULT {NOTIFICATION_MAX_RETRIES}"
+        )
+        add_column_if_missing(
+            conn,
+            "pending_notifications",
+            "last_error",
+            "TEXT"
+        )
+
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_notifications_event_unique
+            ON pending_notifications(host_id, event_key, event_type)
+            WHERE event_key IS NOT NULL
+        """)
 
         if not table_exists(conn, "api_usage"):
             conn.execute("""
@@ -1504,6 +1845,26 @@ def set_plan(
             """, (guild_id,))
 
         conn.commit()
+
+    if plan == "premium":
+        restored = reactivate_plan_paused_hosts(guild_id)
+        if restored:
+            add_activity(
+                guild_id,
+                None,
+                "Premium Host Reactivation",
+                f"{restored} host dipulihkan setelah Premium aktif."
+            )
+    else:
+        paused = pause_excess_hosts_for_free(guild_id)
+        if paused:
+            add_activity(
+                guild_id,
+                None,
+                "FREE Host Limit Applied",
+                f"{paused} host dipause karena limit FREE."
+            )
+
 
 
 def premium_remaining_seconds(guild_id: int) -> Optional[int]:
@@ -2676,6 +3037,18 @@ def set_host_health(
 
         conn.commit()
 
+    if not success:
+        refreshed = get_host(host_id)
+        if (
+            refreshed
+            and not refreshed["enabled"]
+            and int(refreshed["error_count"] or 0) >= int(
+                refreshed["auto_pause_threshold"] or AUTO_PAUSE_ERRORS
+            )
+        ):
+            mark_host_auto_paused(host_id)
+
+
 
 def get_live_state(guild_id: int, platform: str, target: str):
     with closing(db()) as conn:
@@ -2830,7 +3203,7 @@ def add_activity(
 
         conn.execute("""
             INSERT INTO schema_meta(id, version, updated_at)
-            VALUES(1,16,?)
+            VALUES(1,18,?)
             ON CONFLICT(id)
             DO UPDATE SET
                 version=excluded.version,
@@ -2850,6 +3223,472 @@ def recent_activity(guild_id: int, limit: int = 10):
             guild_id,
             limit
         )).fetchall()
+
+
+
+def create_rollback_snapshot(
+    guild_id: int,
+    reason: str,
+    actor_id: Optional[int] = None
+) -> int:
+    payload = export_guild_backup(int(guild_id))
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            INSERT INTO rollback_snapshots(
+                guild_id, reason, payload_json, created_by, created_at
+            )
+            VALUES(?,?,?,?,?)
+        """, (
+            int(guild_id),
+            str(reason)[:200],
+            json.dumps(payload, ensure_ascii=False),
+            int(actor_id) if actor_id else None,
+            int(time.time())
+        ))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def pause_excess_hosts_for_free(guild_id: int) -> int:
+    hosts = list(get_hosts(int(guild_id)))
+    if len(hosts) <= FREE_HOST_LIMIT:
+        return 0
+
+    paused = 0
+    now = int(time.time())
+    keep_ids = {int(h["id"]) for h in hosts[:FREE_HOST_LIMIT]}
+
+    with closing(db()) as conn:
+        for host in hosts:
+            host_id = int(host["id"])
+            if host_id in keep_ids or not host["enabled"]:
+                continue
+
+            conn.execute("UPDATE hosts SET enabled=0 WHERE id=?", (host_id,))
+            conn.execute("""
+                INSERT INTO host_plan_pause(host_id, guild_id, paused_at, reason)
+                VALUES(?,?,?,'free_limit')
+                ON CONFLICT(host_id)
+                DO UPDATE SET
+                    guild_id=excluded.guild_id,
+                    paused_at=excluded.paused_at,
+                    reason=excluded.reason
+            """, (host_id, int(guild_id), now))
+            paused += 1
+        conn.commit()
+
+    return paused
+
+
+def reactivate_plan_paused_hosts(guild_id: int) -> int:
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT host_id FROM host_plan_pause
+            WHERE guild_id=?
+            ORDER BY paused_at ASC
+        """, (int(guild_id),)).fetchall()
+
+        restored = 0
+        for row in rows:
+            host_id = int(row["host_id"])
+            exists = conn.execute(
+                "SELECT 1 FROM hosts WHERE id=? AND guild_id=?",
+                (host_id, int(guild_id))
+            ).fetchone()
+            if exists:
+                conn.execute("UPDATE hosts SET enabled=1 WHERE id=?", (host_id,))
+                restored += 1
+
+        conn.execute("DELETE FROM host_plan_pause WHERE guild_id=?", (int(guild_id),))
+        conn.commit()
+
+    return restored
+
+
+def mark_host_auto_paused(host_id: int):
+    host = get_host(int(host_id))
+    if not host:
+        return
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO host_auto_recovery(
+                host_id, guild_id, auto_paused_at, last_retry_at, retry_count
+            )
+            VALUES(?,?,?,NULL,0)
+            ON CONFLICT(host_id)
+            DO UPDATE SET
+                guild_id=excluded.guild_id,
+                auto_paused_at=excluded.auto_paused_at
+        """, (
+            int(host_id),
+            int(host["guild_id"]),
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def clear_host_auto_recovery(host_id: int):
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM host_auto_recovery WHERE host_id=?",
+            (int(host_id),)
+        )
+        conn.commit()
+
+
+def server_usage_stats(guild_id: int, days: int = 7) -> dict:
+    since = int(time.time()) - max(1, int(days)) * 86400
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS latency
+            FROM notification_history
+            WHERE guild_id=? AND created_at>=?
+        """, (int(guild_id), since)).fetchone()
+
+    return {
+        "total": int(row["total"] or 0),
+        "sent": int(row["sent"] or 0),
+        "failed": int(row["failed"] or 0),
+        "latency": round(float(row["latency"] or 0)),
+    }
+
+
+def server_health_score(guild_id: int) -> int:
+    hosts = list(get_hosts(int(guild_id)))
+    if not hosts:
+        return 100
+    return round(sum(host_health_score(h) for h in hosts) / len(hosts))
+
+
+def get_server_risk_meta(guild_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM server_risk_meta WHERE guild_id=?",
+            (int(guild_id),)
+        ).fetchone()
+
+
+def set_server_risk_meta(
+    guild_id: int,
+    *,
+    reason: str = "",
+    expires_at: Optional[int] = None,
+    actor_id: Optional[int] = None
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO server_risk_meta(
+                guild_id, reason, expires_at, updated_by, updated_at
+            )
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(guild_id)
+            DO UPDATE SET
+                reason=excluded.reason,
+                expires_at=excluded.expires_at,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+        """, (
+            int(guild_id),
+            str(reason)[:500],
+            int(expires_at) if expires_at else None,
+            int(actor_id) if actor_id else None,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def effective_access_state(guild_id: int) -> str:
+    settings = get_guild_settings(int(guild_id))
+    state = str(settings["access_state"] or "allowed")
+    meta = get_server_risk_meta(guild_id)
+
+    if (
+        state in {"warning", "suspended"}
+        and meta
+        and meta["expires_at"]
+        and int(meta["expires_at"]) <= int(time.time())
+    ):
+        set_access_state(guild_id, "allowed")
+        set_server_risk_meta(
+            guild_id,
+            reason="Status risiko kedaluwarsa otomatis.",
+            expires_at=None
+        )
+        return "allowed"
+
+    return state
+
+
+def platform_maintenance_key(platform: str) -> str:
+    keys = platform_feature_keys(platform)
+    return keys[0] if keys else ""
+
+
+def platform_enabled(guild_id: int, platform: str) -> bool:
+    keys = platform_feature_keys(platform)
+    return all(feature_enabled(guild_id, key) for key in keys) if keys else True
+
+
+def set_platform_enabled(guild_id: int, platform: str, enabled: bool):
+    keys = platform_feature_keys(platform)
+    if not keys:
+        raise ValueError("Platform tidak valid.")
+
+    flags = feature_flags_for_guild(guild_id)
+    for key in keys:
+        if key not in flags:
+            raise ValueError(f"Feature tidak valid: {key}")
+        flags[key] = bool(enabled)
+
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
+            (json.dumps(flags), int(guild_id))
+        )
+        conn.commit()
+
+
+def set_single_feature(guild_id: int, feature: str, enabled: bool):
+    flags = feature_flags_for_guild(guild_id)
+    if feature not in flags:
+        raise ValueError("Feature tidak valid.")
+
+    flags[feature] = bool(enabled)
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
+            (json.dumps(flags), int(guild_id))
+        )
+        conn.commit()
+
+
+def coupon_get(code_value: str):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM premium_coupons WHERE code=?",
+            (str(code_value).strip().upper(),)
+        ).fetchone()
+
+
+def coupon_discount(code_value: str, price: int) -> tuple[int, int]:
+    row = coupon_get(code_value)
+    if not row or not row["enabled"]:
+        raise ValueError("Kode promo tidak valid.")
+
+    now = int(time.time())
+    if row["expires_at"] and int(row["expires_at"]) <= now:
+        raise ValueError("Kode promo sudah kedaluwarsa.")
+
+    if (
+        row["max_uses"] is not None
+        and int(row["used_count"] or 0) >= int(row["max_uses"])
+    ):
+        raise ValueError("Kuota kode promo sudah habis.")
+
+    value = int(row["discount_value"])
+    if row["discount_type"] == "percent":
+        discount = min(int(price), max(0, int(price) * value // 100))
+    else:
+        discount = min(int(price), max(0, value))
+
+    return max(0, int(price) - discount), discount
+
+
+def redeem_coupon_atomic(
+    order_id: int,
+    code_value: str,
+    *,
+    user_id: int,
+    guild_id: int,
+    base_price: int
+) -> tuple[int, int]:
+    code_value = str(code_value).strip().upper()
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute("""
+            SELECT discount_amount
+            FROM premium_coupon_redemptions
+            WHERE order_id=? AND code=?
+        """, (int(order_id), code_value)).fetchone()
+
+        if existing:
+            discount = int(existing["discount_amount"] or 0)
+            conn.commit()
+            return max(0, int(base_price) - discount), discount
+
+        row = conn.execute(
+            "SELECT * FROM premium_coupons WHERE code=?",
+            (code_value,)
+        ).fetchone()
+
+        if not row or not row["enabled"]:
+            conn.rollback()
+            raise ValueError("Kode promo tidak valid.")
+        if row["expires_at"] and int(row["expires_at"]) <= now:
+            conn.rollback()
+            raise ValueError("Kode promo sudah kedaluwarsa.")
+        if (
+            row["max_uses"] is not None
+            and int(row["used_count"] or 0) >= int(row["max_uses"])
+        ):
+            conn.rollback()
+            raise ValueError("Kuota kode promo sudah habis.")
+
+        value = int(row["discount_value"])
+        if row["discount_type"] == "percent":
+            discount = min(int(base_price), max(0, int(base_price) * value // 100))
+        else:
+            discount = min(int(base_price), max(0, value))
+
+        cur = conn.execute("""
+            UPDATE premium_coupons
+            SET used_count=used_count+1
+            WHERE code=? AND enabled=1
+              AND (max_uses IS NULL OR used_count < max_uses)
+        """, (code_value,))
+        if cur.rowcount != 1:
+            conn.rollback()
+            raise ValueError("Kuota kode promo sudah habis.")
+
+        conn.execute("""
+            INSERT INTO premium_coupon_redemptions(
+                order_id, code, discount_amount,
+                user_id, guild_id, redeemed_at
+            )
+            VALUES(?,?,?,?,?,?)
+        """, (
+            int(order_id), code_value, int(discount),
+            int(user_id), int(guild_id), now
+        ))
+        conn.commit()
+
+    return max(0, int(base_price) - discount), discount
+
+
+def create_coupon(
+    code_value: str,
+    discount_type: str,
+    discount_value: int,
+    *,
+    expires_at: Optional[int] = None,
+    max_uses: Optional[int] = None,
+    actor_id: Optional[int] = None
+):
+    kind = "percent" if str(discount_type).lower() == "percent" else "fixed"
+    code_value = str(code_value).strip().upper()
+    if not code_value:
+        raise ValueError("Kode promo kosong.")
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO premium_coupons(
+                code, discount_type, discount_value, expires_at,
+                max_uses, used_count, enabled, created_by, created_at
+            )
+            VALUES(?,?,?,?,?,0,1,?,?)
+            ON CONFLICT(code)
+            DO UPDATE SET
+                discount_type=excluded.discount_type,
+                discount_value=excluded.discount_value,
+                expires_at=excluded.expires_at,
+                max_uses=excluded.max_uses,
+                enabled=1
+        """, (
+            code_value,
+            kind,
+            max(0, int(discount_value)),
+            int(expires_at) if expires_at else None,
+            int(max_uses) if max_uses else None,
+            int(actor_id) if actor_id else None,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def record_premium_event(
+    order_id: int,
+    status: str,
+    *,
+    actor_id: Optional[int] = None,
+    detail: str = ""
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO premium_order_events(
+                order_id, status, actor_id, detail, created_at
+            )
+            VALUES(?,?,?,?,?)
+        """, (
+            int(order_id),
+            str(status)[:80],
+            int(actor_id) if actor_id else None,
+            str(detail)[:500],
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def database_integrity_report() -> dict:
+    cutoff = int(time.time()) - 1800
+    with closing(db()) as conn:
+        orphan_managers = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM host_managers hm
+            LEFT JOIN hosts h ON h.id=hm.host_id
+            WHERE h.id IS NULL
+        """).fetchone()["total"]
+
+        stuck_access = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM server_host_access_requests
+            WHERE status='processing'
+              AND processed_at<?
+        """, (cutoff,)).fetchone()["total"]
+
+        stuck_hosts = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM host_creation_requests
+            WHERE status='processing'
+              AND processed_at<?
+        """, (cutoff,)).fetchone()["total"]
+
+    return {
+        "orphan_managers": int(orphan_managers or 0),
+        "stuck_access": int(stuck_access or 0),
+        "stuck_hosts": int(stuck_hosts or 0),
+    }
+
+
+def repair_database_integrity() -> dict:
+    report = database_integrity_report()
+    cutoff = int(time.time()) - 1800
+
+    with closing(db()) as conn:
+        conn.execute("""
+            DELETE FROM host_managers
+            WHERE host_id NOT IN (SELECT id FROM hosts)
+        """)
+        conn.execute("""
+            UPDATE server_host_access_requests
+            SET status='pending', processed_by=NULL, processed_at=NULL
+            WHERE status='processing' AND processed_at<?
+        """, (cutoff,))
+        conn.execute("""
+            UPDATE host_creation_requests
+            SET status='pending', processed_by=NULL, processed_at=NULL
+            WHERE status='processing' AND processed_at<?
+        """, (cutoff,))
+        conn.commit()
+
+    return report
 
 
 
@@ -2886,37 +3725,13 @@ async def notify_primary_owners_premium_request(
     sent = 0
 
     embed = discord.Embed(
-        title=f"⭐ Premium Request #{order_id}",
-        description=f"Server **{guild.name}** mengajukan Premium.",
-        color=discord.Color.gold()
-    )
-    embed.add_field(
-        name="Paket",
-        value=f"📅 **{days} hari**\n💰 **{rupiah(price)}**",
-        inline=False
-    )
-    embed.add_field(
-        name="Server",
-        value=f"`{guild.id}` • {guild.name}",
-        inline=False
-    )
-    embed.add_field(
-        name="Owner Server",
-        value=f"<@{guild.owner_id}> (`{guild.owner_id}`)",
-        inline=False
-    )
-    embed.add_field(
-        name="Peminta",
-        value=f"<@{requester.id}> (`{requester.id}`)",
-        inline=False
-    )
-    embed.add_field(
-        name="Proses",
-        value=(
-            "`/owner` → **Permintaan Premium** → pilih request.\n"
-            "Tandai Dibayar → Aktifkan."
+        title=f"⭐ Premium #{order_id}",
+        description=(
+            f"**{guild.name}** • **{days} hari** • **{rupiah(price)}**\n"
+            f"Peminta: <@{requester.id}>\n"
+            "Buka `/owner` → **Request** untuk memproses."
         ),
-        inline=False
+        color=discord.Color.gold()
     )
 
     for owner_id in primary_owner_ids():
@@ -3000,21 +3815,995 @@ def delete_premium_package(days: int):
 
 def premium_packages_text():
     packages = get_premium_packages()
-
     if not packages:
         return "Belum ada paket Premium."
+    return "\n".join(
+        f"⭐ **{days} hari** • **{rupiah(price)}**"
+        for days, price in packages
+    )
 
+
+def premium_entitlements(guild_id: int) -> dict:
+    plan = str(get_guild_settings(guild_id)["plan"] or "free")
+    premium = plan == "premium"
+
+    return {
+        "host_limit": host_limit_for_guild(guild_id),
+        "analytics_days": 30 if premium else 7,
+        "priority_polling": premium,
+        "custom_templates": premium,
+        "webhook": premium,
+        "extra_channels": premium,
+    }
+
+
+def premium_entitlements_text(guild_id: int) -> str:
+    e = premium_entitlements(guild_id)
+    return (
+        f"Host **{e['host_limit']}** • "
+        f"Analytics **{e['analytics_days']} hari**\n"
+        f"{'✅' if e['priority_polling'] else '🔒'} Priority checker • "
+        f"{'✅' if e['webhook'] else '🔒'} Webhook\n"
+        f"{'✅' if e['extra_channels'] else '🔒'} Extra channel • "
+        f"{'✅' if e['custom_templates'] else '🔒'} Custom template"
+    )
+
+
+
+
+def premium_plan_summary_embed(guild: discord.Guild):
+    settings = get_guild_settings(guild.id)
+    plan = str(settings["plan"] or "free").lower()
+    hosts = len(get_hosts(guild.id))
+    limit = host_limit_for_guild(guild.id)
+
+    embed = discord.Embed(
+        title=f"⭐ Premium • {guild.name}",
+        description="Kelola Premium server secara ringkas.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="Status",
+        value="⭐ **PREMIUM**" if plan == "premium" else "🆓 **FREE**",
+        inline=True
+    )
+    embed.add_field(
+        name="Host",
+        value=f"**{hosts}/{limit}**",
+        inline=True
+    )
+    if plan == "premium":
+        embed.add_field(
+            name="Aktif Sampai",
+            value=premium_expiry_text(guild.id),
+            inline=False
+        )
+    embed.add_field(
+        name="Paket",
+        value=premium_packages_text(),
+        inline=False
+    )
+    embed.add_field(
+        name="Benefit",
+        value=premium_entitlements_text(guild.id),
+        inline=False
+    )
+    embed.set_footer(text="Pilih paket dari dropdown • invoice dibuat setelah konfirmasi")
+    return embed
+
+
+def list_user_premium_orders(user_id: int, guild_id: int, limit: int = 8):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM premium_orders
+            WHERE requester_id=? AND guild_id=?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (
+            int(user_id),
+            int(guild_id),
+            max(1, min(20, int(limit)))
+        )).fetchall()
+
+
+def user_premium_history_embed(user_id: int, guild_id: int):
+    rows = list_user_premium_orders(user_id, guild_id, 8)
     lines = []
-
-    for index, (days, price) in enumerate(packages, start=1):
+    for row in rows:
+        ref = row["invoice_ref"] or ensure_invoice_ref(row["id"])
         lines.append(
-            f"**Paket {index}**\n"
-            f"📅 Hari: **{days} hari**\n"
-            f"💰 Isi Harga: **{rupiah(price)}**"
+            f"• `{ref}` • **{row['days']} hari** • "
+            f"{order_status_label(row['status'])}"
+        )
+    return discord.Embed(
+        title="🧾 Riwayat Premium",
+        description="\n".join(lines) if lines else "Belum ada transaksi Premium.",
+        color=discord.Color.gold()
+    )
+
+
+def premium_queue_embed():
+    counts = premium_order_counts()
+    waiting = (
+        counts["pending"] + counts["proof_submitted"]
+        + counts["amount_mismatch"] + counts["amount_verified"]
+        + counts["paid"]
+    )
+    embed = discord.Embed(
+        title="💳 Premium • Queue",
+        description=f"Perlu diproses: **{waiting}**",
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="Status",
+        value=(
+            f"🟡 Baru **{counts['pending']}** • "
+            f"🧾 Bukti **{counts['proof_submitted']}**\n"
+            f"🔴 Selisih **{counts['amount_mismatch']}** • "
+            f"🟢 Sesuai **{counts['amount_verified']}**\n"
+            f"🔵 Dibayar **{counts['paid']}** • "
+            f"⭐ Aktif **{counts['active']}**"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="Pilih invoice untuk melihat detail")
+    return embed
+
+
+# ============================================================
+# PROFESSIONAL PAYMENT CORE
+# ============================================================
+
+PAYMENT_STATE_TRANSITIONS = {
+    "pending": {
+        "proof_submitted", "amount_verified", "amount_mismatch",
+        "underpaid", "overpaid", "paid", "rejected",
+        "invoice_expired", "late_payment"
+    },
+    "proof_submitted": {
+        "amount_verified", "amount_mismatch", "underpaid",
+        "overpaid", "paid", "rejected", "invoice_expired",
+        "late_payment"
+    },
+    "amount_mismatch": {
+        "amount_verified", "underpaid", "overpaid",
+        "rejected", "invoice_expired"
+    },
+    "underpaid": {
+        "amount_verified", "overpaid", "rejected",
+        "invoice_expired", "refund_pending"
+    },
+    "overpaid": {
+        "amount_verified", "underpaid", "rejected",
+        "invoice_expired", "refund_pending"
+    },
+    "amount_verified": {
+        "paid", "processing", "active", "refund_pending"
+    },
+    "paid": {
+        "processing", "active", "refund_pending"
+    },
+    "processing": {
+        "active", "amount_verified", "paid", "refund_pending"
+    },
+    "active": {
+        "expired", "refund_pending"
+    },
+    "expired": {
+        "refund_pending"
+    },
+    "invoice_expired": {
+        "late_payment", "rejected"
+    },
+    "late_payment": {
+        "amount_verified", "refund_pending", "rejected"
+    },
+    "refund_pending": {
+        "refunded", "refund_failed"
+    },
+    "refund_failed": {
+        "refund_pending", "refunded"
+    },
+    "rejected": set(),
+    "refunded": set(),
+}
+
+
+def payment_transition_allowed(current: str, target: str) -> bool:
+    if current == target:
+        return True
+    return target in PAYMENT_STATE_TRANSITIONS.get(str(current), set())
+
+
+def payment_reference_in_use(
+    reference_id: str,
+    *,
+    exclude_order_id: Optional[int] = None
+) -> bool:
+    ref = str(reference_id or "").strip()
+    if not ref:
+        return False
+
+    sql = """
+        SELECT id FROM premium_orders
+        WHERE payment_reference=?
+    """
+    args = [ref]
+
+    if exclude_order_id is not None:
+        sql += " AND id<>?"
+        args.append(int(exclude_order_id))
+
+    sql += " LIMIT 1"
+
+    with closing(db()) as conn:
+        return conn.execute(sql, tuple(args)).fetchone() is not None
+
+
+def calculate_payment_risk(order) -> tuple[int, str, list[str]]:
+    score = 0
+    reasons = []
+
+    scan_status = (
+        str(order["proof_scan_status"] or "")
+        if "proof_scan_status" in order.keys()
+        else ""
+    )
+
+    if scan_status == "review":
+        score += 25
+        reasons.append("Bukti perlu review.")
+    elif scan_status == "rejected":
+        score += 60
+        reasons.append("Bukti ditolak screening.")
+
+    if (
+        "proof_edit_software" in order.keys()
+        and order["proof_edit_software"]
+    ):
+        score += 20
+        reasons.append("Metadata editing terdeteksi.")
+
+    if order["received_amount"] is not None:
+        expected = int(order["expected_amount"] or order["price"])
+        received = int(order["received_amount"])
+        if received != expected:
+            score += 30
+            reasons.append("Nominal transfer tidak sesuai.")
+
+    if "late_payment" in order.keys() and int(order["late_payment"] or 0):
+        score += 20
+        reasons.append("Pembayaran diterima setelah invoice expired.")
+
+    with closing(db()) as conn:
+        recent = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM premium_orders
+            WHERE requester_id=?
+              AND id<>?
+              AND created_at>=?
+              AND status IN (
+                  'amount_mismatch','underpaid','overpaid',
+                  'rejected','invoice_expired'
+              )
+        """, (
+            int(order["requester_id"]),
+            int(order["id"]),
+            int(time.time()) - 30 * 86400
+        )).fetchone()
+
+    failed_recent = int(recent["total"] or 0)
+    if failed_recent >= 3:
+        bump = min(20, failed_recent * 3)
+        score += bump
+        reasons.append(f"{failed_recent} transaksi bermasalah dalam 30 hari.")
+
+    score = max(0, min(100, score))
+
+    if score < 25:
+        level = "low"
+    elif score < 50:
+        level = "medium"
+    elif score < 75:
+        level = "high"
+    else:
+        level = "critical"
+
+    if not reasons:
+        reasons.append("Tidak ada indikator risiko utama.")
+
+    return score, level, reasons
+
+
+def refresh_payment_risk(order_id: int):
+    order = get_premium_order(order_id)
+    if not order:
+        return
+
+    score, level, reasons = calculate_payment_risk(order)
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE premium_orders
+            SET risk_score=?, risk_level=?, risk_reasons=?, updated_at=?
+            WHERE id=?
+        """, (
+            score,
+            level,
+            " | ".join(reasons)[:1500],
+            int(time.time()),
+            int(order_id)
+        ))
+        conn.commit()
+
+
+def payment_health_update(
+    *,
+    success: bool,
+    error: Optional[str] = None,
+    callback: bool = False
+):
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        if success:
+            conn.execute("""
+                UPDATE payment_health
+                SET
+                    last_callback_at=CASE WHEN ? THEN ? ELSE last_callback_at END,
+                    last_success_at=?,
+                    success_count=success_count+1,
+                    last_error=NULL
+                WHERE id=1
+            """, (
+                1 if callback else 0,
+                now,
+                now
+            ))
+        else:
+            conn.execute("""
+                UPDATE payment_health
+                SET
+                    last_callback_at=CASE WHEN ? THEN ? ELSE last_callback_at END,
+                    last_failure_at=?,
+                    failure_count=failure_count+1,
+                    last_error=?
+                WHERE id=1
+            """, (
+                1 if callback else 0,
+                now,
+                now,
+                str(error or "Unknown payment error")[:1000]
+            ))
+        conn.commit()
+
+
+def payment_health_row():
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM payment_health WHERE id=1"
+        ).fetchone()
+
+
+def settlement_stats(days: int = 1) -> dict:
+    since = int(time.time()) - max(1, int(days)) * 86400
+
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total_orders,
+                SUM(CASE WHEN status IN ('active','expired') THEN 1 ELSE 0 END) AS successful,
+                SUM(CASE WHEN status='refunded' THEN 1 ELSE 0 END) AS refunded,
+                SUM(CASE WHEN status IN (
+                    'pending','proof_submitted','amount_verified',
+                    'paid','processing','underpaid','overpaid','late_payment'
+                ) THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status IN ('active','expired') THEN price ELSE 0 END) AS gross,
+                SUM(CASE WHEN status='refunded' THEN price ELSE 0 END) AS refund_total
+            FROM premium_orders
+            WHERE created_at>=?
+        """, (since,)).fetchone()
+
+    gross = int(row["gross"] or 0)
+    refunds = int(row["refund_total"] or 0)
+
+    return {
+        "total_orders": int(row["total_orders"] or 0),
+        "successful": int(row["successful"] or 0),
+        "refunded": int(row["refunded"] or 0),
+        "pending": int(row["pending"] or 0),
+        "gross": gross,
+        "refund_total": refunds,
+        "net": gross - refunds,
+    }
+
+
+def payment_settlement_embed():
+    d1 = settlement_stats(1)
+    d30 = settlement_stats(30)
+
+    embed = discord.Embed(
+        title="💰 Payment Settlement",
+        description="Ringkasan settlement berdasarkan data transaksi bot.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="24 Jam",
+        value=(
+            f"Berhasil **{d1['successful']}** • Pending **{d1['pending']}**\n"
+            f"Refund **{d1['refunded']}** • Net **{rupiah(d1['net'])}**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="30 Hari",
+        value=(
+            f"Berhasil **{d30['successful']}** • Pending **{d30['pending']}**\n"
+            f"Gross **{rupiah(d30['gross'])}** • Refund **{rupiah(d30['refund_total'])}**\n"
+            f"Net **{rupiah(d30['net'])}**"
+        ),
+        inline=False
+    )
+    return embed
+
+
+def payment_health_embed():
+    health = payment_health_row()
+
+    last_callback = (
+        f"<t:{int(health['last_callback_at'])}:R>"
+        if health and health["last_callback_at"]
+        else "-"
+    )
+    last_success = (
+        f"<t:{int(health['last_success_at'])}:R>"
+        if health and health["last_success_at"]
+        else "-"
+    )
+    last_failure = (
+        f"<t:{int(health['last_failure_at'])}:R>"
+        if health and health["last_failure_at"]
+        else "-"
+    )
+
+    embed = discord.Embed(
+        title="🩺 Payment Health",
+        description=(
+            f"Webhook: **{'ON' if PAYMENT_WEBHOOK_ENABLED else 'OFF'}**\n"
+            f"Auto activation: **{'ON' if AUTO_ACTIVATE_VERIFIED_PAYMENTS else 'OFF'}**"
+        ),
+        color=discord.Color.green()
+    )
+    embed.add_field(
+        name="Callback",
+        value=(
+            f"Terakhir: {last_callback}\n"
+            f"Sukses: **{int(health['success_count'] or 0) if health else 0}**\n"
+            f"Gagal: **{int(health['failure_count'] or 0) if health else 0}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Status terakhir",
+        value=(
+            f"Sukses: {last_success}\n"
+            f"Gagal: {last_failure}"
+        ),
+        inline=True
+    )
+    if health and health["last_error"]:
+        embed.add_field(
+            name="Error terakhir",
+            value=f"`{str(health['last_error'])[:900]}`",
+            inline=False
+        )
+    return embed
+
+
+def payment_event_dlq_count() -> int:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM payment_event_dead_letter
+            WHERE resolved_at IS NULL
+        """).fetchone()
+    return int(row["total"] or 0)
+
+
+def payment_receipt_embed(order):
+    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
+    paid_at = (
+        int(order["paid_at"])
+        if "paid_at" in order.keys() and order["paid_at"]
+        else int(order["payment_verified_at"])
+        if "payment_verified_at" in order.keys() and order["payment_verified_at"]
+        else int(order["activated_at"] or time.time())
+    )
+
+    embed = discord.Embed(
+        title="🧾 Receipt • Hi Notifku",
+        description=f"Invoice `{invoice_ref}`",
+        color=discord.Color.green()
+    )
+    embed.add_field(
+        name="Paket",
+        value=f"⭐ {int(order['days'])} hari",
+        inline=True
+    )
+    embed.add_field(
+        name="Total",
+        value=rupiah(int(order["expected_amount"] or order["price"])),
+        inline=True
+    )
+    embed.add_field(
+        name="Dibayar",
+        value=f"<t:{paid_at}:F>",
+        inline=False
+    )
+    if order["expires_at"]:
+        embed.add_field(
+            name="Premium sampai",
+            value=f"<t:{int(order['expires_at'])}:F>",
+            inline=False
+        )
+    if "payment_reference" in order.keys() and order["payment_reference"]:
+        embed.add_field(
+            name="Referensi",
+            value=f"`{str(order['payment_reference'])[:120]}`",
+            inline=False
+        )
+    embed.set_footer(text="Simpan receipt ini sebagai bukti transaksi.")
+    return embed
+
+
+async def send_payment_receipt(order_id: int) -> bool:
+    order = get_premium_order(order_id)
+    if not order:
+        return False
+
+    if "receipt_sent_at" in order.keys() and order["receipt_sent_at"]:
+        return True
+
+    try:
+        user = bot.get_user(int(order["requester_id"])) or await bot.fetch_user(
+            int(order["requester_id"])
+        )
+        await user.send(embed=payment_receipt_embed(order))
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE premium_orders
+                SET receipt_sent_at=?, updated_at=?
+                WHERE id=?
+            """, (
+                int(time.time()),
+                int(time.time()),
+                int(order_id)
+            ))
+            conn.commit()
+
+        return True
+    except Exception:
+        log.exception("Gagal mengirim payment receipt order_id=%s", order_id)
+        return False
+
+
+def verify_payment_webhook_signature(
+    raw_body: bytes,
+    *,
+    timestamp: str,
+    signature: str
+) -> bool:
+    if not PAYMENT_WEBHOOK_SECRET:
+        return False
+
+    if not str(timestamp).isdigit():
+        return False
+
+    ts = int(timestamp)
+    if abs(int(time.time()) - ts) > PAYMENT_WEBHOOK_MAX_SKEW_SECONDS:
+        return False
+
+    message = str(timestamp).encode("utf-8") + b"." + raw_body
+    expected = hmac.new(
+        PAYMENT_WEBHOOK_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256
+    ).hexdigest()
+
+    supplied = str(signature or "").strip().lower()
+    if supplied.startswith("sha256="):
+        supplied = supplied.split("=", 1)[1]
+
+    return hmac.compare_digest(expected, supplied)
+
+
+def record_payment_callback_event(
+    *,
+    event_id: str,
+    invoice_ref: str,
+    reference_id: str,
+    amount: int,
+    payment_status: str,
+    payload_hash: str,
+    signature_valid: bool
+) -> bool:
+    try:
+        with closing(db()) as conn:
+            conn.execute("""
+                INSERT INTO payment_callback_events(
+                    event_id, invoice_ref, reference_id, amount,
+                    payment_status, payload_hash, signature_valid,
+                    received_at, process_status
+                )
+                VALUES(?,?,?,?,?,?,?,?, 'received')
+            """, (
+                str(event_id)[:160],
+                str(invoice_ref)[:160],
+                str(reference_id)[:160],
+                int(amount),
+                str(payment_status)[:80],
+                str(payload_hash)[:128],
+                1 if signature_valid else 0,
+                int(time.time())
+            ))
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_order_by_invoice_ref(invoice_ref: str):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM premium_orders
+            WHERE invoice_ref=?
+            LIMIT 1
+        """, (str(invoice_ref).strip(),)).fetchone()
+
+
+def mark_callback_event(
+    event_id: str,
+    status: str,
+    *,
+    error: Optional[str] = None
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE payment_callback_events
+            SET
+                process_status=?,
+                processed_at=?,
+                error=?
+            WHERE event_id=?
+        """, (
+            str(status)[:80],
+            int(time.time()),
+            str(error)[:1000] if error else None,
+            str(event_id)
+        ))
+        conn.commit()
+
+
+def enqueue_payment_event_dlq(
+    event_id: str,
+    payload: dict,
+    error: str,
+    *,
+    retry_count: int = 0
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO payment_event_dead_letter(
+                event_id, payload_json, error, retry_count,
+                next_retry_at, created_at
+            )
+            VALUES(?,?,?,?,?,?)
+        """, (
+            str(event_id)[:160],
+            json.dumps(payload, ensure_ascii=False)[:10000],
+            str(error)[:1000],
+            int(retry_count),
+            int(time.time()) + PAYMENT_EVENT_RETRY_SECONDS,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+async def process_verified_payment_event(
+    payload: dict,
+    *,
+    source: str = "signed_webhook",
+    from_retry: bool = False
+) -> dict:
+    event_id = str(payload.get("event_id") or "").strip()
+    invoice_ref = str(payload.get("invoice_ref") or "").strip()
+    reference_id = str(payload.get("reference_id") or "").strip()
+    raw_status = str(payload.get("status") or "").strip().lower()
+
+    try:
+        amount = int(payload.get("amount"))
+    except Exception:
+        raise ValueError("amount wajib berupa integer.")
+
+    if not event_id or not invoice_ref or not reference_id:
+        raise ValueError(
+            "event_id, invoice_ref, dan reference_id wajib diisi."
         )
 
-    return "\n\n".join(lines)
+    paid_states = {"paid", "success", "settled", "completed"}
+    failed_states = {"failed", "cancelled", "canceled", "expired"}
 
+    if raw_status not in paid_states | failed_states:
+        raise ValueError("Status callback tidak dikenali.")
+
+    order = get_order_by_invoice_ref(invoice_ref)
+    if not order:
+        raise ValueError("Invoice callback tidak ditemukan.")
+
+    if payment_reference_in_use(
+        reference_id,
+        exclude_order_id=int(order["id"])
+    ):
+        refresh_payment_risk(int(order["id"]))
+        raise ValueError(
+            "Reference pembayaran sudah digunakan invoice lain."
+        )
+
+    now = int(time.time())
+
+    if raw_status in failed_states:
+        record_premium_event(
+            int(order["id"]),
+            "payment_callback_failed",
+            detail=f"{source}:{raw_status}; ref={reference_id}"
+        )
+        return {
+            "ok": True,
+            "activated": False,
+            "message": "Status pembayaran bukan sukses."
+        }
+
+    expected = int(order["expected_amount"] or order["price"])
+    matched = amount == expected
+    late = bool(
+        order["invoice_deadline"]
+        and now > int(order["invoice_deadline"])
+        and not order["activated_at"]
+    )
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE premium_orders
+            SET
+                received_amount=?,
+                amount_verified=?,
+                payment_checked_at=?,
+                payment_verified_at=?,
+                payment_reference=?,
+                payment_source=?,
+                paid_at=?,
+                late_payment=?,
+                status=?,
+                updated_at=?
+            WHERE id=?
+        """, (
+            amount,
+            1 if matched else 0,
+            now,
+            now if matched else None,
+            reference_id,
+            source,
+            now,
+            1 if late else 0,
+            (
+                "late_payment"
+                if late and matched
+                else "amount_verified"
+                if matched
+                else "underpaid"
+                if amount < expected
+                else "overpaid"
+            ),
+            now,
+            int(order["id"])
+        ))
+        conn.commit()
+
+    refresh_payment_risk(int(order["id"]))
+
+    if not matched:
+        return {
+            "ok": True,
+            "activated": False,
+            "message": (
+                "Nominal kurang."
+                if amount < expected
+                else "Nominal lebih."
+            )
+        }
+
+    if late:
+        await send_payment_admin_log(
+            "⏰ Late Payment",
+            (
+                f"Invoice: `{invoice_ref}`\n"
+                f"Nominal: **{rupiah(amount)}**\n"
+                f"Reference: `{reference_id}`\n"
+                "Pembayaran valid tetapi masuk setelah invoice expired."
+            ),
+            guild_id=int(order["guild_id"])
+        )
+        return {
+            "ok": True,
+            "activated": False,
+            "message": "Late payment menunggu review."
+        }
+
+    ok, message = await activate_verified_premium_order(
+        int(order["id"]),
+        actor_id=0,
+        source=source,
+        require_proof=False
+    )
+
+    return {
+        "ok": True,
+        "activated": bool(ok),
+        "message": message
+    }
+
+
+async def payment_webhook_handler(request: web.Request):
+    raw = await request.read()
+    timestamp = request.headers.get("X-Payment-Timestamp", "")
+    signature = request.headers.get("X-Payment-Signature", "")
+
+    valid_signature = verify_payment_webhook_signature(
+        raw,
+        timestamp=timestamp,
+        signature=signature
+    )
+
+    payment_health_update(
+        success=valid_signature,
+        error=None if valid_signature else "Invalid callback signature.",
+        callback=True
+    )
+
+    if not valid_signature:
+        return web.json_response(
+            {"ok": False, "error": "invalid_signature"},
+            status=401
+        )
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        event_id = str(payload.get("event_id") or "").strip()
+        invoice_ref = str(payload.get("invoice_ref") or "").strip()
+        reference_id = str(payload.get("reference_id") or "").strip()
+        amount = int(payload.get("amount"))
+        payment_status = str(payload.get("status") or "").strip()
+    except Exception:
+        return web.json_response(
+            {"ok": False, "error": "invalid_payload"},
+            status=400
+        )
+
+    payload_hash = hashlib.sha256(raw).hexdigest()
+
+    inserted = record_payment_callback_event(
+        event_id=event_id,
+        invoice_ref=invoice_ref,
+        reference_id=reference_id,
+        amount=amount,
+        payment_status=payment_status,
+        payload_hash=payload_hash,
+        signature_valid=True
+    )
+
+    if not inserted:
+        return web.json_response(
+            {"ok": True, "duplicate": True},
+            status=200
+        )
+
+    try:
+        result = await process_verified_payment_event(payload)
+        mark_callback_event(event_id, "processed")
+        payment_health_update(success=True, callback=False)
+        return web.json_response(result, status=200)
+
+    except Exception as exc:
+        mark_callback_event(
+            event_id,
+            "failed",
+            error=f"{type(exc).__name__}: {exc}"
+        )
+        enqueue_payment_event_dlq(
+            event_id,
+            payload,
+            f"{type(exc).__name__}: {exc}"
+        )
+        payment_health_update(
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+            callback=False
+        )
+        log.exception("Payment callback processing gagal")
+        return web.json_response(
+            {"ok": False, "queued_for_retry": True},
+            status=202
+        )
+
+
+async def payment_webhook_health_handler(request: web.Request):
+    health = payment_health_row()
+    return web.json_response({
+        "ok": True,
+        "webhook_enabled": PAYMENT_WEBHOOK_ENABLED,
+        "last_callback_at": (
+            int(health["last_callback_at"])
+            if health and health["last_callback_at"]
+            else None
+        )
+    })
+
+
+async def start_payment_webhook_server():
+    global payment_web_runner
+
+    if not PAYMENT_WEBHOOK_ENABLED:
+        return
+
+    if not PAYMENT_WEBHOOK_SECRET:
+        log.error(
+            "PAYMENT_WEBHOOK_ENABLED=true tetapi PAYMENT_WEBHOOK_SECRET kosong."
+        )
+        return
+
+    if payment_web_runner is not None:
+        return
+
+    app = web.Application(client_max_size=1024 * 1024)
+    app.router.add_post(
+        PAYMENT_WEBHOOK_PATH,
+        payment_webhook_handler
+    )
+    app.router.add_get(
+        "/health/payments",
+        payment_webhook_health_handler
+    )
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PAYMENT_WEBHOOK_PORT
+    )
+    await site.start()
+    payment_web_runner = runner
+
+    log.info(
+        "Payment webhook listener aktif pada port %s path %s",
+        PAYMENT_WEBHOOK_PORT,
+        PAYMENT_WEBHOOK_PATH
+    )
+
+
+async def stop_payment_webhook_server():
+    global payment_web_runner
+
+    if payment_web_runner is None:
+        return
+
+    try:
+        await payment_web_runner.cleanup()
+    finally:
+        payment_web_runner = None
 
 
 # ============================================================
@@ -3035,6 +4824,14 @@ def verify_received_amount(order_id: int, received_amount: int) -> bool:
     expected = int(order["expected_amount"] or order["price"])
     received = int(received_amount)
     matched = expected == received
+    now = int(time.time())
+
+    if matched:
+        status = "amount_verified"
+    elif received < expected:
+        status = "underpaid"
+    else:
+        status = "overpaid"
 
     with closing(db()) as conn:
         conn.execute("""
@@ -3043,19 +4840,22 @@ def verify_received_amount(order_id: int, received_amount: int) -> bool:
                 received_amount=?,
                 amount_verified=?,
                 payment_checked_at=?,
+                payment_verified_at=?,
                 status=?,
                 updated_at=?
             WHERE id=?
         """, (
             received,
             1 if matched else 0,
-            int(time.time()),
-            "amount_verified" if matched else "amount_mismatch",
-            int(time.time()),
+            now,
+            now if matched else None,
+            status,
+            now,
             int(order_id)
         ))
         conn.commit()
 
+    refresh_payment_risk(order_id)
     return matched
 
 
@@ -3095,8 +4895,10 @@ def payment_amount_status(order) -> str:
 
 ORDER_STATUSES = {
     "pending", "proof_submitted", "amount_mismatch",
-    "amount_verified", "paid", "processing", "active",
-    "rejected", "expired", "invoice_expired"
+    "underpaid", "overpaid", "amount_verified", "paid",
+    "processing", "active", "rejected", "expired",
+    "invoice_expired", "late_payment", "refund_pending",
+    "refunded", "refund_failed"
 }
 
 
@@ -3113,25 +4915,33 @@ def create_premium_order(
 
     with closing(db()) as conn:
         existing = conn.execute("""
-            SELECT id
+            SELECT id, days, price
             FROM premium_orders
             WHERE guild_id=?
               AND requester_id=?
-              AND days=?
               AND status IN (
-                  'pending','proof_submitted',
-                  'amount_mismatch','amount_verified','paid'
+                  'pending','proof_submitted','amount_mismatch',
+                  'underpaid','overpaid','amount_verified','paid',
+                  'processing'
               )
             ORDER BY id DESC
             LIMIT 1
         """, (
             guild_id,
-            requester_id,
-            days
+            requester_id
         )).fetchone()
 
         if existing:
-            return int(existing["id"])
+            if (
+                int(existing["days"]) == int(days)
+                and int(existing["price"]) == int(price)
+            ):
+                return int(existing["id"])
+
+            raise ValueError(
+                "Masih ada invoice aktif untuk server ini. "
+                "Selesaikan atau tunggu invoice tersebut kedaluwarsa."
+            )
 
     unique_code, expected_amount = generate_collision_free_payment_code(
         int(price)
@@ -3218,6 +5028,16 @@ def update_order_status(
 
     now = int(time.time())
 
+    current = get_premium_order(order_id)
+    if not current:
+        raise ValueError("Order tidak ditemukan.")
+
+    current_status = str(current["status"])
+    if not payment_transition_allowed(current_status, status):
+        raise ValueError(
+            f"Transisi status tidak valid: {current_status} → {status}"
+        )
+
     with closing(db()) as conn:
         conn.execute("""
             UPDATE premium_orders
@@ -3237,6 +5057,14 @@ def update_order_status(
         ))
         conn.commit()
 
+    record_premium_event(
+        order_id,
+        status,
+        actor_id=processed_by,
+        detail="Status invoice diperbarui."
+    )
+
+
 
 def premium_order_counts():
     with closing(db()) as conn:
@@ -3245,6 +5073,11 @@ def premium_order_counts():
                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
                 SUM(CASE WHEN status='proof_submitted' THEN 1 ELSE 0 END) AS proof_submitted,
                 SUM(CASE WHEN status='amount_mismatch' THEN 1 ELSE 0 END) AS amount_mismatch,
+                SUM(CASE WHEN status='underpaid' THEN 1 ELSE 0 END) AS underpaid,
+                SUM(CASE WHEN status='overpaid' THEN 1 ELSE 0 END) AS overpaid,
+                SUM(CASE WHEN status='late_payment' THEN 1 ELSE 0 END) AS late_payment,
+                SUM(CASE WHEN status='refund_pending' THEN 1 ELSE 0 END) AS refund_pending,
+                SUM(CASE WHEN status='refunded' THEN 1 ELSE 0 END) AS refunded,
                 SUM(CASE WHEN status='amount_verified' THEN 1 ELSE 0 END) AS amount_verified,
                 SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid,
                 SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active,
@@ -3257,6 +5090,11 @@ def premium_order_counts():
         "pending": int(row["pending"] or 0),
         "proof_submitted": int(row["proof_submitted"] or 0),
         "amount_mismatch": int(row["amount_mismatch"] or 0),
+        "underpaid": int(row["underpaid"] or 0),
+        "overpaid": int(row["overpaid"] or 0),
+        "late_payment": int(row["late_payment"] or 0),
+        "refund_pending": int(row["refund_pending"] or 0),
+        "refunded": int(row["refunded"] or 0),
         "amount_verified": int(row["amount_verified"] or 0),
         "paid": int(row["paid"] or 0),
         "active": int(row["active"] or 0),
@@ -3272,40 +5110,25 @@ def order_status_label(status: str) -> str:
 def premium_order_embed(order):
     guild = bot.get_guild(int(order["guild_id"]))
     guild_name = guild.name if guild else f"Server {order['guild_id']}"
+    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
+    expected = int(order["expected_amount"] or order["price"])
 
     embed = discord.Embed(
-        title=f"💳 Premium Request #{order['id']}",
-        description=f"**{guild_name}**",
+        title=f"💳 {invoice_ref}",
+        description=f"**{guild_name}** • {order_status_label(order['status'])}",
         color=discord.Color.gold()
     )
     embed.add_field(
-        name="Invoice",
-        value=f"`{order['invoice_ref'] or ensure_invoice_ref(order['id'])}`",
-        inline=False
-    )
-    embed.add_field(
-        name="Status",
-        value=order_status_label(order["status"]),
-        inline=False
-    )
-    embed.add_field(
         name="Paket",
-        value=(
-            f"📅 **{order['days']} hari**\n"
-            f"💰 Harga: **{rupiah(order['price'])}**\n"
-            f"🔢 Kode unik: **{int(order['unique_code'] or 0):03d}**"
-        ),
-        inline=True
-    )
-    embed.add_field(
-        name="Nominal Transfer",
-        value=payment_amount_status(order),
+        value=f"⭐ **{order['days']} hari** • **{rupiah(order['price'])}**",
         inline=False
     )
-
     embed.add_field(
-        name="Metode Pembayaran",
-        value=order["payment_method_name"] or "Belum dipilih",
+        name="Transfer",
+        value=(
+            f"**{rupiah(expected)}** • "
+            f"`{order['payment_method_name'] or 'metode belum dipilih'}`"
+        ),
         inline=False
     )
     embed.add_field(
@@ -3314,45 +5137,104 @@ def premium_order_embed(order):
         inline=True
     )
     embed.add_field(
-        name="Dibuat",
-        value=f"<t:{order['created_at']}:F>",
-        inline=False
-    )
-
-    embed.add_field(
-        name="Invoice Berlaku Sampai",
+        name="Deadline",
         value=invoice_deadline_text(order),
-        inline=False
+        inline=True
     )
+    if order["received_amount"] is not None:
+        embed.add_field(
+            name="Nominal Masuk",
+            value=(
+                f"**{rupiah(int(order['received_amount']))}** • "
+                f"{'✅ sesuai' if int(order['amount_verified'] or 0) else '❌ selisih'}"
+            ),
+            inline=False
+        )
+    if order["proof_url"]:
+        detail_lines = [
+            payment_proof_scan_label(order),
+        ]
 
+        if "proof_sender_name" in order.keys() and order["proof_sender_name"]:
+            detail_lines.append(
+                f"Pengirim: **{str(order['proof_sender_name'])[:80]}**"
+            )
+
+        if "proof_sender_account" in order.keys() and order["proof_sender_account"]:
+            detail_lines.append(
+                f"Akun: `{mask_account(order['proof_sender_account'])}`"
+            )
+
+        if "proof_transfer_time" in order.keys() and order["proof_transfer_time"]:
+            detail_lines.append(
+                f"Waktu: **{str(order['proof_transfer_time'])[:80]}**"
+            )
+
+        if "proof_reference" in order.keys() and order["proof_reference"]:
+            detail_lines.append(
+                f"Ref: `{str(order['proof_reference'])[:100]}`"
+            )
+
+        if "proof_scan_detail" in order.keys() and order["proof_scan_detail"]:
+            detail_lines.append(
+                f"Scan: {str(order['proof_scan_detail'])[:500]}"
+            )
+
+        embed.add_field(
+            name="Screening Bukti",
+            value="\n".join(detail_lines)[:1024],
+            inline=False
+        )
     if order["rejection_reason"]:
         embed.add_field(
-            name="Alasan Penolakan",
-            value=str(order["rejection_reason"])[:1000],
+            name="Penolakan",
+            value=str(order["rejection_reason"])[:700],
             inline=False
         )
-
-    if order["owner_note"]:
-        embed.add_field(
-            name="Catatan Owner",
-            value=str(order["owner_note"])[:1000],
-            inline=False
-        )
-
-    if order["proof_url"]:
-        embed.add_field(
-            name="Bukti Pembayaran",
-            value=order["proof_url"],
-            inline=False
-        )
-
     if order["expires_at"]:
         embed.add_field(
-            name="Aktif Sampai",
-            value=f"<t:{order['expires_at']}:F> • <t:{order['expires_at']}:R>",
+            name="Premium Sampai",
+            value=f"<t:{int(order['expires_at'])}:F> • <t:{int(order['expires_at'])}:R>",
+            inline=False
+        )
+    if "payment_reference" in order.keys() and order["payment_reference"]:
+        embed.add_field(
+            name="Reference Pembayaran",
+            value=f"`{str(order['payment_reference'])[:120]}`",
             inline=False
         )
 
+    if "risk_level" in order.keys() and order["risk_level"]:
+        risk_icon = {
+            "low": "🟢",
+            "medium": "🟡",
+            "high": "🟠",
+            "critical": "🔴",
+        }.get(str(order["risk_level"]), "⚪")
+
+        embed.add_field(
+            name="Risk",
+            value=(
+                f"{risk_icon} **{str(order['risk_level']).upper()}** "
+                f"• {int(order['risk_score'] or 0)}/100\n"
+                f"{str(order['risk_reasons'] or '-')[:500]}"
+            ),
+            inline=False
+        )
+
+    if "refund_status" in order.keys() and order["refund_status"]:
+        embed.add_field(
+            name="Refund",
+            value=(
+                f"**{order['refund_status']}**"
+                + (
+                    f"\n{str(order['refund_reason'])[:400]}"
+                    if order["refund_reason"]
+                    else ""
+                )
+            ),
+            inline=False
+        )
     return embed
 
 
@@ -3733,10 +5615,14 @@ def payment_method_embed(method, order=None):
 
     if order:
         embed.add_field(
-            name="⚠️ Nominal Wajib Tepat",
+            name="⚠️ Nominal + Kode Unik Wajib Tepat",
             value=(
-                f"Transfer **persis {rupiah(int(order['expected_amount'] or order['price']))}**. "
-                "Jangan dibulatkan."
+                f"Harga paket: **{rupiah(int(order['price']))}**\n"
+                f"Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
+                f"Total transfer: **{rupiah(int(order['expected_amount'] or order['price']))}**\n\n"
+                "Transfer harus **PERSIS** sesuai Total Transfer di atas. "
+                "Jangan hanya transfer harga paket, jangan dibulatkan, dan jangan "
+                "mengubah kode unik."
             ),
             inline=False
         )
@@ -3744,8 +5630,10 @@ def payment_method_embed(method, order=None):
     embed.add_field(
         name="Setelah Membayar",
         value=(
-            "Tekan **Saya Sudah Bayar**, lalu kirim screenshot/bukti "
-            "pembayaran ke DM bot."
+            "Tekan **Saya Sudah Bayar**, isi detail transaksi, lalu kirim "
+            "1 screenshot bukti transfer asli ke DM bot untuk screening otomatis.\n\n"
+            "Bukti harus jelas, utuh, tidak diedit, dan menampilkan nominal serta "
+            "informasi transaksi penting."
         ),
         inline=False
     )
@@ -3832,15 +5720,437 @@ def assign_order_payment_method(order_id: int, method_id: int):
         conn.commit()
 
 
+def payment_proof_instruction_text() -> str:
+    return (
+        "📌 **Agar bukti dapat diperiksa dengan baik:**\n"
+        "• gunakan **screenshot asli langsung dari aplikasi pembayaran**;\n"
+        "• jangan crop terlalu ketat — tampilkan bagian transaksi secara utuh;\n"
+        "• **nominal transfer wajib persis sama dengan Total Transfer pada invoice, "
+        "termasuk kode unik**;\n"
+        "• contoh: harga paket Rp25.000 + kode unik 137 = transfer **Rp25.137**, "
+        "bukan Rp25.000;\n"
+        "• jangan membulatkan, menambah, atau mengurangi nominal;\n"
+        "• tanggal dan waktu transaksi harus terlihat;\n"
+        "• nomor referensi/ID transaksi harus terlihat bila tersedia;\n"
+        "• nama/akun pengirim harus sesuai dengan detail yang kamu isi;\n"
+        "• jangan blur bagian transaksi penting;\n"
+        "• jangan tambahkan stiker, coretan, filter, watermark, atau edit gambar;\n"
+        "• jangan kirim foto layar yang buram jika screenshot asli tersedia;\n"
+        "• kirim **1 file gambar asli** PNG/JPG/JPEG/WEBP.\n\n"
+        "⚠️ Nominal yang tidak persis sama dengan invoice—termasuk kode unik—"
+        "akan dianggap **TIDAK SESUAI**. Bukti yang terpotong, buram, terlalu kecil, "
+        "diedit, atau pernah digunakan sebelumnya dapat masuk **REVIEW** atau **DITOLAK**."
+    )
+
+
+def mask_account(value: Optional[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    compact = "".join(ch for ch in raw if ch.isalnum())
+    if len(compact) <= 4:
+        return "••••"
+    return "••••" + compact[-4:]
+
+
+def save_payment_proof_details(
+    order_id: int,
+    *,
+    sender_name: str,
+    sender_account: str,
+    transfer_time: str,
+    reference: str,
+    declared_amount: int,
+    note: str = ""
+):
+    order = get_premium_order(order_id)
+    if not order:
+        raise ValueError("Order tidak ditemukan.")
+
+    expected = int(order["expected_amount"] or order["price"])
+    if int(declared_amount) != expected:
+        raise ValueError(
+            f"Nominal yang kamu isi harus persis {rupiah(expected)}."
+        )
+
+    reference_value = str(reference).strip()
+    if not reference_value:
+        raise ValueError("Nomor referensi transaksi wajib diisi.")
+
+    with closing(db()) as conn:
+        duplicate_ref = conn.execute("""
+            SELECT id
+            FROM premium_orders
+            WHERE proof_reference=?
+              AND id<>?
+            LIMIT 1
+        """, (
+            reference_value,
+            int(order_id)
+        )).fetchone()
+
+        if duplicate_ref:
+            raise ValueError(
+                f"Nomor referensi sudah dipakai pada invoice #{duplicate_ref['id']}."
+            )
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE premium_orders
+            SET
+                proof_sender_name=?,
+                proof_sender_account=?,
+                proof_transfer_time=?,
+                proof_reference=?,
+                proof_declared_amount=?,
+                proof_note=?,
+                proof_details_submitted_at=?,
+                updated_at=?
+            WHERE id=?
+        """, (
+            str(sender_name).strip()[:120],
+            str(sender_account).strip()[:120],
+            str(transfer_time).strip()[:100],
+            reference_value[:160],
+            int(declared_amount),
+            str(note).strip()[:500],
+            int(time.time()),
+            int(time.time()),
+            int(order_id)
+        ))
+        conn.commit()
+
+
+def scan_payment_proof_bytes(
+    raw: bytes,
+    *,
+    filename: str,
+    content_type: str
+) -> dict:
+    size = len(raw)
+    max_bytes = PAYMENT_PROOF_MAX_MB * 1024 * 1024
+
+    if not raw:
+        raise ValueError("File bukti kosong.")
+
+    if size > max_bytes:
+        raise ValueError(
+            f"Ukuran bukti maksimal {PAYMENT_PROOF_MAX_MB} MB."
+        )
+
+    lowered_name = str(filename or "").lower()
+    content_type = str(content_type or "").lower()
+
+    valid_signature = (
+        raw.startswith(b"\x89PNG\r\n\x1a\n")
+        or raw.startswith(b"\xff\xd8\xff")
+        or (raw.startswith(b"RIFF") and b"WEBP" in raw[:16])
+    )
+
+    if not valid_signature:
+        raise ValueError(
+            "File bukti harus gambar PNG/JPG/JPEG/WEBP yang valid."
+        )
+
+    score = 100
+    reasons = []
+    width = None
+    height = None
+    edit_software = None
+    entropy = None
+
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(raw)) as img:
+                width, height = img.size
+                fmt = (img.format or "").upper()
+
+                if width < 300 or height < 300:
+                    score -= 35
+                    reasons.append("Resolusi terlalu kecil.")
+
+                if width > 12000 or height > 12000:
+                    score -= 20
+                    reasons.append("Resolusi tidak wajar.")
+
+                try:
+                    entropy = float(img.convert("L").entropy())
+                    if entropy < 2.0:
+                        score -= 40
+                        reasons.append("Gambar terlalu polos/kosong.")
+                    elif entropy < 3.0:
+                        score -= 15
+                        reasons.append("Detail visual sangat rendah.")
+                except Exception:
+                    entropy = None
+
+                try:
+                    exif = img.getexif()
+                    software = (
+                        exif.get(305)
+                        if exif
+                        else None
+                    )
+                    if software:
+                        edit_software = str(software)[:120]
+                        suspicious_terms = (
+                            "photoshop",
+                            "gimp",
+                            "canva",
+                            "snapseed",
+                            "lightroom",
+                            "picsart",
+                        )
+                        if any(
+                            term in edit_software.lower()
+                            for term in suspicious_terms
+                        ):
+                            score -= 30
+                            reasons.append(
+                                "Metadata menunjukkan software editing."
+                            )
+                except Exception:
+                    pass
+
+                if fmt not in {"PNG", "JPEG", "WEBP"}:
+                    score -= 30
+                    reasons.append("Format gambar tidak umum.")
+
+        except Exception as exc:
+            raise ValueError(
+                f"Gambar bukti tidak dapat dibaca: {type(exc).__name__}."
+            )
+
+    if size < 15 * 1024:
+        score -= 20
+        reasons.append("Ukuran file sangat kecil.")
+
+    if not content_type.startswith("image/"):
+        score -= 10
+        reasons.append("Content-Type bukan image/*.")
+
+    score = max(0, min(100, int(score)))
+
+    if score >= 75:
+        status = "passed"
+    elif score >= 40:
+        status = "review"
+    else:
+        status = "rejected"
+
+    if not reasons:
+        reasons.append("Tidak ditemukan indikator teknis mencurigakan.")
+
+    return {
+        "status": status,
+        "score": score,
+        "detail": " | ".join(reasons)[:1500],
+        "file_size": size,
+        "width": width,
+        "height": height,
+        "mime": content_type[:120],
+        "edit_software": edit_software,
+        "entropy": entropy,
+        "filename": lowered_name[:200],
+    }
+
+
+def payment_proof_scan_label(order) -> str:
+    status = (
+        str(order["proof_scan_status"])
+        if "proof_scan_status" in order.keys()
+        and order["proof_scan_status"]
+        else "belum_scan"
+    )
+    score = (
+        int(order["proof_scan_score"])
+        if "proof_scan_score" in order.keys()
+        and order["proof_scan_score"] is not None
+        else None
+    )
+
+    labels = {
+        "passed": "✅ LULUS SCREENING",
+        "review": "🟠 PERLU REVIEW",
+        "rejected": "🔴 DITOLAK",
+        "belum_scan": "⚪ BELUM DISCAN",
+    }
+
+    return (
+        f"{labels.get(status, status.upper())}"
+        + (f" • skor **{score}/100**" if score is not None else "")
+    )
+
+
+async def activate_verified_premium_order(
+    order_id: int,
+    *,
+    actor_id: int,
+    source: str,
+    require_proof: bool = True
+) -> tuple[bool, str]:
+    order = get_premium_order(order_id)
+
+    if not order:
+        return False, "Order tidak ditemukan."
+
+    if order["activated_at"] or order["status"] == "active":
+        return True, "Premium sudah aktif."
+
+    if not int(order["amount_verified"] or 0):
+        return False, "Nominal pembayaran belum terverifikasi."
+
+    if require_proof and not order["proof_url"]:
+        return False, "Menunggu bukti transfer."
+
+    scan_status = (
+        str(order["proof_scan_status"] or "")
+        if "proof_scan_status" in order.keys()
+        else ""
+    )
+
+    if scan_status == "rejected":
+        return False, "Bukti transfer ditolak screening otomatis."
+
+    if not claim_order_for_activation(
+        int(order_id),
+        int(actor_id)
+    ):
+        refreshed = get_premium_order(order_id)
+        if refreshed and refreshed["status"] == "active":
+            return True, "Premium sudah aktif."
+        return False, "Order sedang diproses."
+
+    try:
+        guild_id = int(order["guild_id"])
+        existing = get_guild_settings(guild_id)
+        extend = existing["plan"] == "premium"
+
+        set_plan(
+            guild_id,
+            "premium",
+            duration_days=int(order["days"]),
+            extend=extend
+        )
+
+        settings = get_guild_settings(guild_id)
+        expires_at = (
+            int(settings["premium_expires_at"])
+            if settings["premium_expires_at"]
+            else None
+        )
+
+        now = int(time.time())
+
+        update_order_status(
+            int(order_id),
+            "active",
+            processed_by=int(actor_id),
+            activated_at=now,
+            expires_at=expires_at
+        )
+
+        invoice_ref = (
+            order["invoice_ref"]
+            or ensure_invoice_ref(order["id"])
+        )
+
+        add_activity(
+            guild_id,
+            int(actor_id),
+            "Premium Auto Activated",
+            (
+                f"{invoice_ref}; {order['days']} hari; "
+                f"source={source}; scan={scan_status or 'unknown'}"
+            )
+        )
+
+        await audit_webhook(
+            "Premium Auto Activated",
+            (
+                f"{invoice_ref} • {order['days']} hari • "
+                f"source={source}"
+            ),
+            actor_id=int(actor_id),
+            guild_id=guild_id
+        )
+
+        await send_payment_admin_log(
+            "✅ Premium Otomatis Aktif",
+            (
+                f"Invoice: `{invoice_ref}`\n"
+                f"Paket: **{order['days']} hari**\n"
+                f"Nominal: **{rupiah(int(order['expected_amount'] or order['price']))}**\n"
+                f"Sumber verifikasi: **{source}**\n"
+                f"Screening bukti: **{scan_status or 'unknown'}**"
+            ),
+            guild_id=guild_id
+        )
+
+        msg = (
+            f"✅ Pembayaran `{invoice_ref}` sudah terverifikasi.\n"
+            f"⭐ Premium otomatis aktif **{order['days']} hari**.\n"
+            f"Berakhir: {premium_expiry_text(guild_id)}"
+        )
+
+        await notify_order_user(order, msg)
+
+        guild = bot.get_guild(guild_id)
+        if guild:
+            await dm_guild_owner(guild, msg)
+
+        await send_payment_receipt(int(order_id))
+        payment_health_update(success=True)
+
+        return True, msg
+
+    except Exception:
+        release_order_claim(int(order_id))
+        raise
+
+
+async def maybe_auto_activate_verified_order(
+    order_id: int,
+    *,
+    actor_id: int,
+    source: str
+) -> tuple[bool, str]:
+    if not AUTO_ACTIVATE_VERIFIED_PAYMENTS:
+        return False, "Auto-activate dinonaktifkan."
+
+    order = get_premium_order(order_id)
+    if not order:
+        return False, "Order tidak ditemukan."
+
+    if not int(order["amount_verified"] or 0):
+        return False, "Nominal belum terverifikasi."
+
+    if not order["proof_url"]:
+        return False, "Menunggu bukti transfer."
+
+    return await activate_verified_premium_order(
+        order_id,
+        actor_id=actor_id,
+        source=source
+    )
+
+
+
+
 def save_payment_proof(
     order_id: int,
     proof_url: str,
     proof_message_id: int,
-    proof_hash_value: Optional[str] = None
+    proof_hash_value: Optional[str] = None,
+    *,
+    scan: Optional[dict] = None
 ):
     proof_hash = proof_hash_value or hashlib.sha256(
         proof_url.encode("utf-8")
     ).hexdigest()
+
+    scan = scan or {}
+    scan_status = str(scan.get("status") or "review")
 
     with closing(db()) as conn:
         duplicate = conn.execute("""
@@ -3859,6 +6169,13 @@ def save_payment_proof(
                 f"Bukti pembayaran sudah pernah dipakai pada request #{duplicate['id']}."
             )
 
+        if scan_status == "rejected":
+            raise ValueError(
+                "Bukti gagal screening otomatis. Kirim screenshot asli sesuai instruksi: "
+                "utuh, jelas, tidak diedit, nominal/tanggal/referensi terlihat, dan bukan "
+                "file yang pernah dipakai sebelumnya."
+            )
+
         conn.execute("""
             UPDATE premium_orders
             SET
@@ -3866,6 +6183,15 @@ def save_payment_proof(
                 proof_message_id=?,
                 proof_submitted_at=?,
                 proof_hash=?,
+                proof_scan_status=?,
+                proof_scan_score=?,
+                proof_scan_detail=?,
+                proof_scan_at=?,
+                proof_file_size=?,
+                proof_image_width=?,
+                proof_image_height=?,
+                proof_mime=?,
+                proof_edit_software=?,
                 status='proof_submitted',
                 updated_at=?
             WHERE id=?
@@ -3874,6 +6200,19 @@ def save_payment_proof(
             proof_message_id,
             int(time.time()),
             proof_hash,
+            scan_status,
+            int(scan.get("score") or 0),
+            str(scan.get("detail") or "")[:1500],
+            int(time.time()),
+            int(scan.get("file_size") or 0),
+            scan.get("width"),
+            scan.get("height"),
+            str(scan.get("mime") or "")[:120],
+            (
+                str(scan.get("edit_software"))[:120]
+                if scan.get("edit_software")
+                else None
+            ),
             int(time.time()),
             int(order_id)
         ))
@@ -3886,8 +6225,9 @@ def latest_waiting_proof_order(user_id: int):
             SELECT *
             FROM premium_orders
             WHERE requester_id=?
-              AND status IN ('pending','proof_submitted','amount_mismatch')
+              AND status IN ('pending','proof_submitted','amount_mismatch','amount_verified')
               AND payment_method_id IS NOT NULL
+              AND proof_details_submitted_at IS NOT NULL
             ORDER BY id DESC
             LIMIT 1
         """, (int(user_id),)).fetchone()
@@ -4007,6 +6347,8 @@ def invoice_status_label(status: str) -> str:
         "pending": "🟡 Menunggu Pembayaran",
         "proof_submitted": "🟠 Bukti Dikirim",
         "amount_mismatch": "🔴 Nominal Tidak Sesuai",
+        "underpaid": "🔻 Kurang Bayar",
+        "overpaid": "🔺 Lebih Bayar",
         "amount_verified": "🟢 Nominal Sesuai",
         "paid": "🔵 Dibayar",
         "processing": "🟣 Diproses",
@@ -4014,6 +6356,10 @@ def invoice_status_label(status: str) -> str:
         "rejected": "❌ Ditolak",
         "expired": "⚫ Premium Selesai",
         "invoice_expired": "⌛ Invoice Kedaluwarsa",
+        "late_payment": "⏰ Pembayaran Terlambat",
+        "refund_pending": "↩️ Refund Diproses",
+        "refunded": "✅ Refunded",
+        "refund_failed": "❌ Refund Gagal",
     }
     return labels.get(status, status)
 
@@ -4793,6 +7139,15 @@ def database_maintenance():
             "DELETE FROM pending_uploads WHERE created_at<?",
             (now - 86400,)
         )
+        conn.execute(
+            "DELETE FROM payment_callback_events WHERE received_at<?",
+            (tx_cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM payment_event_dead_letter "
+            "WHERE resolved_at IS NOT NULL AND resolved_at<?",
+            (tx_cutoff,)
+        )
         notifier_cutoff = now - EVENT_RETENTION_DAYS * 86400
         conn.execute(
             "DELETE FROM notification_history WHERE created_at<?",
@@ -4979,19 +7334,218 @@ async def is_user_in_required_guild(user_id: int) -> bool:
         return False
 
 
+def get_user_verification(user_id: int):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM user_verifications
+            WHERE user_id=?
+        """, (int(user_id),)).fetchone()
+
+
+def set_user_verification(
+    user_id: int,
+    verified: bool,
+    *,
+    source: str,
+    reason: str = "",
+    mark_active: bool = False
+):
+    # Global Owner Bot is permanently exempt from user verification storage.
+    if is_global_owner(int(user_id)):
+        return
+
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        previous = conn.execute("""
+            SELECT *
+            FROM user_verifications
+            WHERE user_id=?
+        """, (int(user_id),)).fetchone()
+
+        created_at = (
+            int(previous["created_at"])
+            if previous and previous["created_at"]
+            else now
+        )
+
+        last_active_at = (
+            now
+            if mark_active
+            else (
+                int(previous["last_active_at"])
+                if previous and previous["last_active_at"]
+                else now
+            )
+        )
+
+        conn.execute("""
+            INSERT INTO user_verifications(
+                user_id,
+                verified,
+                verified_at,
+                last_checked_at,
+                last_active_at,
+                created_at,
+                verification_source,
+                status_reason
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                verified=excluded.verified,
+                verified_at=excluded.verified_at,
+                last_checked_at=excluded.last_checked_at,
+                last_active_at=excluded.last_active_at,
+                verification_source=excluded.verification_source,
+                status_reason=excluded.status_reason
+        """, (
+            int(user_id),
+            1 if verified else 0,
+            now if verified else None,
+            now,
+            last_active_at,
+            created_at,
+            str(source)[:80],
+            str(reason)[:500]
+        ))
+        conn.commit()
+
+
+def touch_user_verification_activity(user_id: int):
+    if is_global_owner(int(user_id)):
+        return
+
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE user_verifications
+            SET last_active_at=?
+            WHERE user_id=? AND verified=1
+        """, (
+            now,
+            int(user_id)
+        ))
+        conn.commit()
+
+
+def user_verification_is_active(user_id: int) -> bool:
+    if is_global_owner(int(user_id)):
+        return True
+
+    row = get_user_verification(user_id)
+    if not row or not row["verified"]:
+        return False
+
+    cutoff = int(time.time()) - (
+        int(VERIFICATION_RETENTION_DAYS) * 86400
+    )
+
+    return int(row["last_active_at"] or 0) > cutoff
+
+
+async def refresh_user_verification(
+    user_id: int,
+    *,
+    source: str,
+    mark_active: bool = False
+) -> bool:
+    if is_global_owner(int(user_id)):
+        return True
+
+    if not REQUIRED_GUILD_ID:
+        return False
+
+    verified = await is_user_in_required_guild(
+        int(user_id)
+    )
+
+    set_user_verification(
+        int(user_id),
+        verified,
+        source=source,
+        reason=(
+            "User terdeteksi di Server Owner/Support."
+            if verified
+            else "User tidak terdeteksi di Server Owner/Support."
+        ),
+        mark_active=mark_active
+    )
+
+    return verified
+
+
+def user_verification_status_text(user_id: int) -> str:
+    if is_global_owner(int(user_id)):
+        return "👑 Global Owner • bypass"
+
+    row = get_user_verification(user_id)
+
+    if not row:
+        return "🔒 Belum terverifikasi"
+
+    if not row["verified"]:
+        return "🔒 Tidak terverifikasi"
+
+    last_active = int(row["last_active_at"] or 0)
+    expires_at = last_active + int(VERIFICATION_RETENTION_DAYS) * 86400
+
+    return (
+        f"✅ Terverifikasi • aktif <t:{last_active}:R>\n"
+        f"Retensi sampai <t:{expires_at}:R>"
+    )
+
+
+def cleanup_stale_user_verifications() -> int:
+    cutoff = int(time.time()) - (
+        int(VERIFICATION_RETENTION_DAYS) * 86400
+    )
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT user_id
+            FROM user_verifications
+            WHERE last_active_at<=?
+        """, (cutoff,)).fetchall()
+
+        removable = [
+            int(row["user_id"])
+            for row in rows
+            if not is_global_owner(int(row["user_id"]))
+        ]
+
+        if removable:
+            placeholders = ",".join("?" for _ in removable)
+            conn.execute(
+                f"""
+                DELETE FROM user_verifications
+                WHERE user_id IN ({placeholders})
+                """,
+                removable
+            )
+            conn.commit()
+
+    return len(removable)
+
+
+
+
 def set_guild_owner_verification(
     guild_id: int,
     owner_id: int,
     verified: bool,
     *,
     source: str = "live_check",
-    reason: Optional[str] = None
+    reason: Optional[str] = None,
+    user_active: bool = False
 ):
     now = int(time.time())
 
     with closing(db()) as conn:
         existing = conn.execute("""
-            SELECT created_at
+            SELECT *
             FROM guild_owner_verification
             WHERE guild_id=?
         """, (int(guild_id),)).fetchone()
@@ -5000,6 +7554,30 @@ def set_guild_owner_verification(
             int(existing["created_at"])
             if existing and existing["created_at"]
             else now
+        )
+
+        previous_active = (
+            int(existing["last_active_at"])
+            if existing and "last_active_at" in existing.keys()
+            and existing["last_active_at"]
+            else None
+        )
+
+        previous_inactive_since = (
+            int(existing["inactive_since"])
+            if existing and "inactive_since" in existing.keys()
+            and existing["inactive_since"]
+            else None
+        )
+
+        last_active_at = now if user_active else previous_active
+
+        # First known verification counts as activity.
+        if last_active_at is None and verified:
+            last_active_at = now
+
+        inactive_since = None if verified else (
+            previous_inactive_since or now
         )
 
         conn.execute("""
@@ -5011,9 +7589,11 @@ def set_guild_owner_verification(
                 last_checked_at,
                 created_at,
                 verification_source,
-                status_reason
+                status_reason,
+                last_active_at,
+                inactive_since
             )
-            VALUES(?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(guild_id)
             DO UPDATE SET
                 owner_id=excluded.owner_id,
@@ -5021,7 +7601,9 @@ def set_guild_owner_verification(
                 verified_at=excluded.verified_at,
                 last_checked_at=excluded.last_checked_at,
                 verification_source=excluded.verification_source,
-                status_reason=excluded.status_reason
+                status_reason=excluded.status_reason,
+                last_active_at=COALESCE(excluded.last_active_at, guild_owner_verification.last_active_at),
+                inactive_since=excluded.inactive_since
         """, (
             int(guild_id),
             int(owner_id),
@@ -5030,9 +7612,39 @@ def set_guild_owner_verification(
             now,
             created_at,
             str(source),
-            reason
+            reason,
+            last_active_at,
+            inactive_since
         ))
         conn.commit()
+
+
+def touch_guild_owner_verification_activity(
+    guild_id: int,
+    owner_id: int
+):
+    now = int(time.time())
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE guild_owner_verification
+            SET last_active_at=?,
+                owner_id=?
+            WHERE guild_id=?
+        """, (
+            now,
+            int(owner_id),
+            int(guild_id)
+        ))
+        conn.commit()
+
+
+def cleanup_stale_verification_records() -> int:
+    """
+    Legacy compatibility helper.
+    Guild-owner verification is no longer deleted by the 30-day user
+    retention policy. Retention applies to user_verifications instead.
+    """
+    return 0
 
 
 def get_guild_owner_verification(guild_id: int):
@@ -5046,7 +7658,8 @@ def get_guild_owner_verification(guild_id: int):
 async def refresh_guild_owner_verification(
     guild: discord.Guild,
     *,
-    source: str = "live_check"
+    source: str = "live_check",
+    user_active: bool = False
 ) -> bool:
     if not REQUIRED_GUILD_ID:
         verified = True
@@ -5066,7 +7679,8 @@ async def refresh_guild_owner_verification(
         guild.owner_id,
         verified,
         source=source,
-        reason=reason
+        reason=reason,
+        user_active=user_active
     )
     return verified
 
@@ -5081,7 +7695,11 @@ async def verify_owned_guilds_for_user(
     verified_count = 0
 
     for guild in owned:
-        if await refresh_guild_owner_verification(guild):
+        if await refresh_guild_owner_verification(
+            guild,
+            source="owner_manual_refresh",
+            user_active=True
+        ):
             verified_count += 1
 
     return verified_count, len(owned)
@@ -5115,7 +7733,8 @@ async def auto_verify_owned_guilds_for_member(
                 "Owner join Server Owner/Support."
                 if verified
                 else "Owner keluar dari Server Owner/Support."
-            )
+            ),
+            user_active=bool(verified)
         )
         updated += 1
 
@@ -5237,6 +7856,22 @@ def guild_verification_detail_embed(guild: discord.Guild):
         value=str(row["status_reason"] or "-")[:1024],
         inline=False
     )
+    last_active = (
+        int(row["last_active_at"])
+        if "last_active_at" in row.keys() and row["last_active_at"]
+        else int(row["created_at"])
+    )
+    expiry = last_active + int(VERIFICATION_RETENTION_DAYS) * 86400
+
+    embed.add_field(
+        name="Retensi",
+        value=(
+            f"Aktivitas terakhir: <t:{last_active}:R>\n"
+            f"Hapus otomatis jika tidak aktif sampai <t:{expiry}:F>"
+        ),
+        inline=False
+    )
+
     embed.add_field(
         name="Aktivasi",
         value=(
@@ -5253,7 +7888,13 @@ def guild_verification_detail_embed(guild: discord.Guild):
 
 
 async def guild_owner_verified(guild: discord.Guild) -> bool:
-    return await refresh_guild_owner_verification(guild)
+    # Always refresh live. Missing guild-owner verification rows are
+    # recreated automatically and are not governed by user retention.
+    return await refresh_guild_owner_verification(
+        guild,
+        source="live_check",
+        user_active=False
+    )
 
 
 def required_join_text() -> str:
@@ -5435,6 +8076,29 @@ def manual_backup_payload_and_bytes():
     return payload, raw
 
 
+def backup_restore_smoke_test(payload: dict) -> tuple[bool, str]:
+    ok, detail = verify_backup_payload(payload)
+    if not ok:
+        return False, detail
+
+    try:
+        restored = json.loads(json.dumps(payload, ensure_ascii=False))
+        for guild_item in restored.get("guilds", []):
+            guild_id = int(guild_item["guild_id"])
+            for host in guild_item.get("hosts", []):
+                if "platform" not in host or "target" not in host:
+                    return False, (
+                        f"Host invalid pada guild {guild_id}: "
+                        "platform/target tidak lengkap."
+                    )
+        return True, (
+            f"Restore smoke-test OK • "
+            f"{len(restored.get('guilds', []))} server."
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def verify_backup_payload(payload: dict) -> tuple[bool, str]:
     if not isinstance(payload, dict):
         return False, "Root backup bukan object JSON."
@@ -5540,8 +8204,7 @@ def owner_self_test_results() -> list[tuple[str, bool, str]]:
 
 
 def guild_access_allowed(guild_id: int) -> bool:
-    settings = get_guild_settings(guild_id)
-    return settings["access_state"] not in {"blacklist", "suspended"}
+    return effective_access_state(guild_id) not in {"blacklist", "suspended"}
 
 
 # ============================================================
@@ -5853,6 +8516,26 @@ def reserve_notification_event(
         return False
 
 
+def release_notification_event(
+    host_id: int,
+    event_key: Optional[str],
+    event_type: str
+):
+    if not event_key:
+        return
+
+    with closing(db()) as conn:
+        conn.execute("""
+            DELETE FROM notification_events
+            WHERE host_id=? AND event_key=? AND event_type=?
+        """, (
+            int(host_id),
+            str(event_key)[:300],
+            str(event_type)[:80]
+        ))
+        conn.commit()
+
+
 def record_notification_history(
     *,
     guild_id: int,
@@ -6021,6 +8704,100 @@ def apply_host_embed_branding(host, embed: discord.Embed):
             embed.color = discord.Color(int(host["embed_color"]))
         except Exception:
             pass
+
+
+def queue_notification_retry(
+    host,
+    embed: discord.Embed,
+    content: Optional[str],
+    *,
+    event_type: str,
+    event_key: Optional[str],
+    source_url: Optional[str],
+    retry_count: int = 0,
+    last_error: str = ""
+):
+    release_after = int(time.time()) + (
+        NOTIFICATION_RETRY_SECONDS * max(1, retry_count + 1)
+    )
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO pending_notifications(
+                guild_id, host_id, event_type, event_key,
+                content, embed_json, source_url,
+                release_after, created_at,
+                retry_count, max_retries, last_error
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            int(host["guild_id"]),
+            int(host["id"]),
+            str(event_type)[:80],
+            str(event_key)[:300] if event_key else None,
+            content[:2000] if content else None,
+            json.dumps(embed.to_dict(), ensure_ascii=False),
+            str(source_url)[:1000] if source_url else None,
+            release_after,
+            int(time.time()),
+            int(retry_count),
+            int(NOTIFICATION_MAX_RETRIES),
+            str(last_error)[:1000]
+        ))
+        conn.commit()
+
+    runtime_metrics["notifications_queued"] += 1
+
+
+def move_notification_to_dead_letter(row, reason: str):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO notification_dead_letter(
+                guild_id, host_id, event_type, event_key,
+                content, embed_json, source_url,
+                failure_reason, retry_count, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            int(row["guild_id"]),
+            int(row["host_id"]),
+            row["event_type"],
+            row["event_key"],
+            row["content"],
+            row["embed_json"],
+            row["source_url"],
+            str(reason)[:1000],
+            int(row["retry_count"] or 0),
+            int(time.time())
+        ))
+        conn.execute(
+            "DELETE FROM pending_notifications WHERE id=?",
+            (int(row["id"]),)
+        )
+        conn.commit()
+
+
+def dead_letter_count() -> int:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM notification_dead_letter
+            WHERE resolved_at IS NULL
+        """).fetchone()
+    return int(row["total"] or 0)
+
+
+def recent_dead_letters(limit: int = 15):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM notification_dead_letter
+            WHERE resolved_at IS NULL
+            ORDER BY id DESC
+            LIMIT ?
+        """, (max(1, min(25, int(limit))),)).fetchall()
+
+
 
 
 def queue_quiet_notification(
@@ -6565,17 +9342,20 @@ async def send_notification(
             return True
 
     if host_quiet_now(host):
-        queue_quiet_notification(
-            host,
-            embed,
-            content_override,
-            event_type,
-            event_key,
-            source_url
-        )
-        return True
+        try:
+            queue_quiet_notification(
+                host, embed, content_override,
+                event_type, event_key, source_url
+            )
+            return True
+        except Exception:
+            if dedupe and event_key:
+                release_notification_event(
+                    int(host["id"]), event_key, event_type
+                )
+            raise
 
-    return await _deliver_notification_now(
+    delivered = await _deliver_notification_now(
         host,
         embed,
         content_override,
@@ -6583,6 +9363,25 @@ async def send_notification(
         event_key=event_key,
         source_url=source_url
     )
+
+    if not delivered:
+        try:
+            queue_notification_retry(
+                host, embed, content_override,
+                event_type=event_type,
+                event_key=event_key,
+                source_url=source_url,
+                retry_count=0,
+                last_error="Immediate delivery failed"
+            )
+        except Exception:
+            if dedupe and event_key:
+                release_notification_event(
+                    int(host["id"]), event_key, event_type
+                )
+            raise
+
+    return delivered
 
 
 async def send_activity_to_discord(
@@ -7504,6 +10303,108 @@ async def check_tiktok_post(host):
 # ============================================================
 
 @tasks.loop(minutes=5)
+async def payment_reconciliation_loop():
+    if not AUTO_ACTIVATE_VERIFIED_PAYMENTS:
+        return
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT id
+            FROM premium_orders
+            WHERE activated_at IS NULL
+              AND amount_verified=1
+              AND status IN ('amount_verified','paid')
+              AND proof_url IS NOT NULL
+            ORDER BY updated_at ASC
+            LIMIT 25
+        """).fetchall()
+
+    for row in rows:
+        try:
+            await maybe_auto_activate_verified_order(
+                int(row["id"]),
+                actor_id=0,
+                source="automatic_reconciliation"
+            )
+        except Exception:
+            log.exception(
+                "Payment reconciliation gagal order_id=%s",
+                row["id"]
+            )
+
+
+@payment_reconciliation_loop.before_loop
+async def before_payment_reconciliation_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=2)
+async def payment_event_retry_loop():
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM payment_event_dead_letter
+            WHERE resolved_at IS NULL
+              AND next_retry_at<=?
+            ORDER BY id ASC
+            LIMIT 20
+        """, (now,)).fetchall()
+
+    for row in rows:
+        retry_count = int(row["retry_count"] or 0)
+
+        if retry_count >= PAYMENT_EVENT_MAX_RETRIES:
+            continue
+
+        try:
+            payload = json.loads(row["payload_json"])
+            result = await process_verified_payment_event(
+                payload,
+                source="payment_event_retry",
+                from_retry=True
+            )
+
+            if result.get("ok"):
+                with closing(db()) as conn:
+                    conn.execute("""
+                        UPDATE payment_event_dead_letter
+                        SET resolved_at=?
+                        WHERE id=?
+                    """, (
+                        int(time.time()),
+                        int(row["id"])
+                    ))
+                    conn.commit()
+                continue
+
+            raise RuntimeError(str(result.get("message") or "retry failed"))
+
+        except Exception as exc:
+            with closing(db()) as conn:
+                conn.execute("""
+                    UPDATE payment_event_dead_letter
+                    SET
+                        retry_count=retry_count+1,
+                        next_retry_at=?,
+                        error=?
+                    WHERE id=?
+                """, (
+                    int(time.time())
+                    + PAYMENT_EVENT_RETRY_SECONDS * (retry_count + 2),
+                    f"{type(exc).__name__}: {exc}"[:1000],
+                    int(row["id"])
+                ))
+                conn.commit()
+
+
+@payment_event_retry_loop.before_loop
+async def before_payment_event_retry_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=5)
 async def invoice_expiry_loop():
     now = int(time.time())
 
@@ -7704,7 +10605,570 @@ def host_due(host, now: int) -> bool:
     last = int(host["last_check"] or 0)
     interval = int(host["check_interval"] or DEFAULT_CHECK_INTERVAL)
 
+    try:
+        if premium_entitlements(int(host["guild_id"]))["priority_polling"]:
+            interval = max(60, int(interval * 0.75))
+    except Exception:
+        pass
+
     return now - last >= interval
+
+
+@tasks.loop(hours=24)
+async def verification_expiry_warning_loop():
+    now = int(time.time())
+    warning_seconds = VERIFICATION_WARNING_DAYS * 86400
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM user_verifications
+            WHERE verified=1
+        """).fetchall()
+
+    for row in rows:
+        user_id = int(row["user_id"])
+
+        if is_global_owner(user_id):
+            continue
+
+        expires_at = (
+            int(row["last_active_at"])
+            + VERIFICATION_RETENTION_DAYS * 86400
+        )
+
+        remaining = expires_at - now
+
+        if remaining <= 0 or remaining > warning_seconds:
+            continue
+
+        with closing(db()) as conn:
+            sent = conn.execute("""
+                SELECT 1
+                FROM user_verification_warnings
+                WHERE user_id=? AND expiry_at=? AND days_before=?
+            """, (
+                user_id,
+                expires_at,
+                VERIFICATION_WARNING_DAYS
+            )).fetchone()
+
+        if sent:
+            continue
+
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            await user.send(
+                (
+                    "⏳ **Verifikasi Hi Notifku akan kedaluwarsa.**\n"
+                    f"Jika tidak ada aktivitas, data verifikasi akan dihapus "
+                    f"<t:{expires_at}:R>.\n"
+                    "Gunakan bot melalui DM agar masa aktif diperbarui."
+                )
+            )
+
+            with closing(db()) as conn:
+                conn.execute("""
+                    INSERT OR IGNORE INTO user_verification_warnings(
+                        user_id, expiry_at, days_before, sent_at
+                    )
+                    VALUES(?,?,?,?)
+                """, (
+                    user_id,
+                    expires_at,
+                    VERIFICATION_WARNING_DAYS,
+                    now
+                ))
+                conn.commit()
+
+        except Exception:
+            pass
+
+
+@verification_expiry_warning_loop.before_loop
+async def before_verification_expiry_warning_loop():
+    await bot.wait_until_ready()
+
+
+def verification_dashboard_embed():
+    now = int(time.time())
+    d7 = now - 7 * 86400
+    d30 = now - VERIFICATION_RETENTION_DAYS * 86400
+    warning_cutoff = now - (
+        (VERIFICATION_RETENTION_DAYS - VERIFICATION_WARNING_DAYS) * 86400
+    )
+
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN verified=1 THEN 1 ELSE 0 END) AS verified,
+                SUM(CASE WHEN verified=1 AND last_active_at>=? THEN 1 ELSE 0 END) AS active7,
+                SUM(CASE WHEN verified=1 AND last_active_at>=? THEN 1 ELSE 0 END) AS active30,
+                SUM(CASE WHEN verified=1 AND last_active_at<=? AND last_active_at>? THEN 1 ELSE 0 END) AS expiring
+            FROM user_verifications
+        """, (
+            d7,
+            d30,
+            warning_cutoff,
+            d30
+        )).fetchone()
+
+    return discord.Embed(
+        title="✅ User Verification",
+        description="Retensi semua user • Global Owner dikecualikan.",
+        color=discord.Color.green()
+    ).add_field(
+        name="Ringkasan",
+        value=(
+            f"Verified: **{int(row['verified'] or 0)}**\n"
+            f"Aktif 7 hari: **{int(row['active7'] or 0)}**\n"
+            f"Aktif ≤{VERIFICATION_RETENTION_DAYS} hari: "
+            f"**{int(row['active30'] or 0)}**\n"
+            f"Hampir expired: **{int(row['expiring'] or 0)}**"
+        ),
+        inline=False
+    )
+
+
+
+
+@tasks.loop(hours=24)
+async def verification_retention_cleanup_loop():
+    removed = cleanup_stale_user_verifications()
+
+    if removed:
+        log.info(
+            "User verification retention menghapus %s user tidak aktif > %s hari.",
+            removed,
+            VERIFICATION_RETENTION_DAYS
+        )
+
+
+@verification_retention_cleanup_loop.before_loop
+async def before_verification_retention_cleanup_loop():
+    await bot.wait_until_ready()
+
+
+
+
+async def validation_alert_once(
+    guild: discord.Guild,
+    host,
+    alert_type: str,
+    detail: str
+):
+    key = f"{host['id']}:{alert_type}"
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        previous = conn.execute(
+            "SELECT sent_at FROM validation_alerts WHERE alert_key=?",
+            (key,)
+        ).fetchone()
+
+    if previous and now - int(previous["sent_at"]) < 12 * 3600:
+        return
+
+    await dm_guild_owner(
+        guild,
+        (
+            f"⚠️ **Validasi Host #{host['id']}**\n"
+            f"{platform_display_name(host['platform'])} • "
+            f"**{host['display_name'] or host['target']}**\n"
+            f"{detail}"
+        )
+    )
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO validation_alerts(
+                alert_key, guild_id, host_id, alert_type, sent_at
+            )
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(alert_key)
+            DO UPDATE SET sent_at=excluded.sent_at
+        """, (
+            key,
+            int(guild.id),
+            int(host["id"]),
+            str(alert_type),
+            now
+        ))
+        conn.commit()
+
+
+@tasks.loop(hours=6)
+async def host_target_validation_loop():
+    for guild in list(bot.guilds):
+        try:
+            for host in get_hosts(guild.id):
+                channel_ids = host_delivery_channels(host)
+
+                if not channel_ids:
+                    await validation_alert_once(
+                        guild,
+                        host,
+                        "channel_missing",
+                        "❌ Tidak ada channel notifikasi yang valid."
+                    )
+                else:
+                    invalid_channels = [
+                        cid for cid in channel_ids
+                        if guild.get_channel(int(cid)) is None
+                    ]
+                    if invalid_channels:
+                        await validation_alert_once(
+                            guild,
+                            host,
+                            "channel_deleted",
+                            "❌ Channel tidak ditemukan: "
+                            + ", ".join(str(x) for x in invalid_channels[:5])
+                        )
+
+                invalid_roles = [
+                    rid for rid in host_mention_roles(host)
+                    if guild.get_role(int(rid)) is None
+                ]
+                if invalid_roles:
+                    await validation_alert_once(
+                        guild,
+                        host,
+                        "role_deleted",
+                        "❌ Role tidak ditemukan: "
+                        + ", ".join(str(x) for x in invalid_roles[:5])
+                    )
+
+                webhook_url = (
+                    str(host["webhook_url"]).strip()
+                    if "webhook_url" in host.keys() and host["webhook_url"]
+                    else ""
+                )
+
+                if webhook_url and http is not None and not http.closed:
+                    try:
+                        webhook = discord.Webhook.from_url(
+                            webhook_url,
+                            session=http
+                        )
+                        await webhook.fetch()
+                    except Exception:
+                        await validation_alert_once(
+                            guild,
+                            host,
+                            "webhook_invalid",
+                            "❌ Webhook tidak valid / sudah dihapus."
+                        )
+
+        except Exception:
+            log.exception(
+                "Host target validation gagal guild_id=%s",
+                guild.id
+            )
+
+
+@host_target_validation_loop.before_loop
+async def before_host_target_validation_loop():
+    await bot.wait_until_ready()
+
+
+
+
+@tasks.loop(minutes=15)
+async def server_owner_health_alert_loop():
+    now = int(time.time())
+
+    for guild in list(bot.guilds):
+        try:
+            for host in get_hosts(guild.id):
+                errors = int(host["error_count"] or 0)
+                if errors < ERROR_ALERT_THRESHOLD:
+                    continue
+
+                with closing(db()) as conn:
+                    previous = conn.execute("""
+                        SELECT *
+                        FROM owner_health_alerts
+                        WHERE host_id=?
+                    """, (int(host["id"]),)).fetchone()
+
+                if (
+                    previous
+                    and errors <= int(previous["last_error_count"])
+                    and now - int(previous["last_sent_at"]) < 6 * 3600
+                ):
+                    continue
+
+                await dm_guild_owner(
+                    guild,
+                    (
+                        f"🚨 Host bermasalah: **{host['display_name'] or host['target']}**\n"
+                        f"Platform: **{platform_display_name(host['platform'])}**\n"
+                        f"Error berturut: **{errors}**\n"
+                        f"Terakhir: `{str(host['last_error'] or '-')[:500]}`\n\n"
+                        "Buka `/menu` → server → **Kelola Host**."
+                    )
+                )
+
+                with closing(db()) as conn:
+                    conn.execute("""
+                        INSERT INTO owner_health_alerts(
+                            host_id, last_error_count, last_sent_at
+                        )
+                        VALUES(?,?,?)
+                        ON CONFLICT(host_id)
+                        DO UPDATE SET
+                            last_error_count=excluded.last_error_count,
+                            last_sent_at=excluded.last_sent_at
+                    """, (
+                        int(host["id"]),
+                        errors,
+                        now
+                    ))
+                    conn.commit()
+
+        except Exception:
+            log.exception(
+                "Server owner health alert gagal guild_id=%s",
+                guild.id
+            )
+
+
+@server_owner_health_alert_loop.before_loop
+async def before_server_owner_health_alert_loop():
+    await bot.wait_until_ready()
+
+
+
+
+def platform_feature_keys(platform: str) -> list[str]:
+    return {
+        "youtube": ["youtube_live"],
+        "tiktok": ["tiktok_live", "tiktok_post"],
+        "twitch": ["twitch_live"],
+        "kick": ["kick_live"],
+        "instagram": ["instagram_post"],
+        "facebook": ["facebook_post"],
+    }.get(str(platform).lower().strip(), [])
+
+
+def host_auto_recovery_allowed(host) -> tuple[bool, str]:
+    guild_id = int(host["guild_id"])
+    settings = get_guild_settings(guild_id)
+
+    if effective_access_state(guild_id) not in {"allowed", "whitelist"}:
+        return False, "Akses server sedang dibatasi."
+
+    if bool(settings["maintenance_mode"]):
+        return False, "Server sedang maintenance."
+
+    keys = platform_feature_keys(str(host["platform"]))
+    if keys and not all(feature_enabled(guild_id, key) for key in keys):
+        return False, "Platform sedang maintenance."
+
+    if str(settings["plan"] or "free") != "premium":
+        active_other = sum(
+            1 for item in get_hosts(guild_id)
+            if int(item["id"]) != int(host["id"]) and bool(item["enabled"])
+        )
+        if active_other >= FREE_HOST_LIMIT:
+            return False, "Limit host FREE sudah penuh."
+
+    return True, "OK"
+
+
+@tasks.loop(minutes=30)
+async def host_auto_recovery_loop():
+    now = int(time.time())
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM host_auto_recovery
+            WHERE last_retry_at IS NULL OR last_retry_at<=?
+            ORDER BY auto_paused_at ASC
+            LIMIT 25
+        """, (now - 1800,)).fetchall()
+
+    for row in rows:
+        host = get_host(int(row["host_id"]))
+        if not host:
+            clear_host_auto_recovery(int(row["host_id"]))
+            continue
+
+        try:
+            allowed, reason = host_auto_recovery_allowed(host)
+            if not allowed:
+                with closing(db()) as conn:
+                    conn.execute("""
+                        UPDATE host_auto_recovery
+                        SET last_retry_at=?, retry_count=retry_count+1
+                        WHERE host_id=?
+                    """, (now, int(row["host_id"])))
+                    conn.commit()
+                log.info(
+                    "Auto recovery ditahan host_id=%s: %s",
+                    host["id"], reason
+                )
+                continue
+
+            await host_manager_recheck(host)
+
+            refreshed = get_host(int(host["id"])) or host
+            allowed, reason = host_auto_recovery_allowed(refreshed)
+            if not allowed:
+                log.info(
+                    "Auto recovery batal host_id=%s setelah recheck: %s",
+                    host["id"], reason
+                )
+                continue
+
+            set_host_health(int(host["id"]), success=True)
+
+            with closing(db()) as conn:
+                conn.execute(
+                    "UPDATE hosts SET enabled=1 WHERE id=?",
+                    (int(host["id"]),)
+                )
+                conn.commit()
+
+            clear_host_auto_recovery(int(host["id"]))
+            guild = bot.get_guild(int(host["guild_id"]))
+            if guild:
+                await dm_guild_owner(
+                    guild,
+                    f"✅ Host **{host['display_name'] or host['target']}** pulih otomatis."
+                )
+
+        except Exception:
+            with closing(db()) as conn:
+                conn.execute("""
+                    UPDATE host_auto_recovery
+                    SET last_retry_at=?, retry_count=retry_count+1
+                    WHERE host_id=?
+                """, (now, int(row["host_id"])))
+                conn.commit()
+
+
+@host_auto_recovery_loop.before_loop
+async def before_host_auto_recovery_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=10)
+async def platform_outage_detection_loop():
+    now = int(time.time())
+
+    for platform_name in sorted(SUPPORTED_PLATFORMS):
+        total = 0
+        errors = 0
+
+        for guild in bot.guilds:
+            try:
+                for host in get_hosts(guild.id):
+                    if str(host["platform"]) != platform_name:
+                        continue
+                    total += 1
+                    if (
+                        host["last_error"]
+                        and host["last_check"]
+                        and now - int(host["last_check"]) <= 3600
+                    ):
+                        errors += 1
+            except Exception:
+                pass
+
+        outage = total >= 3 and errors >= 3 and (errors / max(1, total)) >= 0.5
+        state = "outage" if outage else "normal"
+
+        with closing(db()) as conn:
+            previous = conn.execute(
+                "SELECT state FROM platform_incidents WHERE platform=?",
+                (platform_name,)
+            ).fetchone()
+
+            conn.execute("""
+                INSERT INTO platform_incidents(
+                    platform, state, error_hosts, total_hosts, updated_at
+                )
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(platform)
+                DO UPDATE SET
+                    state=excluded.state,
+                    error_hosts=excluded.error_hosts,
+                    total_hosts=excluded.total_hosts,
+                    updated_at=excluded.updated_at
+            """, (
+                platform_name,
+                state,
+                errors,
+                total,
+                now
+            ))
+            conn.commit()
+
+        if outage and (not previous or previous["state"] != "outage"):
+            for owner_id in primary_owner_ids():
+                try:
+                    user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                    await user.send(
+                        f"🌐 **Platform Incident** • {platform_display_name(platform_name)}\n"
+                        f"Host error: **{errors}/{total}**. Kemungkinan gangguan provider."
+                    )
+                except Exception:
+                    pass
+
+
+@platform_outage_detection_loop.before_loop
+async def before_platform_outage_detection_loop():
+    await bot.wait_until_ready()
+
+
+
+
+@tasks.loop(hours=6)
+async def user_verification_reconcile_loop():
+    if not REQUIRED_GUILD_ID:
+        return
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT user_id
+            FROM user_verifications
+            WHERE verified=1
+        """).fetchall()
+
+    for row in rows:
+        user_id = int(row["user_id"])
+
+        if is_global_owner(user_id):
+            continue
+
+        try:
+            still_member = await is_user_in_required_guild(
+                user_id
+            )
+
+            if not still_member:
+                set_user_verification(
+                    user_id,
+                    False,
+                    source="membership_reconcile",
+                    reason="Membership Server Owner/Support tidak lagi terdeteksi.",
+                    mark_active=False
+                )
+
+        except Exception:
+            log.exception(
+                "User verification reconcile gagal user_id=%s",
+                user_id
+            )
+
+
+@user_verification_reconcile_loop.before_loop
+async def before_user_verification_reconcile_loop():
+    await bot.wait_until_ready()
+
+
 
 
 @tasks.loop(hours=1)
@@ -7725,6 +11189,8 @@ async def owner_verification_reconcile_loop():
             previous = get_guild_owner_verification(
                 guild.id
             )
+
+            # Missing guild-owner records must be repaired here.
             previous_verified = (
                 bool(previous["verified"])
                 if previous
@@ -7876,6 +11342,19 @@ async def recover_pending_request_views():
                         now
                     ))
                     conn.commit()
+
+
+@tasks.loop(hours=1)
+async def pending_request_recovery_loop():
+    try:
+        await recover_pending_request_views()
+    except Exception:
+        log.exception("Periodic pending request recovery gagal")
+
+
+@pending_request_recovery_loop.before_loop
+async def before_pending_request_recovery_loop():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(hours=6)
@@ -8036,6 +11515,9 @@ async def before_host_manager_expiry_warning_loop():
 
 @tasks.loop(seconds=BASE_MONITOR_TICK)
 async def monitor_loop():
+    if SAFE_MODE:
+        return
+
     if runtime_setting_enabled("monitor_paused") or runtime_setting_enabled("maintenance_all"):
         return
 
@@ -8186,20 +11668,27 @@ async def pending_notification_loop():
     for row in rows:
         host = get_host(int(row["host_id"]))
 
-        if not host or not host["enabled"]:
-            with closing(db()) as conn:
-                conn.execute(
-                    "DELETE FROM pending_notifications WHERE id=?",
-                    (row["id"],)
-                )
-                conn.commit()
+        if not host:
+            move_notification_to_dead_letter(
+                row,
+                "Host tidak ditemukan."
+            )
+            continue
+
+        if not host["enabled"]:
+            # Keep disabled-host deliveries visible instead of silently deleting.
+            move_notification_to_dead_letter(
+                row,
+                "Host sedang pause/nonaktif."
+            )
             continue
 
         try:
             embed = discord.Embed.from_dict(
                 json.loads(row["embed_json"])
             )
-            await _deliver_notification_now(
+
+            ok = await _deliver_notification_now(
                 host,
                 embed,
                 row["content"],
@@ -8207,13 +11696,69 @@ async def pending_notification_loop():
                 event_key=row["event_key"],
                 source_url=row["source_url"]
             )
-        finally:
-            with closing(db()) as conn:
-                conn.execute(
-                    "DELETE FROM pending_notifications WHERE id=?",
-                    (row["id"],)
+
+            if ok:
+                with closing(db()) as conn:
+                    conn.execute(
+                        "DELETE FROM pending_notifications WHERE id=?",
+                        (int(row["id"]),)
+                    )
+                    conn.commit()
+                continue
+
+            retry_count = int(row["retry_count"] or 0) + 1
+            max_retries = int(
+                row["max_retries"] or NOTIFICATION_MAX_RETRIES
+            )
+
+            if retry_count >= max_retries:
+                move_notification_to_dead_letter(
+                    row,
+                    f"Gagal setelah {retry_count} retry."
                 )
+                continue
+
+            with closing(db()) as conn:
+                conn.execute("""
+                    UPDATE pending_notifications
+                    SET retry_count=?,
+                        release_after=?,
+                        last_error=?
+                    WHERE id=?
+                """, (
+                    retry_count,
+                    now + NOTIFICATION_RETRY_SECONDS * (retry_count + 1),
+                    "Delivery retry gagal.",
+                    int(row["id"])
+                ))
                 conn.commit()
+
+        except Exception as exc:
+            retry_count = int(row["retry_count"] or 0) + 1
+            max_retries = int(
+                row["max_retries"] or NOTIFICATION_MAX_RETRIES
+            )
+
+            if retry_count >= max_retries:
+                move_notification_to_dead_letter(
+                    row,
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                with closing(db()) as conn:
+                    conn.execute("""
+                        UPDATE pending_notifications
+                        SET retry_count=?,
+                            release_after=?,
+                            last_error=?
+                        WHERE id=?
+                    """, (
+                        retry_count,
+                        now + NOTIFICATION_RETRY_SECONDS * (retry_count + 1),
+                        f"{type(exc).__name__}: {exc}"[:1000],
+                        int(row["id"])
+                    ))
+                    conn.commit()
 
 
 @pending_notification_loop.before_loop
@@ -9001,12 +12546,24 @@ def owner_platform_health_embed():
         else:
             icon = "🟢"
 
+        with closing(db()) as conn:
+            incident = conn.execute(
+                "SELECT state FROM platform_incidents WHERE platform=?",
+                (platform,)
+            ).fetchone()
+
+        incident_text = (
+            " • 🚨 OUTAGE"
+            if incident and incident["state"] == "outage"
+            else ""
+        )
+
         lines.append(
             f"{icon} **{platform_display_name(platform)}** — "
             f"{item['healthy']} sehat • "
             f"{item['warning']} warning • "
             f"{item['error']} error • "
-            f"{item['total']} total"
+            f"{item['total']} total{incident_text}"
         )
 
     return discord.Embed(
@@ -10026,12 +13583,32 @@ class ReceivedAmountModal(discord.ui.Modal):
         order = get_premium_order(self.order_id)
 
         if matched:
+            auto_ok = False
+            auto_message = ""
+
+            try:
+                auto_ok, auto_message = await maybe_auto_activate_verified_order(
+                    self.order_id,
+                    actor_id=interaction.user.id,
+                    source="verified_received_amount"
+                )
+            except Exception as exc:
+                log.exception("Auto aktivasi Premium gagal")
+                auto_message = f"Auto aktivasi gagal: {type(exc).__name__}"
+
             await safe_reply(
                 interaction,
                 (
-                    f"✅ Nominal **SESUAI**.\\n"
-                    f"Harus masuk: **{rupiah(order['expected_amount'])}**\\n"
-                    f"Nominal masuk: **{rupiah(received)}**"
+                    f"✅ Nominal **SESUAI**.\n"
+                    f"Harga paket: **{rupiah(int(order['price']))}**\n"
+                    f"Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
+                    f"Total wajib: **{rupiah(order['expected_amount'])}**\n"
+                    f"Nominal masuk: **{rupiah(received)}**\n\n"
+                    + (
+                        "⭐ **Premium otomatis aktif sesuai paket.**"
+                        if auto_ok
+                        else f"ℹ️ {auto_message}"
+                    )
                 )
             )
         else:
@@ -10046,10 +13623,13 @@ class ReceivedAmountModal(discord.ui.Modal):
             await safe_reply(
                 interaction,
                 (
-                    f"❌ Nominal **TIDAK SESUAI**.\\n"
-                    f"Harus masuk: **{rupiah(expected)}**\\n"
-                    f"Nominal masuk: **{rupiah(received)}**\\n"
-                    f"Selisih: **{detail}**"
+                    f"❌ Nominal **TIDAK SESUAI**.\n"
+                    f"Harga paket: **{rupiah(int(order['price']))}**\n"
+                    f"Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
+                    f"Harus masuk persis: **{rupiah(expected)}**\n"
+                    f"Nominal masuk: **{rupiah(received)}**\n"
+                    f"Selisih: **{detail}**\n\n"
+                    "Nominal wajib termasuk kode unik dan tidak boleh dibulatkan."
                 )
             )
 
@@ -10775,47 +14355,15 @@ def user_server_embed(guild: discord.Guild):
         inline=True
     )
 
-    if plan == "premium":
-        embed.add_field(
-            name="Status",
-            value="✅ Premium aktif.",
-            inline=False
-        )
-        embed.add_field(
-            name="Aktif Sampai",
-            value=premium_expiry_text(guild.id),
-            inline=False
-        )
-        embed.add_field(
-            name="Perpanjang Premium",
-            value=(
-                "Pilih paket di bawah untuk mengajukan perpanjangan. "
-                "Hari baru akan ditambahkan ke masa aktif yang masih tersisa."
-            ),
-            inline=False
-        )
-    else:
-        package_lines = [
-            (
-                f"⭐ **{days} hari**\n"
-                f"💰 **{rupiah(price)}**"
-            )
-            for days, price in get_premium_packages()
-        ]
-
-        embed.add_field(
-            name="Pilihan Premium",
-            value="\n\n".join(package_lines),
-            inline=False
-        )
-        embed.add_field(
-            name="Cara Upgrade",
-            value=(
-                "Pilih paket menggunakan tombol di bawah. "
-                "Permintaan akan langsung dikirim ke DM owner Hi Notifku."
-            ),
-            inline=False
-        )
+    embed.add_field(
+        name="Premium",
+        value=(
+            f"⭐ Aktif • {premium_expiry_text(guild.id)}"
+            if plan == "premium"
+            else "🆓 FREE • tekan **Premium** untuk upgrade"
+        ),
+        inline=False
+    )
 
     embed.add_field(
         name="Akses",
@@ -10835,6 +14383,17 @@ def user_server_embed(guild: discord.Guild):
     embed.add_field(
         name="Request Pending",
         value=f"📨 {pending_total}",
+        inline=True
+    )
+    stats7 = server_usage_stats(guild.id, 7)
+    embed.add_field(
+        name="Health Score",
+        value=f"**{server_health_score(guild.id)}%**",
+        inline=True
+    )
+    embed.add_field(
+        name="Notif 7 Hari",
+        value=f"✅ {stats7['sent']} • ❌ {stats7['failed']}",
         inline=True
     )
 
@@ -13128,207 +16687,791 @@ class ServerOwnerDeleteHostConfirmView(discord.ui.View):
 
 
 
-class UserServerMenuView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=900)
-        self.guild_id = guild_id
+class UserPremiumPackageSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, user_id: int):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        renewal = get_guild_settings(self.guild_id)["plan"] == "premium"
 
-        settings = get_guild_settings(guild_id)
-        is_premium = settings["plan"] == "premium"
-
-        for index, (days, price) in enumerate(get_premium_packages()):
-            button = discord.ui.Button(
-                label=(
-                    f"Perpanjang {days} Hari • {rupiah(price)}"
-                    if is_premium
-                    else f"{days} Hari • {rupiah(price)}"
-                ),
-                emoji="🔄" if is_premium else "⭐",
-                style=discord.ButtonStyle.success,
-                row=min(index // 2, 2)
+        options = [
+            discord.SelectOption(
+                label=f"{days} hari • {rupiah(price)}"[:100],
+                description="Perpanjang Premium" if renewal else "Aktifkan Premium",
+                value=f"{days}:{price}",
+                emoji="⭐"
             )
-
-            async def package_callback(
-                interaction: discord.Interaction,
-                chosen_days=days,
-                chosen_price=price
-            ):
-                await self.request_package(
-                    interaction,
-                    chosen_days,
-                    chosen_price
+            for days, price in get_premium_packages()[:25]
+        ]
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Belum ada paket",
+                    value="0:0",
+                    emoji="ℹ️"
                 )
-
-            button.callback = package_callback
-            self.add_item(button)
-
-        host_button = discord.ui.Button(
-            label="Kelola Host",
-            emoji="📡",
-            style=discord.ButtonStyle.primary,
-            row=3
+            ]
+        super().__init__(
+            placeholder="Pilih paket Premium",
+            options=options,
+            row=0
         )
-        host_button.callback = self.manage_hosts
-        self.add_item(host_button)
 
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
 
-        request_button = discord.ui.Button(
-            label="Request",
-            emoji="📨",
-            style=discord.ButtonStyle.primary,
-            row=3
-        )
-        request_button.callback = self.requests
-        self.add_item(request_button)
-
-        back = discord.ui.Button(
-            label="Kembali",
-            emoji="⬅️",
-            style=discord.ButtonStyle.secondary,
-            row=4
-        )
-        back.callback = self.back
-        self.add_item(back)
-
-        home = discord.ui.Button(
-            label="Menu Awal",
-            emoji="🏠",
-            style=discord.ButtonStyle.secondary,
-            row=4
-        )
-        home.callback = self.home
-        self.add_item(home)
-
-    async def manage_hosts(self, interaction: discord.Interaction):
-        guild = await require_server_owner(
-            interaction,
-            self.guild_id
-        )
+        guild = await require_server_owner(interaction, self.guild_id)
         if not guild:
             return
 
-        await interaction.response.edit_message(
-            embed=user_server_hosts_embed(guild),
-            view=UserServerHostsView(
-                guild.id,
-                interaction.user.id
-            )
-        )
+        days_raw, price_raw = self.values[0].split(":", 1)
+        days, price = int(days_raw), int(price_raw)
 
-    async def requests(self, interaction: discord.Interaction):
-        guild = await require_server_owner(
-            interaction,
-            self.guild_id
-        )
-        if not guild:
+        if days <= 0:
+            await safe_reply(interaction, "ℹ️ Belum ada paket Premium.")
+            return
+
+        if (days, price) not in get_premium_packages():
+            await safe_reply(interaction, "⚠️ Paket berubah. Buka ulang menu Premium.")
             return
 
         await interaction.response.edit_message(
-            embed=server_owner_requests_embed(
-                self.guild_id
+            embed=discord.Embed(
+                title="⭐ Konfirmasi Premium",
+                description=(
+                    f"Server: **{guild.name}**\n"
+                    f"Paket: **{days} hari**\n"
+                    f"Harga: **{rupiah(price)}**\n\n"
+                    "Lanjutkan untuk membuat invoice pembayaran."
+                ),
+                color=discord.Color.gold()
             ),
-            view=ServerOwnerRequestsView(
-                interaction.user.id,
-                self.guild_id
+            view=UserPremiumConfirmView(
+                self.guild_id,
+                self.user_id,
+                days,
+                price
             )
         )
 
-    async def back(self, interaction: discord.Interaction):
+
+class UserPremiumView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.add_item(UserPremiumPackageSelect(self.guild_id, self.user_id))
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return None
+        return await require_server_owner(interaction, self.guild_id)
+
+    @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
+    async def history(self, interaction, button):
+        if not await self.valid(interaction):
+            return
         await interaction.response.edit_message(
-            embed=dm_menu_home_embed(interaction.user.id),
-            view=MenuRoleChoiceView(interaction.user.id)
+            embed=user_premium_history_embed(self.user_id, self.guild_id),
+            view=UserPremiumHistoryView(self.guild_id, self.user_id)
         )
 
-    async def home(self, interaction: discord.Interaction):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
         await interaction.response.edit_message(
-            embed=dm_menu_home_embed(interaction.user.id),
-            view=MenuRoleChoiceView(interaction.user.id)
+            embed=premium_plan_summary_embed(guild),
+            view=UserPremiumView(self.guild_id, self.user_id)
         )
 
-    async def request_package(
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+class UserPremiumHistoryView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=0)
+    async def back(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=premium_plan_summary_embed(guild),
+            view=UserPremiumView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=0)
+    async def home(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+class PremiumPromoModal(discord.ui.Modal):
+    code_input = discord.ui.TextInput(
+        label="Kode Promo",
+        placeholder="Contoh: HINOTIF10",
+        max_length=40
+    )
+
+    def __init__(
         self,
-        interaction: discord.Interaction,
+        guild_id: int,
+        user_id: int,
         days: int,
-        price: int
+        base_price: int
     ):
+        super().__init__(title="Gunakan Promo", timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.days = int(days)
+        self.base_price = int(base_price)
+
+    async def on_submit(self, interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
+            return
+
+        code_value = self.code_input.value.strip().upper()
+
+        try:
+            final_price, discount = coupon_discount(
+                code_value,
+                self.base_price
+            )
+        except Exception as exc:
+            await safe_reply(interaction, f"❌ {exc}")
+            return
+
         guild = bot.get_guild(self.guild_id)
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🎟️ Promo Diterapkan",
+                description=(
+                    f"Server: **{guild.name if guild else self.guild_id}**\n"
+                    f"Paket: **{self.days} hari**\n"
+                    f"Harga awal: ~~{rupiah(self.base_price)}~~\n"
+                    f"Diskon: **{rupiah(discount)}**\n"
+                    f"Total: **{rupiah(final_price)}**"
+                ),
+                color=discord.Color.green()
+            ),
+            view=UserPremiumConfirmView(
+                self.guild_id,
+                self.user_id,
+                self.days,
+                final_price,
+                base_price=self.base_price,
+                coupon_code=code_value
+            )
+        )
+
+
+
+
+class UserPremiumConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        days: int,
+        price: int,
+        *,
+        base_price: Optional[int] = None,
+        coupon_code: Optional[str] = None
+    ):
+        super().__init__(timeout=180)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.days = int(days)
+        self.price = int(price)
+        self.base_price = int(
+            base_price if base_price is not None else price
+        )
+        self.coupon_code = coupon_code
+
+    @discord.ui.button(label="Buat Invoice", emoji="✅", style=discord.ButtonStyle.success, row=0)
+    async def confirm(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
+            return
+
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+
+        if action_rate_limited(
+            interaction.user.id,
+            f"premium_invoice:{self.guild_id}"
+        ):
+            await safe_reply(
+                interaction,
+                "⏳ Tunggu beberapa detik sebelum membuat invoice lagi."
+            )
+            return
 
         settings_now = get_guild_settings(self.guild_id)
         if settings_now["maintenance_mode"]:
-            await safe_reply(
-                interaction,
-                "🛠️ Request Premium sedang maintenance. Coba lagi setelah maintenance selesai."
-            )
+            await safe_reply(interaction, "🛠️ Premium sedang maintenance.")
             return
 
-        if guild is None:
-            await safe_reply(
-                interaction,
-                "❌ Server tidak ditemukan."
-            )
+        if (self.days, self.base_price) not in get_premium_packages():
+            await safe_reply(interaction, "⚠️ Paket berubah. Buka ulang menu Premium.")
             return
 
-        order_id = create_premium_order(
-            guild.id,
-            interaction.user.id,
-            days,
-            price
-        )
+        try:
+            order_id = create_premium_order(
+                guild.id,
+                interaction.user.id,
+                self.days,
+                self.price
+            )
+        except ValueError as exc:
+            await safe_reply(interaction, f"⚠️ {exc}")
+            return
 
-        sent = await notify_primary_owners_premium_request(
-            guild,
-            interaction.user,
-            days,
-            price,
-            order_id
-        )
+        if self.coupon_code:
+            try:
+                final_price, discount = redeem_coupon_atomic(
+                    order_id,
+                    self.coupon_code,
+                    user_id=interaction.user.id,
+                    guild_id=guild.id,
+                    base_price=self.base_price
+                )
+            except ValueError as exc:
+                await safe_reply(interaction, f"❌ Promo gagal: {exc}")
+                return
 
-        if sent:
-            settings = get_guild_settings(guild.id)
-            action = "perpanjangan" if settings["plan"] == "premium" else "aktivasi"
-            order = get_premium_order(order_id)
-
-            methods = list_payment_methods(True)
-
-            if not methods:
+            if final_price != int(self.price):
                 await safe_reply(
                     interaction,
-                    (
-                        f"✅ Request **#{order_id}** berhasil dibuat.\n"
-                        "⚠️ Tetapi owner belum menambahkan metode pembayaran.\n"
-                        "Silakan tunggu owner mengatur pembayaran."
-                    )
+                    "⚠️ Nilai promo berubah. Buka ulang invoice Premium."
                 )
                 return
 
-            embed = discord.Embed(
-                title=f"💳 Pilih Metode Pembayaran • #{order_id}",
-                description=(
-                    f"Jenis: **{action.title()} Premium**\n"
-                    f"📅 Paket: **{days} hari**\n"
-                    f"💰 Harga: **{rupiah(price)}**\n"
-                    f"🔢 Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
-                    f"💳 Transfer tepat: **{rupiah(int(order['expected_amount'] or price))}**\n\n"
-                    "Pilih metode pembayaran di bawah."
-                ),
-                color=discord.Color.gold()
+            record_premium_event(
+                order_id,
+                "promo_applied",
+                actor_id=interaction.user.id,
+                detail=f"{self.coupon_code} • diskon {rupiah(discount)}"
             )
 
-            await safe_reply(
-                interaction,
-                "",
-                embed=embed,
-                view=PaymentMethodSelectView(order_id)
+        await notify_primary_owners_premium_request(
+            guild,
+            interaction.user,
+            self.days,
+            self.price,
+            order_id
+        )
+
+        order = get_premium_order(order_id)
+        methods = list_payment_methods(True)
+
+        if not methods:
+            await interaction.response.edit_message(
+                embed=discord.Embed(
+                    title=f"✅ Invoice #{order_id} Dibuat",
+                    description=(
+                        "Metode pembayaran belum tersedia. "
+                        "Invoice tersimpan dan owner sudah diberi notifikasi."
+                    ),
+                    color=discord.Color.orange()
+                ),
+                view=UserPremiumHistoryView(self.guild_id, self.user_id)
             )
-        else:
-            await safe_reply(
-                interaction,
-                (
-                    f"⚠️ Request **#{order_id}** sudah tersimpan, "
-                    "tetapi DM ke owner belum berhasil dikirim."
+            return
+
+        expected = int(order["expected_amount"] or self.price)
+        embed = discord.Embed(
+            title=f"💳 {order['invoice_ref'] or ensure_invoice_ref(order_id)}",
+            description=(
+                f"⭐ **{self.days} hari** • **{rupiah(self.price)}**\n"
+                f"Transfer tepat: **{rupiah(expected)}**\n"
+                f"Deadline: {invoice_deadline_text(order)}\n\n"
+                "Pilih metode pembayaran."
+            ),
+            color=discord.Color.gold()
+        )
+        await interaction.response.edit_message(
+            embed=embed,
+            view=PaymentMethodSelectView(order_id)
+        )
+
+    @discord.ui.button(label="Promo", emoji="🎟️", style=discord.ButtonStyle.secondary, row=0)
+    async def promo(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
+            return
+
+        await interaction.response.send_modal(
+            PremiumPromoModal(
+                self.guild_id,
+                self.user_id,
+                self.days,
+                self.base_price
+            )
+        )
+
+    @discord.ui.button(label="Batal", emoji="✖️", style=discord.ButtonStyle.secondary, row=0)
+    async def cancel(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
+            return
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=premium_plan_summary_embed(guild),
+            view=UserPremiumView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+def server_audit_timeline_embed(guild_id: int):
+    guild = bot.get_guild(int(guild_id))
+    rows = recent_activity(int(guild_id), 15)
+    lines = [
+        f"• <t:{int(row['created_at'])}:R> **{row['action']}**"
+        + (f" — {str(row['detail'])[:120]}" if row["detail"] else "")
+        for row in rows
+    ]
+    return discord.Embed(
+        title=f"🧾 Timeline • {guild.name if guild else guild_id}",
+        description="\n".join(lines) if lines else "Belum ada aktivitas.",
+        color=discord.Color.blurple()
+    )
+
+
+def server_insights_embed(guild_id: int):
+    guild = bot.get_guild(int(guild_id))
+    s7 = server_usage_stats(guild_id, 7)
+    s30 = server_usage_stats(guild_id, 30)
+    score = server_health_score(guild_id)
+    settings = get_guild_settings(guild_id)
+
+    embed = discord.Embed(
+        title=f"📊 Insights • {guild.name if guild else guild_id}",
+        description=f"Health Score: **{score}%**",
+        color=discord.Color.green() if score >= 80 else discord.Color.orange()
+    )
+    embed.add_field(
+        name="7 Hari",
+        value=(
+            f"Notif **{s7['total']}** • ✅ {s7['sent']} • ❌ {s7['failed']}\n"
+            f"Latency **{s7['latency']} ms**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="30 Hari",
+        value=(
+            f"Notif **{s30['total']}** • ✅ {s30['sent']} • ❌ {s30['failed']}\n"
+            f"Latency **{s30['latency']} ms**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Plan",
+        value=(
+            f"⭐ PREMIUM • {premium_expiry_text(guild_id)}"
+            if settings["plan"] == "premium"
+            else "🆓 FREE"
+        ),
+        inline=False
+    )
+    return embed
+
+
+def server_export_bytes(guild_id: int) -> tuple[bytes, bytes]:
+    payload = export_guild_backup(int(guild_id))
+    json_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2
+    ).encode("utf-8")
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "host_id", "platform", "target", "display_name",
+        "enabled", "error_count", "last_error"
+    ])
+    for host in get_hosts(int(guild_id)):
+        writer.writerow([
+            host["id"],
+            host["platform"],
+            host["target"],
+            host["display_name"],
+            host["enabled"],
+            host["error_count"],
+            host["last_error"],
+        ])
+
+    return json_bytes, output.getvalue().encode("utf-8-sig")
+
+
+def platform_control_embed(guild_id: int):
+    guild = bot.get_guild(int(guild_id))
+    flags = feature_flags_for_guild(guild_id)
+    lines = []
+
+    for platform in ["youtube","tiktok","twitch","kick","instagram","facebook"]:
+        enabled = platform_enabled(guild_id, platform)
+        lines.append(
+            f"{'🟢' if enabled else '🔴'} **{platform_display_name(platform)}** — "
+            f"{'Aktif' if enabled else 'Maintenance'}"
+        )
+
+    return discord.Embed(
+        title=f"🌐 Platform • {guild.name if guild else guild_id}",
+        description="\n".join(lines),
+        color=discord.Color.blurple()
+    )
+
+
+class ServerPlatformSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, user_id: int):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        flags = feature_flags_for_guild(self.guild_id)
+
+        options = []
+        for platform in ["youtube","tiktok","twitch","kick","instagram","facebook"]:
+            enabled = platform_enabled(self.guild_id, platform)
+            options.append(
+                discord.SelectOption(
+                    label=(
+                        f"{platform_display_name(platform)} • "
+                        f"{'Aktif' if enabled else 'Maintenance'}"
+                    )[:100],
+                    value=platform,
+                    emoji="🟢" if enabled else "🔴"
                 )
             )
 
+        super().__init__(
+            placeholder="Pilih platform untuk Aktif/Maintenance",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+
+        if not await require_server_owner(interaction, self.guild_id):
+            return
+
+        platform = self.values[0]
+        current = platform_enabled(self.guild_id, platform)
+
+        set_platform_enabled(self.guild_id, platform, not current)
+        add_activity(
+            self.guild_id,
+            interaction.user.id,
+            "Platform Maintenance",
+            f"{platform}={'aktif' if not current else 'maintenance'}"
+        )
+
+        await interaction.response.edit_message(
+            embed=platform_control_embed(self.guild_id),
+            view=ServerPlatformControlView(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+
+class ServerPlatformControlView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.add_item(
+            ServerPlatformSelect(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+class ServerInsightsView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return None
+        return await require_server_owner(interaction, self.guild_id)
+
+    @discord.ui.button(label="Timeline", emoji="🧾", style=discord.ButtonStyle.secondary, row=0)
+    async def timeline(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=server_audit_timeline_embed(self.guild_id),
+            view=ServerInsightsView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Export", emoji="📤", style=discord.ButtonStyle.primary, row=0)
+    async def export(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        json_bytes, csv_bytes = server_export_bytes(self.guild_id)
+        await interaction.response.send_message(
+            content="📤 Export server.",
+            files=[
+                discord.File(
+                    io.BytesIO(json_bytes),
+                    filename=f"server-{self.guild_id}.json"
+                ),
+                discord.File(
+                    io.BytesIO(csv_bytes),
+                    filename=f"server-{self.guild_id}-hosts.csv"
+                ),
+            ],
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=server_insights_embed(self.guild_id),
+            view=ServerInsightsView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+def server_onboarding_embed(guild_id: int):
+    guild = bot.get_guild(int(guild_id))
+    cfg = get_config(guild_id)
+    hosts = get_hosts(guild_id)
+    verified = get_guild_owner_verification(guild_id)
+
+    checks = [
+        ("Owner verified", bool(verified and verified["verified"])),
+        ("Channel YouTube", bool(cfg["youtube_channel_id"])),
+        ("Channel TikTok/default", bool(cfg["tiktok_channel_id"])),
+        ("Host pertama", bool(hosts)),
+    ]
+
+    return discord.Embed(
+        title=f"🧭 Setup • {guild.name if guild else guild_id}",
+        description="\n".join(
+            f"{'✅' if ok else '⬜'} {label}"
+            for label, ok in checks
+        ),
+        color=discord.Color.blurple()
+    ).add_field(
+        name="Langkah berikut",
+        value="Gunakan **Kelola Host** untuk menambah host atau test notifier.",
+        inline=False
+    )
+
+
+class ServerOnboardingView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    @discord.ui.button(label="Kelola Host", emoji="📡", style=discord.ButtonStyle.primary, row=0)
+    async def hosts(self, interaction, button):
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        guild = await require_server_owner(interaction, self.guild_id)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+
+
+
+class UserServerMenuView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+
+    async def valid_owner(self, interaction):
+        return await require_server_owner(interaction, self.guild_id)
+
+    @discord.ui.button(label="Premium", emoji="⭐", style=discord.ButtonStyle.success, row=0)
+    async def premium(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=premium_plan_summary_embed(guild),
+            view=UserPremiumView(self.guild_id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Kelola Host", emoji="📡", style=discord.ButtonStyle.primary, row=0)
+    async def manage_hosts(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(guild.id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Request", emoji="📨", style=discord.ButtonStyle.secondary, row=0)
+    async def requests(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=server_owner_requests_embed(self.guild_id),
+            view=ServerOwnerRequestsView(interaction.user.id, self.guild_id)
+        )
+
+    @discord.ui.button(label="Insights", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
+    async def insights(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=server_insights_embed(self.guild_id),
+            view=ServerInsightsView(self.guild_id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Platform", emoji="🌐", style=discord.ButtonStyle.secondary, row=1)
+    async def platform(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=platform_control_embed(self.guild_id),
+            view=ServerPlatformControlView(self.guild_id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Setup", emoji="🧭", style=discord.ButtonStyle.secondary, row=1)
+    async def setup(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=server_onboarding_embed(self.guild_id),
+            view=ServerOnboardingView(self.guild_id, interaction.user.id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            view=MenuRoleChoiceView(interaction.user.id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
+    async def home(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            view=MenuRoleChoiceView(interaction.user.id)
+        )
 
 
 def user_server_hosts_embed(guild: discord.Guild):
@@ -13766,6 +17909,83 @@ def user_server_host_detail_embed(host):
     return embed
 
 
+class ServerBulkHostActionView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return None
+        return await require_server_owner(interaction, self.guild_id)
+
+    async def set_all(self, interaction, enabled: bool):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        create_rollback_snapshot(
+            self.guild_id,
+            "bulk_resume" if enabled else "bulk_pause",
+            interaction.user.id
+        )
+
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE hosts SET enabled=? WHERE guild_id=?",
+                (1 if enabled else 0, self.guild_id)
+            )
+            conn.commit()
+
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(self.guild_id, self.user_id)
+        )
+
+    @discord.ui.button(label="Pause Semua", emoji="⏸️", style=discord.ButtonStyle.danger, row=0)
+    async def pause_all(self, interaction, button):
+        await self.set_all(interaction, False)
+
+    @discord.ui.button(label="Resume Semua", emoji="▶️", style=discord.ButtonStyle.success, row=0)
+    async def resume_all(self, interaction, button):
+        await self.set_all(interaction, True)
+
+    @discord.ui.button(label="Recheck Semua", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def recheck_all(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, failed = 0, 0
+
+        for host in get_hosts(self.guild_id):
+            try:
+                await host_manager_recheck(host)
+                ok += 1
+            except Exception:
+                failed += 1
+
+        await interaction.followup.send(
+            f"🔄 Recheck selesai • ✅ {ok} • ❌ {failed}",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(self.guild_id, self.user_id)
+        )
+
+
+
+
 class UserServerHostSearchModal(discord.ui.Modal):
     query = discord.ui.TextInput(
         label="Cari Host",
@@ -13939,6 +18159,30 @@ class UserServerHostsView(discord.ui.View):
 
         await interaction.response.send_modal(
             UserServerHostSearchModal(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Bulk",
+        emoji="🧰",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def bulk(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"🧰 Bulk Host • {guild.name}",
+                description=(
+                    "Aksi massal membuat rollback snapshot sebelum perubahan."
+                ),
+                color=discord.Color.orange()
+            ),
+            view=ServerBulkHostActionView(
                 self.guild_id,
                 self.user_id
             )
@@ -17937,6 +22181,99 @@ class PaymentMethodSelectView(discord.ui.View):
         )
 
 
+class PaymentProofDetailsModal(discord.ui.Modal):
+    sender_name = discord.ui.TextInput(
+        label="Nama Pengirim",
+        placeholder="Nama pada rekening/e-wallet pengirim",
+        max_length=120
+    )
+    sender_account = discord.ui.TextInput(
+        label="Rekening / Nomor Pengirim",
+        placeholder="Nomor rekening/e-wallet pengirim",
+        max_length=120
+    )
+    transfer_time = discord.ui.TextInput(
+        label="Waktu Transfer",
+        placeholder="Contoh: 05-10-2026 02:15 WIB",
+        max_length=100
+    )
+    reference = discord.ui.TextInput(
+        label="No. Referensi / Transaksi",
+        placeholder="Nomor referensi dari aplikasi pembayaran",
+        max_length=160
+    )
+    amount = discord.ui.TextInput(
+        label="Nominal pada Bukti",
+        placeholder="Contoh: 25137",
+        max_length=15
+    )
+
+    def __init__(self, order_id: int):
+        super().__init__(
+            title="Detail Bukti Transfer",
+            timeout=300
+        )
+        self.order_id = int(order_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        order = get_premium_order(self.order_id)
+
+        if not order:
+            await safe_reply(interaction, "❌ Invoice tidak ditemukan.")
+            return
+
+        if int(order["requester_id"]) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Invoice ini bukan milikmu.")
+            return
+
+        raw_amount = (
+            self.amount.value
+            .strip()
+            .replace(".", "")
+            .replace(",", "")
+            .replace("Rp", "")
+            .replace("rp", "")
+            .replace(" ", "")
+        )
+
+        if not raw_amount.isdigit():
+            await safe_reply(interaction, "❌ Nominal harus berupa angka.")
+            return
+
+        try:
+            save_payment_proof_details(
+                self.order_id,
+                sender_name=self.sender_name.value,
+                sender_account=self.sender_account.value,
+                transfer_time=self.transfer_time.value,
+                reference=self.reference.value,
+                declared_amount=int(raw_amount)
+            )
+        except ValueError as exc:
+            await safe_reply(interaction, f"❌ {exc}")
+            return
+
+        await safe_reply(
+            interaction,
+            (
+                "✅ Detail transfer disimpan.\n\n"
+                f"Invoice: `{order['invoice_ref'] or ensure_invoice_ref(order['id'])}`\n"
+                f"Harga paket: **{rupiah(int(order['price']))}**\n"
+                f"Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
+                f"Total transfer wajib: **{rupiah(int(order['expected_amount'] or order['price']))}**\n"
+                f"Pengirim: **{self.sender_name.value.strip()}**\n"
+                f"Rekening: `{mask_account(self.sender_account.value)}`\n"
+                f"Referensi: `{self.reference.value.strip()}`\n\n"
+                "📎 Sekarang kirim **1 screenshot bukti transfer asli** "
+                "sebagai attachment ke DM bot ini.\n\n"
+                + payment_proof_instruction_text()
+                + "\n\nBot akan melakukan screening otomatis sebelum bukti diteruskan."
+            )
+        )
+
+
+
+
 class PaymentConfirmView(discord.ui.View):
     def __init__(self, order_id: int):
         super().__init__(timeout=900)
@@ -17975,14 +22312,8 @@ class PaymentConfirmView(discord.ui.View):
             )
             return
 
-        await safe_reply(
-            interaction,
-            (
-                f"📎 Sekarang kirim **bukti pembayaran** ke DM bot ini.\n"
-                f"Bukti akan dikaitkan ke request **#{self.order_id}**.\n"
-                f"Metode: **{order['payment_method_name']}**\n"
-                "Kirim gambar/screenshot pembayaran sebagai attachment."
-            )
+        await interaction.response.send_modal(
+            PaymentProofDetailsModal(self.order_id)
         )
 
     @discord.ui.button(
@@ -18473,7 +22804,11 @@ def owner_dashboard_embed():
 
 class PremiumOrderSelect(discord.ui.Select):
     def __init__(self):
-        orders = list_premium_orders(("pending", "proof_submitted", "amount_mismatch", "amount_verified", "paid"), 25)
+        orders = list_premium_orders((
+            "pending", "proof_submitted", "amount_mismatch",
+            "underpaid", "overpaid", "amount_verified",
+            "paid", "late_payment"
+        ), 25)
 
         options = []
 
@@ -18533,18 +22868,7 @@ class PremiumOrdersView(discord.ui.View):
 
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        counts = premium_order_counts()
-        embed = discord.Embed(
-            title="💳 Permintaan Premium",
-            description=(
-                f"🟡 Pending: **{counts['pending']}**\n"
-                f"🟠 Bukti: **{counts['proof_submitted']}**\n"
-                f"🔴 Tidak Sesuai: **{counts['amount_mismatch']}**\n"
-                f"🟢 Nominal Sesuai: **{counts['amount_verified']}**\n"
-                f"🔵 Dibayar: **{counts['paid']}**"
-            ),
-            color=discord.Color.gold()
-        )
+        embed = premium_queue_embed()
         await interaction.response.edit_message(
             embed=embed,
             view=PremiumOrdersView()
@@ -18663,6 +22987,107 @@ class OwnerOrderNoteModal(discord.ui.Modal):
         await safe_reply(interaction, "✅ Catatan transaksi disimpan.")
 
 
+class PaymentOverrideModal(discord.ui.Modal):
+    reason = discord.ui.TextInput(
+        label="Alasan Override",
+        placeholder="Jelaskan kenapa transaksi perlu diaktifkan manual.",
+        style=discord.TextStyle.paragraph,
+        min_length=10,
+        max_length=500
+    )
+
+    def __init__(self, order_id: int):
+        super().__init__(title="Manual Payment Override", timeout=300)
+        self.order_id = int(order_id)
+
+    async def on_submit(self, interaction):
+        if owner_role(interaction.user.id) != "super_owner":
+            await safe_reply(
+                interaction,
+                "🔒 Override hanya untuk Super Owner."
+            )
+            return
+
+        order = get_premium_order(self.order_id)
+        if not order:
+            await safe_reply(interaction, "❌ Invoice tidak ditemukan.")
+            return
+
+        if order["activated_at"] or str(order["status"]) == "active":
+            await safe_reply(
+                interaction,
+                "ℹ️ Premium invoice ini sudah aktif."
+            )
+            return
+
+        if str(order["status"]) in {"refunded", "refund_pending"}:
+            await safe_reply(
+                interaction,
+                "❌ Invoice sedang/sudah dalam proses refund."
+            )
+            return
+
+        create_rollback_snapshot(
+            int(order["guild_id"]),
+            "payment_manual_override",
+            interaction.user.id
+        )
+
+        expected = int(order["expected_amount"] or order["price"])
+        received = order["received_amount"]
+
+        if received is None or int(received) != expected:
+            await safe_reply(
+                interaction,
+                "❌ Override tetap membutuhkan nominal masuk yang persis sesuai invoice."
+            )
+            return
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE premium_orders
+                SET
+                    amount_verified=1,
+                    payment_verified_at=?,
+                    override_reason=?,
+                    status='amount_verified',
+                    updated_at=?
+                WHERE id=?
+            """, (
+                int(time.time()),
+                self.reason.value.strip()[:500],
+                int(time.time()),
+                self.order_id
+            ))
+            conn.commit()
+
+        record_premium_event(
+            self.order_id,
+            "manual_override",
+            actor_id=interaction.user.id,
+            detail=self.reason.value.strip()
+        )
+
+        try:
+            ok, msg = await activate_verified_premium_order(
+                self.order_id,
+                actor_id=interaction.user.id,
+                source="super_owner_manual_override",
+                require_proof=False
+            )
+        except Exception as exc:
+            await safe_reply(
+                interaction,
+                f"❌ Override gagal: `{type(exc).__name__}: {exc}`"
+            )
+            return
+
+        await safe_reply(
+            interaction,
+            "✅ Override berhasil dan Premium aktif." if ok else f"⚠️ {msg}"
+        )
+
+
 class PremiumOrderManageView(discord.ui.View):
     def __init__(self, order_id: int):
         super().__init__(timeout=900)
@@ -18777,93 +23202,27 @@ class PremiumOrderManageView(discord.ui.View):
         if not order:
             return
 
-        if not claim_order_for_activation(
-            self.order_id,
-            interaction.user.id
-        ):
-            await safe_reply(
-                interaction,
-                "⏳ Request sedang atau sudah diproses owner lain."
-            )
-            return
-
         await defer_if_needed(interaction, ephemeral=True)
 
         try:
-            guild_id = int(order["guild_id"])
-            existing = get_guild_settings(guild_id)
-            extend = existing["plan"] == "premium"
-
-            set_plan(
-                guild_id,
-                "premium",
-                duration_days=int(order["days"]),
-                extend=extend
-            )
-
-            settings = get_guild_settings(guild_id)
-            expires_at = (
-                int(settings["premium_expires_at"])
-                if settings["premium_expires_at"]
-                else None
-            )
-
-            update_order_status(
+            ok, message = await activate_verified_premium_order(
                 self.order_id,
-                "active",
-                processed_by=interaction.user.id,
-                activated_at=int(time.time()),
-                expires_at=expires_at
-            )
-
-            invoice_ref = (
-                order["invoice_ref"]
-                or ensure_invoice_ref(order["id"])
-            )
-
-            add_activity(
-                guild_id,
-                interaction.user.id,
-                "Premium Activated",
-                f"{invoice_ref}; {order['days']} hari."
-            )
-
-            await audit_webhook(
-                "Premium Activated",
-                invoice_ref,
                 actor_id=interaction.user.id,
-                guild_id=guild_id
+                source="manual_owner_approval"
             )
 
-            await send_payment_admin_log(
-                "✅ Premium Aktif",
-                (
-                    f"Invoice: `{invoice_ref}`\n"
-                    f"Paket: **{order['days']} hari**\n"
-                    f"Nominal: **{rupiah(int(order['expected_amount'] or order['price']))}**"
-                ),
-                guild_id=guild_id
-            )
-
-            msg = (
-                f"✅ Pembayaran `{invoice_ref}` diterima.\n"
-                f"⭐ Premium aktif **{order['days']} hari**.\n"
-                f"Berakhir: {premium_expiry_text(guild_id)}"
-            )
-
-            await notify_order_user(order, msg)
-
-            guild = bot.get_guild(guild_id)
-            if guild:
-                await dm_guild_owner(guild, msg)
-
-            await interaction.followup.send(
-                "✅ Premium berhasil diaktifkan.",
-                ephemeral=True
-            )
+            if ok:
+                await interaction.followup.send(
+                    "✅ Premium berhasil diaktifkan.",
+                    ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"⚠️ {message}",
+                    ephemeral=True
+                )
 
         except Exception as exc:
-            release_order_claim(self.order_id)
             await report_interaction_error(
                 interaction,
                 exc,
@@ -18883,6 +23242,20 @@ class PremiumOrderManageView(discord.ui.View):
 
         await interaction.response.send_modal(
             RejectPremiumModal(self.order_id)
+        )
+
+    @discord.ui.button(
+        label="Override",
+        emoji="🛡️",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
+    async def override(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if owner_role(interaction.user.id) != "super_owner":
+            await safe_reply(interaction, "🔒 Override hanya untuk Super Owner.")
+            return
+        await interaction.response.send_modal(
+            PaymentOverrideModal(self.order_id)
         )
 
     @discord.ui.button(
@@ -19309,6 +23682,235 @@ class OwnerReadOnlyAuditView(discord.ui.View):
 
 
 
+class PaymentRefundModal(discord.ui.Modal):
+    invoice_ref = discord.ui.TextInput(
+        label="Invoice",
+        placeholder="INV-YYYYMMDD-XXXXXX",
+        max_length=80
+    )
+    status_input = discord.ui.TextInput(
+        label="Status Refund",
+        placeholder="pending / refunded / failed",
+        max_length=20
+    )
+    reason = discord.ui.TextInput(
+        label="Alasan / Catatan",
+        style=discord.TextStyle.paragraph,
+        max_length=500
+    )
+
+    def __init__(self):
+        super().__init__(title="Update Refund", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not owner_has_level(interaction.user.id, "payment_admin"):
+            await safe_reply(interaction, "🔒 Akses Payment Admin diperlukan.")
+            return
+
+        order = get_order_by_invoice_ref(self.invoice_ref.value.strip())
+        if not order:
+            await safe_reply(interaction, "❌ Invoice tidak ditemukan.")
+            return
+
+        if str(order["status"]) == "refunded":
+            await safe_reply(
+                interaction,
+                "ℹ️ Invoice ini sudah berstatus **refunded**."
+            )
+            return
+
+        raw = self.status_input.value.strip().lower()
+        mapping = {
+            "pending": "refund_pending",
+            "refunded": "refunded",
+            "failed": "refund_failed",
+        }
+        target = mapping.get(raw)
+        if not target:
+            await safe_reply(
+                interaction,
+                "❌ Status harus pending / refunded / failed."
+            )
+            return
+
+        current = str(order["status"])
+        if not payment_transition_allowed(current, target):
+            await safe_reply(
+                interaction,
+                f"❌ Transisi `{current}` → `{target}` tidak valid."
+            )
+            return
+
+        now = int(time.time())
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE premium_orders
+                SET
+                    status=?,
+                    refund_status=?,
+                    refund_reason=?,
+                    refunded_at=CASE WHEN ?='refunded' THEN ? ELSE refunded_at END,
+                    processed_by=?,
+                    updated_at=?
+                WHERE id=?
+            """, (
+                target,
+                target,
+                self.reason.value.strip()[:500],
+                target,
+                now,
+                interaction.user.id,
+                now,
+                int(order["id"])
+            ))
+            conn.commit()
+
+        record_premium_event(
+            int(order["id"]),
+            target,
+            actor_id=interaction.user.id,
+            detail=self.reason.value.strip()
+        )
+
+        await safe_reply(
+            interaction,
+            f"✅ Refund `{order['invoice_ref']}` → **{target}**."
+        )
+
+
+class PaymentTestModal(discord.ui.Modal):
+    invoice_ref = discord.ui.TextInput(
+        label="Invoice",
+        placeholder="INV-YYYYMMDD-XXXXXX",
+        max_length=80
+    )
+    amount = discord.ui.TextInput(
+        label="Nominal Simulasi",
+        placeholder="25137",
+        max_length=15
+    )
+
+    def __init__(self):
+        super().__init__(title="Payment Test Mode", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not owner_has_level(interaction.user.id, "payment_admin"):
+            await safe_reply(interaction, "🔒 Akses Payment Admin diperlukan.")
+            return
+
+        order = get_order_by_invoice_ref(self.invoice_ref.value.strip())
+        if not order:
+            await safe_reply(interaction, "❌ Invoice tidak ditemukan.")
+            return
+
+        raw = self.amount.value.strip().replace(".", "").replace(",", "")
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ Nominal harus angka.")
+            return
+
+        expected = int(order["expected_amount"] or order["price"])
+        amount = int(raw)
+
+        await safe_reply(
+            interaction,
+            (
+                "🧪 **Test Mode — tidak mengubah transaksi**\n"
+                f"Invoice: `{order['invoice_ref']}`\n"
+                f"Expected: **{rupiah(expected)}**\n"
+                f"Simulasi: **{rupiah(amount)}**\n"
+                f"Hasil: **{'MATCH' if amount == expected else 'MISMATCH'}**"
+            )
+        )
+
+
+class PaymentCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Health", emoji="🩺", style=discord.ButtonStyle.secondary, row=0)
+    async def health(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=payment_health_embed(),
+            view=PaymentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Settlement", emoji="💰", style=discord.ButtonStyle.secondary, row=0)
+    async def settlement(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=payment_settlement_embed(),
+            view=PaymentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Reconcile", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def reconcile(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await defer_if_needed(interaction, ephemeral=True)
+
+        with closing(db()) as conn:
+            rows = conn.execute("""
+                SELECT id
+                FROM premium_orders
+                WHERE activated_at IS NULL
+                  AND amount_verified=1
+                  AND status IN ('amount_verified','paid')
+                  AND proof_url IS NOT NULL
+                ORDER BY updated_at ASC
+                LIMIT 50
+            """).fetchall()
+
+        activated = 0
+        for row in rows:
+            try:
+                ok, _ = await maybe_auto_activate_verified_order(
+                    int(row["id"]),
+                    actor_id=interaction.user.id,
+                    source="manual_reconciliation"
+                )
+                if ok:
+                    activated += 1
+            except Exception:
+                log.exception(
+                    "Manual payment reconciliation gagal order_id=%s",
+                    row["id"]
+                )
+
+        await interaction.followup.send(
+            f"✅ Reconciliation selesai. Premium diaktifkan: **{activated}**.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Refund", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def refund(self, interaction, button):
+        if not owner_has_level(interaction.user.id, "payment_admin"):
+            await safe_reply(interaction, "🔒 Akses Payment Admin diperlukan.")
+            return
+        await interaction.response.send_modal(PaymentRefundModal())
+
+    @discord.ui.button(label="Test", emoji="🧪", style=discord.ButtonStyle.secondary, row=1)
+    async def test(self, interaction, button):
+        if not owner_has_level(interaction.user.id, "payment_admin"):
+            await safe_reply(interaction, "🔒 Akses Payment Admin diperlukan.")
+            return
+        await interaction.response.send_modal(PaymentTestModal())
+
+    @discord.ui.button(label="Event DLQ", emoji="📮", style=discord.ButtonStyle.secondary, row=1)
+    async def event_dlq(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await safe_reply(
+            interaction,
+            (
+                f"📮 Payment event DLQ open: **{payment_event_dlq_count()}**\n"
+                f"Retry otomatis maksimal **{PAYMENT_EVENT_MAX_RETRIES}x**."
+            )
+        )
+
+
 class OwnerOpsHomeView(discord.ui.View):
     def __init__(self, viewer_id: int):
         super().__init__(timeout=900)
@@ -19408,6 +24010,57 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerEmergencyView(self.viewer_id)
         )
 
+    @discord.ui.button(label="Integrity", emoji="🧰", style=discord.ButtonStyle.secondary, row=3)
+    async def integrity(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=owner_integrity_embed(),
+            view=OwnerIntegrityView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Verification", emoji="✅", style=discord.ButtonStyle.secondary, row=3)
+    async def verification(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=verification_dashboard_embed(),
+            view=OwnerVerificationDashboardView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="DLQ", emoji="📮", style=discord.ButtonStyle.secondary, row=3)
+    async def dlq(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=dead_letter_embed(),
+            view=OwnerDeadLetterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Payment", emoji="💳", style=discord.ButtonStyle.secondary, row=4)
+    async def payment(self, interaction, button):
+        if not await self.valid(interaction, "payment_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=payment_health_embed(),
+            view=PaymentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Diagnostics", emoji="📦", style=discord.ButtonStyle.secondary, row=4)
+    async def diagnostics(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="📦 Diagnostics",
+                description=(
+                    "Buat bundle diagnosis tanpa secret untuk debugging Railway."
+                ),
+                color=discord.Color.blurple()
+            ),
+            view=OwnerDiagnosticsView(self.viewer_id)
+        )
+
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=3)
     async def back(self, interaction, button):
         if not await self.valid(interaction):
@@ -19481,6 +24134,177 @@ class OwnerNotificationCenterView(OwnerBasicBackView):
             embed=owner_notification_center_embed(),
             view=OwnerNotificationCenterView(self.viewer_id)
         )
+
+
+def owner_integrity_embed():
+    report = database_integrity_report()
+    total = sum(report.values())
+    return discord.Embed(
+        title="🧰 Integrity & Repair",
+        description=(
+            "✅ Tidak ada masalah terdeteksi."
+            if total == 0
+            else f"⚠️ Ditemukan **{total}** item."
+        ),
+        color=discord.Color.green() if total == 0 else discord.Color.orange()
+    ).add_field(
+        name="Detail",
+        value=(
+            f"Orphan Host Manager: **{report['orphan_managers']}**\n"
+            f"Request Access stuck: **{report['stuck_access']}**\n"
+            f"Request Host stuck: **{report['stuck_hosts']}**"
+        ),
+        inline=False
+    )
+
+
+def dead_letter_embed():
+    rows = recent_dead_letters()
+    lines = [
+        f"• **#{row['id']}** Host `{row['host_id']}` • "
+        f"{row['event_type'] or '-'} • retry {row['retry_count']}\n"
+        f"  `{str(row['failure_reason'] or '-')[:120]}`"
+        for row in rows
+    ]
+    return discord.Embed(
+        title="📮 Dead Letter Queue",
+        description="\n".join(lines) if lines else "Tidak ada notifikasi gagal permanen.",
+        color=discord.Color.orange()
+    ).add_field(
+        name="Total Open",
+        value=str(dead_letter_count()),
+        inline=True
+    )
+
+
+def diagnostic_bundle_bytes() -> bytes:
+    import zipfile as _zipfile
+    from io import BytesIO
+
+    payload = BytesIO()
+    integrity = database_integrity_report()
+    platform_health = platform_health_summary()
+
+    non_secret = {
+        "schema_version": 18,
+        "db_path": str(DB_PATH),
+        "server_count": len(bot.guilds),
+        "started_at": STARTED_AT,
+        "safe_mode": SAFE_MODE,
+        "safe_mode_reason": SAFE_MODE_REASON,
+        "required_guild_id": REQUIRED_GUILD_ID,
+        "free_host_limit": FREE_HOST_LIMIT,
+        "premium_host_limit": PREMIUM_HOST_LIMIT,
+        "verification_retention_days": VERIFICATION_RETENTION_DAYS,
+        "notification_max_retries": NOTIFICATION_MAX_RETRIES,
+    }
+
+    loops = {
+        "monitor": monitor_loop.is_running(),
+        "premium": premium_expiry_loop.is_running(),
+        "backup": auto_backup_loop.is_running(),
+        "invoice": invoice_expiry_loop.is_running(),
+        "pending_notification": pending_notification_loop.is_running(),
+        "verification_cleanup": verification_retention_cleanup_loop.is_running(),
+        "host_validation": host_target_validation_loop.is_running(),
+    }
+
+    with _zipfile.ZipFile(payload, "w", _zipfile.ZIP_DEFLATED) as z:
+        z.writestr(
+            "config-non-secret.json",
+            json.dumps(non_secret, indent=2, ensure_ascii=False)
+        )
+        z.writestr(
+            "integrity.json",
+            json.dumps(integrity, indent=2, ensure_ascii=False)
+        )
+        z.writestr(
+            "platform-health.json",
+            json.dumps(platform_health, indent=2, ensure_ascii=False)
+        )
+        z.writestr(
+            "loops.json",
+            json.dumps(loops, indent=2, ensure_ascii=False)
+        )
+
+    return payload.getvalue()
+
+
+class OwnerVerificationDashboardView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=verification_dashboard_embed(),
+            view=OwnerVerificationDashboardView(self.viewer_id)
+        )
+
+
+class OwnerDeadLetterView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=dead_letter_embed(),
+            view=OwnerDeadLetterView(self.viewer_id)
+        )
+
+
+class OwnerDiagnosticsView(OwnerBasicBackView):
+    @discord.ui.button(label="Buat Bundle", emoji="📦", style=discord.ButtonStyle.primary, row=0)
+    async def bundle(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        data = diagnostic_bundle_bytes()
+
+        await interaction.response.send_message(
+            content=(
+                "📦 Diagnostic bundle tanpa token/API key/password."
+            ),
+            file=discord.File(
+                io.BytesIO(data),
+                filename="hi-notifku-diagnostics.zip"
+            ),
+            ephemeral=True
+        )
+
+
+
+
+class OwnerIntegrityView(OwnerBasicBackView):
+    @discord.ui.button(label="Scan", emoji="🔎", style=discord.ButtonStyle.secondary, row=0)
+    async def scan(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_integrity_embed(),
+            view=OwnerIntegrityView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Repair Aman", emoji="🧹", style=discord.ButtonStyle.danger, row=0)
+    async def repair(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        report = repair_database_integrity()
+        add_activity(
+            None,
+            interaction.user.id,
+            "Database Safe Repair",
+            json.dumps(report)
+        )
+
+        await interaction.response.edit_message(
+            embed=owner_integrity_embed(),
+            view=OwnerIntegrityView(self.viewer_id)
+        )
+
+
 
 
 class OwnerPlatformHealthView(OwnerBasicBackView):
@@ -19666,6 +24490,19 @@ class OwnerRiskModal(discord.ui.Modal):
         max_length=20
     )
 
+    reason = discord.ui.TextInput(
+        label="Alasan (opsional)",
+        placeholder="Contoh: abuse / spam / investigasi",
+        required=False,
+        max_length=300
+    )
+    duration_hours = discord.ui.TextInput(
+        label="Durasi jam (opsional)",
+        placeholder="24 • kosong = tanpa expiry",
+        required=False,
+        max_length=6
+    )
+
     def __init__(self, viewer_id: int):
         super().__init__(title="Atur Risiko Server", timeout=300)
         self.viewer_id = int(viewer_id)
@@ -19693,7 +24530,22 @@ class OwnerRiskModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Server tidak ditemukan di bot.")
             return
 
+        hours_raw = self.duration_hours.value.strip()
+        expires_at = None
+
+        if hours_raw:
+            if not hours_raw.isdigit():
+                await safe_reply(interaction, "❌ Durasi harus angka jam.")
+                return
+            expires_at = int(time.time()) + int(hours_raw) * 3600
+
         set_access_state(guild_id, state)
+        set_server_risk_meta(
+            guild_id,
+            reason=self.reason.value.strip(),
+            expires_at=expires_at,
+            actor_id=interaction.user.id
+        )
         add_activity(
             guild_id,
             interaction.user.id,
@@ -19821,9 +24673,12 @@ class OwnerBackupCenterView(OwnerBasicBackView):
             return
 
         payload, raw = manual_backup_payload_and_bytes()
-        ok, detail = verify_backup_payload(payload)
+        ok, detail = backup_restore_smoke_test(payload)
         if not ok:
-            await safe_reply(interaction, f"❌ Backup gagal diverifikasi: {detail}")
+            await safe_reply(
+                interaction,
+                f"❌ Backup/restore smoke-test gagal: {detail}"
+            )
             return
 
         ts = int(time.time())
@@ -19996,16 +24851,8 @@ class OwnerHomeView(discord.ui.View):
     async def premium_requests(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
-        counts = premium_order_counts()
         await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="💳 Permintaan Premium",
-                description=(
-                    f"🟡 Pending: **{counts['pending']}**\n"
-                    f"🔵 Dibayar: **{counts['paid']}**"
-                ),
-                color=discord.Color.gold()
-            ),
+            embed=premium_queue_embed(),
             view=PremiumOrdersView()
         )
 
@@ -20139,6 +24986,189 @@ class BackHomeView(discord.ui.View):
 
 
 
+def coupon_admin_embed():
+    now = int(time.time())
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM premium_coupons
+            ORDER BY created_at DESC
+            LIMIT 15
+        """).fetchall()
+
+    lines = []
+    for row in rows:
+        active = bool(row["enabled"]) and (
+            not row["expires_at"] or int(row["expires_at"]) > now
+        )
+        value = (
+            f"{row['discount_value']}%"
+            if row["discount_type"] == "percent"
+            else rupiah(int(row["discount_value"]))
+        )
+        lines.append(
+            f"{'🟢' if active else '⚪'} `{row['code']}` • "
+            f"**{value}** • {int(row['used_count'] or 0)}x"
+        )
+
+    return discord.Embed(
+        title="🎟️ Promo Premium",
+        description="\n".join(lines) if lines else "Belum ada kode promo.",
+        color=discord.Color.gold()
+    )
+
+
+class CouponCreateModal(discord.ui.Modal):
+    code_input = discord.ui.TextInput(
+        label="Kode",
+        placeholder="HINOTIF10",
+        max_length=40
+    )
+    type_input = discord.ui.TextInput(
+        label="Tipe",
+        placeholder="percent / fixed",
+        max_length=10
+    )
+    value_input = discord.ui.TextInput(
+        label="Nilai",
+        placeholder="10 atau 5000",
+        max_length=12
+    )
+    max_uses_input = discord.ui.TextInput(
+        label="Maks. penggunaan (opsional)",
+        required=False,
+        max_length=8
+    )
+    days_input = discord.ui.TextInput(
+        label="Berlaku berapa hari (opsional)",
+        required=False,
+        max_length=5
+    )
+
+    def __init__(self):
+        super().__init__(title="Buat / Update Promo", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+
+        raw_value = self.value_input.value.strip()
+        if not raw_value.isdigit():
+            await safe_reply(interaction, "❌ Nilai promo harus angka.")
+            return
+
+        max_uses = (
+            int(self.max_uses_input.value.strip())
+            if self.max_uses_input.value.strip().isdigit()
+            else None
+        )
+        expires_at = None
+        if self.days_input.value.strip():
+            if not self.days_input.value.strip().isdigit():
+                await safe_reply(interaction, "❌ Hari berlaku harus angka.")
+                return
+            expires_at = (
+                int(time.time())
+                + int(self.days_input.value.strip()) * 86400
+            )
+
+        create_coupon(
+            self.code_input.value,
+            self.type_input.value,
+            int(raw_value),
+            expires_at=expires_at,
+            max_uses=max_uses,
+            actor_id=interaction.user.id
+        )
+
+        await safe_reply(
+            interaction,
+            f"✅ Promo `{self.code_input.value.strip().upper()}` disimpan."
+        )
+
+
+class CouponToggleModal(discord.ui.Modal):
+    code_input = discord.ui.TextInput(
+        label="Kode Promo",
+        max_length=40
+    )
+
+    def __init__(self):
+        super().__init__(title="Aktif / Nonaktif Promo", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+
+        code_value = self.code_input.value.strip().upper()
+        row = coupon_get(code_value)
+
+        if not row:
+            await safe_reply(interaction, "❌ Promo tidak ditemukan.")
+            return
+
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE premium_coupons SET enabled=? WHERE code=?",
+                (0 if row["enabled"] else 1, code_value)
+            )
+            conn.commit()
+
+        await safe_reply(
+            interaction,
+            f"✅ Promo `{code_value}` sekarang "
+            f"{'NONAKTIF' if row['enabled'] else 'AKTIF'}."
+        )
+
+
+class CouponAdminView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Buat / Edit", emoji="➕", style=discord.ButtonStyle.success, row=0)
+    async def create(self, interaction, button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+        await interaction.response.send_modal(CouponCreateModal())
+
+    @discord.ui.button(label="Aktif / Nonaktif", emoji="⏯️", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle(self, interaction, button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+        await interaction.response.send_modal(CouponToggleModal())
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=coupon_admin_embed(),
+            view=CouponAdminView()
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="💰 Harga Paket Premium",
+                description=premium_packages_text(),
+                color=discord.Color.gold()
+            ),
+            view=PremiumPriceManagementView()
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+
+
 class PremiumPriceManagementView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
@@ -20175,6 +25205,20 @@ class PremiumPriceManagementView(discord.ui.View):
 
         await interaction.response.send_modal(
             DeletePremiumPackageModal()
+        )
+
+    @discord.ui.button(
+        label="Promo",
+        emoji="🎟️",
+        style=discord.ButtonStyle.secondary
+    )
+    async def promo(self, interaction, button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+        await interaction.response.edit_message(
+            embed=coupon_admin_embed(),
+            view=CouponAdminView()
         )
 
     @discord.ui.button(
@@ -22683,6 +27727,13 @@ async def start_command(interaction: discord.Interaction):
     if not await require_dm_command(interaction):
         return
 
+    if SAFE_MODE:
+        await safe_reply(
+            interaction,
+            "🛠️ Hi Notifku sedang **Safe Mode**. Hanya `/owner` untuk diagnosis."
+        )
+        return
+
     if is_user_blacklisted(interaction.user.id):
         await safe_reply(
             interaction,
@@ -22729,8 +27780,10 @@ async def start_command(interaction: discord.Interaction):
             )
             return
 
-        verified = await is_user_in_required_guild(
-            interaction.user.id
+        verified = await refresh_user_verification(
+            interaction.user.id,
+            source="start_command",
+            mark_active=True
         )
 
         if verified:
@@ -22751,6 +27804,14 @@ async def start_command(interaction: discord.Interaction):
                     ),
                     inline=False
                 )
+            embed.add_field(
+                name="Verifikasi User",
+                value=user_verification_status_text(
+                    interaction.user.id
+                ),
+                inline=False
+            )
+
             await safe_reply(
                 interaction,
                 "",
@@ -22788,6 +27849,13 @@ async def menu_command(interaction: discord.Interaction):
     if not await require_dm_command(interaction):
         return
 
+    if SAFE_MODE:
+        await safe_reply(
+            interaction,
+            "🛠️ Hi Notifku sedang **Safe Mode**. Hanya `/owner` untuk diagnosis."
+        )
+        return
+
     if is_user_blacklisted(interaction.user.id):
         await safe_reply(
             interaction,
@@ -22813,9 +27881,22 @@ async def menu_command(interaction: discord.Interaction):
                 )
                 return
 
-            verified = await is_user_in_required_guild(
+            verified = user_verification_is_active(
                 interaction.user.id
             )
+
+            if not verified:
+                # Recovery path: if cache expired/missing but user is still
+                # a Support member, verify automatically without manual approval.
+                verified = await refresh_user_verification(
+                    interaction.user.id,
+                    source="menu_auto_refresh",
+                    mark_active=True
+                )
+            else:
+                touch_user_verification_activity(
+                    interaction.user.id
+                )
 
             if verified:
                 await verify_owned_guilds_for_user(
@@ -22828,7 +27909,7 @@ async def menu_command(interaction: discord.Interaction):
                     (
                         "🔒 Kamu belum terverifikasi.\n"
                         "Join **Server Owner/Support** terlebih dahulu. "
-                        "Verifikasi akan aktif otomatis; `/start` hanya untuk refresh manual."
+                        "Verifikasi akan aktif otomatis. Setelah terverifikasi, status user disimpan hingga 30 hari sejak aktivitas terakhir."
                     ),
                     embed=start_verify_embed(
                         interaction.user.id,
@@ -23049,11 +28130,19 @@ async def on_message(message: discord.Message):
                 ).hexdigest()
 
                 try:
+                    scan = await asyncio.to_thread(
+                        scan_payment_proof_bytes,
+                        proof_bytes,
+                        filename=attachment.filename or "",
+                        content_type=attachment.content_type or ""
+                    )
+
                     save_payment_proof(
                         int(order["id"]),
                         proof_url,
                         int(message.id),
-                        proof_hash_value
+                        proof_hash_value,
+                        scan=scan
                     )
                 except ValueError as exc:
                     await message.channel.send(
@@ -23067,7 +28156,8 @@ async def on_message(message: discord.Message):
                 embed = premium_order_embed(updated_order)
                 embed.title = f"📎 Bukti Pembayaran #{order['id']}"
                 embed.description = (
-                    f"Bukti pembayaran baru dari <@{message.author.id}>."
+                    f"Bukti pembayaran baru dari <@{message.author.id}>.\n"
+                    f"{payment_proof_scan_label(updated_order)}"
                 )
 
                 for owner_id in primary_owner_ids():
@@ -23098,8 +28188,39 @@ async def on_message(message: discord.Message):
                     guild_id=int(updated_order["guild_id"])
                 )
 
+                auto_ok = False
+                auto_message = ""
+
+                try:
+                    auto_ok, auto_message = await maybe_auto_activate_verified_order(
+                        int(updated_order["id"]),
+                        actor_id=(
+                            int(updated_order["processed_by"])
+                            if updated_order["processed_by"]
+                            else 0
+                        ),
+                        source="proof_uploaded_after_payment_verification"
+                    )
+                except Exception:
+                    log.exception("Auto aktivasi setelah upload bukti gagal")
+
+                scan_text = payment_proof_scan_label(updated_order)
+
                 await message.channel.send(
-                    f"✅ Bukti `{invoice_ref}` sudah diterima. Tunggu verifikasi owner."
+                    (
+                        f"✅ Bukti `{invoice_ref}` sudah diterima.\n"
+                        f"Screening: {scan_text}\n"
+                        + (
+                            "⭐ Pembayaran sebelumnya sudah terverifikasi, "
+                            "jadi Premium otomatis diaktifkan."
+                            if auto_ok
+                            else (
+                                "⏳ Menunggu verifikasi pembayaran/nominal masuk.\n"
+                                "Pastikan screenshot yang dikirim sudah mengikuti instruksi "
+                                "agar tidak masuk REVIEW/DITOLAK."
+                            )
+                        )
+                    )
                 )
                 return
 
@@ -23235,6 +28356,27 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+@bot.listen("on_interaction")
+async def track_verified_user_activity(
+    interaction: discord.Interaction
+):
+    try:
+        user = interaction.user
+        if not user or getattr(user, "bot", False):
+            return
+
+        if is_global_owner(user.id):
+            return
+
+        if user_verification_is_active(user.id):
+            touch_user_verification_activity(user.id)
+
+    except Exception:
+        log.exception("Gagal memperbarui aktivitas verifikasi user")
+
+
+
+
 @bot.event
 async def on_member_join(member: discord.Member):
     try:
@@ -23243,6 +28385,15 @@ async def on_member_join(member: discord.Member):
 
         if int(member.guild.id) != int(REQUIRED_GUILD_ID):
             return
+
+        if not is_global_owner(member.id):
+            set_user_verification(
+                member.id,
+                True,
+                source="support_member_join",
+                reason="User join Server Owner/Support.",
+                mark_active=True
+            )
 
         updated = await auto_verify_owned_guilds_for_member(
             member.id,
@@ -23288,6 +28439,15 @@ async def on_member_remove(member: discord.Member):
 
         if int(member.guild.id) != int(REQUIRED_GUILD_ID):
             return
+
+        if not is_global_owner(member.id):
+            set_user_verification(
+                member.id,
+                False,
+                source="support_member_remove",
+                reason="User keluar dari Server Owner/Support.",
+                mark_active=False
+            )
 
         updated = await auto_verify_owned_guilds_for_member(
             member.id,
@@ -23397,7 +28557,8 @@ async def on_guild_join(guild: discord.Guild):
 
         verified = await refresh_guild_owner_verification(
             guild,
-            source="bot_invited"
+            source="bot_invited",
+            user_active=True
         )
 
         if REQUIRED_GUILD_ID and not verified:
@@ -23477,18 +28638,40 @@ async def on_guild_remove(guild: discord.Guild):
         log.exception("Guild cleanup gagal")
 
 
+def validate_storage_paths_before_db():
+    path = Path(DB_PATH).expanduser()
+    parent = path.parent
+
+    if path.is_absolute() and not parent.exists():
+        if str(path).startswith("/data/"):
+            raise RuntimeError(
+                "DB_PATH memakai /data tetapi folder /data tidak tersedia. "
+                "Pasang Railway Volume dengan mount path /data, atau ubah "
+                "DB_PATH menjadi live_notifier.db."
+            )
+        parent.mkdir(parents=True, exist_ok=True)
+
+    probe = parent / ".hi-notifku-db-write-test"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Folder database tidak writable: {parent} "
+            f"({type(exc).__name__}: {exc})"
+        )
+
+
 def startup_integrity_results() -> list[tuple[str, bool, str]]:
     results = []
 
     required_tables = {
-        "guild_config",
-        "guild_settings",
-        "hosts",
-        "premium_orders",
-        "server_host_access_requests",
-        "host_creation_requests",
-        "guild_owner_verification",
-        "schema_meta",
+        "guild_config", "guild_settings", "hosts", "premium_orders",
+        "server_host_access_requests", "host_creation_requests",
+        "guild_owner_verification", "user_verifications",
+        "pending_notifications", "notification_dead_letter",
+        "payment_callback_events", "payment_event_dead_letter",
+        "premium_coupons", "premium_coupon_redemptions", "schema_meta",
     }
 
     try:
@@ -23514,13 +28697,23 @@ def startup_integrity_results() -> list[tuple[str, bool, str]]:
 
     try:
         path = Path(DB_PATH).expanduser()
-        results.append((
-            "DB path",
-            path.exists(),
-            str(path)
-        ))
+        parent = path.parent
+        probe = parent / ".startup-db-write"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        results.append(("DB writable", path.exists(), str(path)))
     except Exception as exc:
-        results.append(("DB path", False, str(exc)))
+        results.append(("DB writable", False, str(exc)))
+
+    try:
+        qris = Path(QRIS_STORAGE_DIR)
+        qris.mkdir(parents=True, exist_ok=True)
+        probe = qris / ".startup-check"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        results.append(("QRIS storage", True, str(qris)))
+    except Exception as exc:
+        results.append(("QRIS storage", False, str(exc)))
 
     try:
         folder = Path(AUTO_BACKUP_DIR)
@@ -23593,9 +28786,39 @@ async def notify_startup_integrity():
 
 
 
+def evaluate_safe_mode() -> tuple[bool, str]:
+    try:
+        required = {
+            "guild_settings",
+            "hosts",
+            "user_verifications",
+            "notification_history",
+            "pending_notifications",
+        }
+
+        with closing(db()) as conn:
+            actual = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+
+        missing = sorted(required - actual)
+        if missing:
+            return True, "Missing tables: " + ", ".join(missing)
+
+        return False, ""
+
+    except Exception as exc:
+        return True, f"{type(exc).__name__}: {exc}"
+
+
+
+
 @bot.event
 async def on_ready():
-    global http
+    global http, SAFE_MODE, SAFE_MODE_REASON
 
     if http is None or http.closed:
         http = aiohttp.ClientSession()
@@ -23605,6 +28828,14 @@ async def on_ready():
         bot.user,
         bot.user.id
     )
+
+    SAFE_MODE, SAFE_MODE_REASON = evaluate_safe_mode()
+
+    if SAFE_MODE:
+        log.error(
+            "SAFE MODE aktif: %s",
+            SAFE_MODE_REASON
+        )
     try:
         bot.add_view(StartVerifyView())
     except Exception:
@@ -23626,11 +28857,31 @@ async def on_ready():
     except Exception:
         log.exception("Startup integrity check gagal")
 
+    try:
+        await start_payment_webhook_server()
+    except Exception:
+        log.exception("Payment webhook server gagal start")
+
     if not monitor_loop.is_running():
         monitor_loop.start()
 
+    if not host_auto_recovery_loop.is_running():
+        host_auto_recovery_loop.start()
+
+    if not server_owner_health_alert_loop.is_running():
+        server_owner_health_alert_loop.start()
+
+    if not host_target_validation_loop.is_running():
+        host_target_validation_loop.start()
+
+    if not platform_outage_detection_loop.is_running():
+        platform_outage_detection_loop.start()
+
     if not host_manager_expiry_warning_loop.is_running():
         host_manager_expiry_warning_loop.start()
+
+    if not pending_request_recovery_loop.is_running():
+        pending_request_recovery_loop.start()
 
     if not pending_request_reminder_loop.is_running():
         pending_request_reminder_loop.start()
@@ -23643,11 +28894,26 @@ async def on_ready():
     if not owner_verification_reconcile_loop.is_running():
         owner_verification_reconcile_loop.start()
 
+    if not user_verification_reconcile_loop.is_running():
+        user_verification_reconcile_loop.start()
+
+    if not verification_retention_cleanup_loop.is_running():
+        verification_retention_cleanup_loop.start()
+
+    if not verification_expiry_warning_loop.is_running():
+        verification_expiry_warning_loop.start()
+
     if not premium_expiry_loop.is_running():
         premium_expiry_loop.start()
 
     if not auto_backup_loop.is_running():
         auto_backup_loop.start()
+
+    if not payment_reconciliation_loop.is_running():
+        payment_reconciliation_loop.start()
+
+    if not payment_event_retry_loop.is_running():
+        payment_event_retry_loop.start()
 
     if not invoice_expiry_loop.is_running():
         invoice_expiry_loop.start()
@@ -23677,11 +28943,57 @@ async def main():
     log.info("DB_PATH aktif: %s", DB_PATH)
     log.info("DB parent: %s", Path(DB_PATH).expanduser().parent)
 
+    validate_storage_paths_before_db()
     migrate_database()
 
     try:
         await bot.start(DISCORD_TOKEN)
     finally:
+        log.info("Graceful shutdown: menghentikan loop dan flush resource.")
+
+        loops = [
+            monitor_loop,
+            host_auto_recovery_loop,
+            server_owner_health_alert_loop,
+            host_target_validation_loop,
+            platform_outage_detection_loop,
+            host_manager_expiry_warning_loop,
+            pending_request_reminder_loop,
+            pending_request_recovery_loop,
+            owner_verification_reconcile_loop,
+            user_verification_reconcile_loop,
+            verification_expiry_warning_loop,
+            verification_retention_cleanup_loop,
+            premium_expiry_loop,
+            auto_backup_loop,
+            payment_reconciliation_loop,
+            payment_event_retry_loop,
+            invoice_expiry_loop,
+            db_maintenance_loop,
+            pending_notification_loop,
+            event_cleanup_loop,
+            loop_lag_metrics,
+        ]
+
+        for loop in loops:
+            try:
+                if loop.is_running():
+                    loop.cancel()
+            except Exception:
+                pass
+
+        try:
+            with closing(db()) as conn:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                conn.commit()
+        except Exception:
+            log.exception("DB flush saat shutdown gagal")
+
+        try:
+            await stop_payment_webhook_server()
+        except Exception:
+            log.exception("Payment webhook shutdown gagal")
+
         if http and not http.closed:
             await http.close()
 
