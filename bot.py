@@ -26,6 +26,11 @@ from TikTokLive import TikTokLiveClient
 from yt_dlp import YoutubeDL
 
 try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except Exception:
+    AESGCM = None
+
+try:
     from PIL import Image, ImageDraw, ImageStat
 except Exception:
     Image = None
@@ -40,6 +45,25 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+
+APP_VERSION = "1.8.0"
+CURRENT_SCHEMA_VERSION = 23
+GIT_COMMIT = (
+    os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    or os.getenv("GIT_COMMIT", "")
+).strip()
+BUILD_ID = (
+    os.getenv("RAILWAY_DEPLOYMENT_ID", "")
+    or os.getenv("BUILD_ID", "")
+).strip()
+FULL_BACKUP_HOURS = max(
+    6,
+    int(os.getenv("FULL_BACKUP_HOURS", "168"))
+)
+BACKUP_ENCRYPTION_PASSWORD = os.getenv(
+    "BACKUP_ENCRYPTION_PASSWORD",
+    ""
+).strip()
 
 DEFAULT_CHECK_INTERVAL = max(60, int(os.getenv("CHECK_INTERVAL", "120")))
 BASE_MONITOR_TICK = max(30, int(os.getenv("BASE_MONITOR_TICK", "30")))
@@ -625,6 +649,9 @@ def db():
         ) from exc
 
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -659,6 +686,14 @@ def migrate_database():
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 version INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS migration_history (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at INTEGER NOT NULL
             )
         """)
 
@@ -1273,6 +1308,65 @@ def migrate_database():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS incident_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_key TEXT NOT NULL,
+                incident_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                opened_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                acknowledged_by INTEGER,
+                acknowledged_at INTEGER,
+                resolved_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_incident_history_status
+            ON incident_history(status, updated_at DESC)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS system_backup_schedule_state (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                last_export_at INTEGER,
+                last_path TEXT,
+                last_error TEXT
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO system_backup_schedule_state(id)
+            VALUES(1)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_tuning (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                monitor_concurrency INTEGER NOT NULL,
+                notification_max_retries INTEGER NOT NULL,
+                error_alert_threshold INTEGER NOT NULL,
+                circuit_breaker_minutes INTEGER NOT NULL,
+                updated_by INTEGER,
+                updated_at INTEGER
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO runtime_tuning(
+                id, monitor_concurrency, notification_max_retries,
+                error_alert_threshold, circuit_breaker_minutes
+            )
+            VALUES(1,?,?,?,10)
+        """, (
+            int(MONITOR_CONCURRENCY),
+            runtime_tuning_int(
+                "notification_max_retries",
+                NOTIFICATION_MAX_RETRIES
+            ),
+            int(ERROR_ALERT_THRESHOLD)
+        ))
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS payment_health (
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 last_callback_at INTEGER,
@@ -1744,8 +1838,30 @@ def migrate_database():
             WHERE invoice_ref IS NOT NULL
         """)
 
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO schema_meta(id, version, updated_at)
+            VALUES(1,?,?)
+            ON CONFLICT(id)
+            DO UPDATE SET version=excluded.version, updated_at=excluded.updated_at
+        """, (
+            CURRENT_SCHEMA_VERSION,
+            now
+        ))
+        conn.execute("""
+            INSERT OR IGNORE INTO migration_history(version, name, applied_at)
+            VALUES(?,?,?)
+        """, (
+            CURRENT_SCHEMA_VERSION,
+            f"Hi Notifku schema v{CURRENT_SCHEMA_VERSION}",
+            now
+        ))
+
         conn.commit()
-        log.info("Database schema ready.")
+        log.info(
+            "Database schema ready. version=%s",
+            CURRENT_SCHEMA_VERSION
+        )
 
 
 def ensure_guild(guild_id: int):
@@ -3203,12 +3319,15 @@ def add_activity(
 
         conn.execute("""
             INSERT INTO schema_meta(id, version, updated_at)
-            VALUES(1,18,?)
+            VALUES(1,?,?)
             ON CONFLICT(id)
             DO UPDATE SET
                 version=excluded.version,
                 updated_at=excluded.updated_at
-        """, (int(time.time()),))
+        """, (
+            CURRENT_SCHEMA_VERSION,
+            int(time.time())
+        ))
         conn.commit()
 
 
@@ -7184,6 +7303,39 @@ def database_maintenance():
         conn.execute("VACUUM")
 
 
+def sqlite_storage_stats() -> dict:
+    db_path = Path(DB_PATH).expanduser()
+    wal_path = Path(str(db_path) + "-wal")
+    shm_path = Path(str(db_path) + "-shm")
+    return {
+        "db_bytes": db_path.stat().st_size if db_path.exists() else 0,
+        "wal_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+        "shm_bytes": shm_path.stat().st_size if shm_path.exists() else 0,
+    }
+
+
+@tasks.loop(minutes=30)
+async def sqlite_wal_monitor_loop():
+    try:
+        stats = sqlite_storage_stats()
+        # If WAL grows past 64 MB, request a passive checkpoint.
+        if stats["wal_bytes"] >= 64 * 1024 * 1024:
+            with closing(db()) as conn:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                conn.commit()
+            log.warning(
+                "SQLite WAL checkpoint dipicu otomatis. wal_bytes=%s",
+                stats["wal_bytes"]
+            )
+    except Exception:
+        log.exception("SQLite WAL monitor gagal")
+
+
+@sqlite_wal_monitor_loop.before_loop
+async def before_sqlite_wal_monitor_loop():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(hours=DB_MAINTENANCE_HOURS)
 async def db_maintenance_loop():
     try:
@@ -7909,6 +8061,78 @@ def required_join_text() -> str:
         "🔒 Owner server belum terverifikasi.\n"
         "REQUIRED_GUILD_INVITE belum diisi."
     )
+
+
+def get_runtime_tuning():
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM runtime_tuning WHERE id=1"
+        ).fetchone()
+    if row:
+        return row
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO runtime_tuning(
+                id, monitor_concurrency, notification_max_retries,
+                error_alert_threshold, circuit_breaker_minutes
+            )
+            VALUES(1,?,?,?,10)
+        """, (
+            int(MONITOR_CONCURRENCY),
+            int(NOTIFICATION_MAX_RETRIES),
+            int(ERROR_ALERT_THRESHOLD)
+        ))
+        conn.commit()
+        return conn.execute(
+            "SELECT * FROM runtime_tuning WHERE id=1"
+        ).fetchone()
+
+
+def runtime_tuning_int(name: str, fallback: int) -> int:
+    row = get_runtime_tuning()
+    if row and name in row.keys():
+        try:
+            return int(row[name])
+        except Exception:
+            pass
+    return int(fallback)
+
+
+def update_runtime_tuning(
+    *,
+    monitor_concurrency: int,
+    notification_max_retries: int,
+    error_alert_threshold: int,
+    circuit_breaker_minutes: int,
+    actor_id: int
+):
+    values = {
+        "monitor_concurrency": max(1, min(20, int(monitor_concurrency))),
+        "notification_max_retries": max(1, min(10, int(notification_max_retries))),
+        "error_alert_threshold": max(1, min(100, int(error_alert_threshold))),
+        "circuit_breaker_minutes": max(1, min(60, int(circuit_breaker_minutes))),
+    }
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE runtime_tuning
+            SET
+                monitor_concurrency=?,
+                notification_max_retries=?,
+                error_alert_threshold=?,
+                circuit_breaker_minutes=?,
+                updated_by=?,
+                updated_at=?
+            WHERE id=1
+        """, (
+            values["monitor_concurrency"],
+            values["notification_max_retries"],
+            values["error_alert_threshold"],
+            values["circuit_breaker_minutes"],
+            int(actor_id),
+            int(time.time())
+        ))
+        conn.commit()
+    return values
 
 
 def get_runtime_settings():
@@ -8930,7 +9154,7 @@ async def _deliver_notification_now(
             runtime_metrics["notifications_failed"] += 1
             log.exception("Webhook notification gagal host_id=%s", host["id"])
 
-        if primary_channel in channels:
+        if success_any and primary_channel in channels:
             channels = channels[1:]
 
     for channel_id in channels:
@@ -9006,6 +9230,22 @@ async def _deliver_notification_now(
                 content=content,
                 embed=embed
             )
+
+    if not success_any:
+        guild = bot.get_guild(int(host["guild_id"]))
+        if guild:
+            try:
+                await validation_alert_once(
+                    guild,
+                    host,
+                    "delivery_failed",
+                    (
+                        "❌ Semua jalur pengiriman notifikasi gagal. "
+                        "Periksa webhook, channel, dan permission bot."
+                    )
+                )
+            except Exception:
+                pass
 
     return success_any
 
@@ -10611,7 +10851,17 @@ def host_due(host, now: int) -> bool:
     except Exception:
         pass
 
-    return now - last >= interval
+    # Adaptive backoff for repeatedly failing hosts.
+    errors = int(host["error_count"] or 0)
+    if errors:
+        interval = min(
+            max(interval, 60) * min(4, 1 + errors // 3),
+            1800
+        )
+
+    # Deterministic jitter spreads host checks across time without randomness.
+    jitter = int(host["id"]) % max(1, min(30, interval // 5 or 1))
+    return now - last >= interval + jitter
 
 
 @tasks.loop(hours=24)
@@ -11106,6 +11356,24 @@ async def platform_outage_detection_loop():
             ))
             conn.commit()
 
+        if outage:
+            record_incident(
+                f"platform:{platform_name}",
+                "platform",
+                f"{platform_display_name(platform_name)} outage",
+                f"Host error {errors}/{total}."
+            )
+
+        if not outage and previous and previous["state"] == "outage":
+            with closing(db()) as conn:
+                incident = conn.execute("""
+                    SELECT id FROM incident_history
+                    WHERE incident_key=? AND status IN ('open','investigating')
+                    ORDER BY id DESC LIMIT 1
+                """, (f"platform:{platform_name}",)).fetchone()
+            if incident:
+                update_incident_status(int(incident["id"]), "resolved", 0)
+
         if outage and (not previous or previous["state"] != "outage"):
             for owner_id in primary_owner_ids():
                 try:
@@ -11513,6 +11781,26 @@ async def before_host_manager_expiry_warning_loop():
     await bot.wait_until_ready()
 
 
+def platform_circuit_open(platform: str) -> bool:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT state, updated_at
+            FROM platform_incidents
+            WHERE platform=?
+        """, (str(platform),)).fetchone()
+
+    if not row or row["state"] != "outage":
+        return False
+
+    hold_seconds = runtime_tuning_int(
+        "circuit_breaker_minutes",
+        10
+    ) * 60
+
+    # Let probes through after the hold period so recovery can be detected.
+    return int(time.time()) - int(row["updated_at"] or 0) < hold_seconds
+
+
 @tasks.loop(seconds=BASE_MONITOR_TICK)
 async def monitor_loop():
     if SAFE_MODE:
@@ -11530,13 +11818,23 @@ async def monitor_loop():
 
     runtime_metrics["checker_runs"] += len(due_hosts)
 
-    semaphore = asyncio.Semaphore(MONITOR_CONCURRENCY)
+    semaphore = asyncio.Semaphore(
+        runtime_tuning_int("monitor_concurrency", MONITOR_CONCURRENCY)
+    )
 
     async def run_host(host):
         async with semaphore:
             guild = bot.get_guild(host["guild_id"])
 
             if guild is None:
+                return
+
+            if platform_circuit_open(str(host["platform"])):
+                log.info(
+                    "Circuit breaker aktif platform=%s host_id=%s",
+                    host["platform"],
+                    host["id"]
+                )
                 return
 
             if not guild_access_allowed(guild.id):
@@ -11708,7 +12006,10 @@ async def pending_notification_loop():
 
             retry_count = int(row["retry_count"] or 0) + 1
             max_retries = int(
-                row["max_retries"] or NOTIFICATION_MAX_RETRIES
+                row["max_retries"] or runtime_tuning_int(
+                    "notification_max_retries",
+                    NOTIFICATION_MAX_RETRIES
+                )
             )
 
             if retry_count >= max_retries:
@@ -11736,7 +12037,10 @@ async def pending_notification_loop():
         except Exception as exc:
             retry_count = int(row["retry_count"] or 0) + 1
             max_retries = int(
-                row["max_retries"] or NOTIFICATION_MAX_RETRIES
+                row["max_retries"] or runtime_tuning_int(
+                    "notification_max_retries",
+                    NOTIFICATION_MAX_RETRIES
+                )
             )
 
             if retry_count >= max_retries:
@@ -12842,6 +13146,24 @@ def owner_backup_center_embed():
 
 
 
+def release_info_text() -> str:
+    commit = GIT_COMMIT[:8] if GIT_COMMIT else "local"
+    build = BUILD_ID[:12] if BUILD_ID else "-"
+    return (
+        f"v{APP_VERSION} • schema {CURRENT_SCHEMA_VERSION} • "
+        f"commit `{commit}` • build `{build}`"
+    )
+
+
+def schema_history_rows(limit: int = 10):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM migration_history
+            ORDER BY version DESC
+            LIMIT ?
+        """, (max(1, min(50, int(limit))),)).fetchall()
+
+
 def owner_home_embed():
     free_count = len(guilds_by_plan("free"))
     premium_count = len(guilds_by_plan("premium"))
@@ -12912,6 +13234,11 @@ def owner_home_embed():
         name="Auto Backup",
         value=f"Setiap **{AUTO_BACKUP_HOURS} jam**",
         inline=True
+    )
+    embed.add_field(
+        name="Release",
+        value=release_info_text(),
+        inline=False
     )
     embed.set_footer(
         text="/owner • Global Owner Bot only • semua pengaturan melalui DM"
@@ -15253,10 +15580,12 @@ class ServerOwnerAccessRequestView(discord.ui.View):
         requester_id: int,
         guild_id: int
     ):
-        super().__init__(timeout=86400)
+        super().__init__(timeout=None)
         self.request_id = int(request_id)
         self.requester_id = int(requester_id)
         self.guild_id = int(guild_id)
+        self.approve.custom_id = f"hin:server_access:{self.request_id}:approve"
+        self.deny.custom_id = f"hin:server_access:{self.request_id}:deny"
 
     async def valid(
         self,
@@ -18244,6 +18573,103 @@ class UserServerHostsView(discord.ui.View):
         )
 
 
+HOST_MANAGER_PERMISSION_PRESETS = {
+    "readonly": set(),
+    "moderator": {"pause", "recheck", "history", "test"},
+    "content": {"edit_messages", "schedule", "history", "test"},
+    "full": set(HOST_MANAGER_PERMISSION_COLUMNS),
+}
+
+
+class ServerOwnerManagerPermissionModal(discord.ui.Modal):
+    manager_id = discord.ui.TextInput(
+        label="User ID Host Manager",
+        placeholder="123456789012345678",
+        max_length=24
+    )
+    permissions = discord.ui.TextInput(
+        label="Permissions / Preset",
+        placeholder="full / moderator / content / readonly atau list permission",
+        style=discord.TextStyle.paragraph,
+        max_length=250
+    )
+    expiry_days = discord.ui.TextInput(
+        label="Masa Akses (hari)",
+        placeholder="Kosong = permanen; contoh 7 / 30",
+        required=False,
+        max_length=5
+    )
+
+    def __init__(self, guild_id: int, host_id: int, owner_id: int):
+        super().__init__(title="Permission Host Manager", timeout=300)
+        self.guild_id = int(guild_id)
+        self.host_id = int(host_id)
+        self.owner_id = int(owner_id)
+
+    async def on_submit(self, interaction):
+        if int(interaction.user.id) != self.owner_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+        if not await require_server_owner(interaction, self.guild_id):
+            return
+
+        raw_id = self.manager_id.value.strip()
+        if not raw_id.isdigit():
+            await safe_reply(interaction, "❌ User ID harus angka.")
+            return
+
+        allowed = set(HOST_MANAGER_PERMISSION_COLUMNS)
+        raw_permissions = self.permissions.value.strip().lower()
+        if raw_permissions in HOST_MANAGER_PERMISSION_PRESETS:
+            requested = set(HOST_MANAGER_PERMISSION_PRESETS[raw_permissions])
+        else:
+            requested = {
+                item.strip().lower()
+                for item in raw_permissions.split(",")
+                if item.strip()
+            }
+        invalid = sorted(requested - allowed)
+        if invalid:
+            await safe_reply(
+                interaction,
+                "❌ Permission tidak valid: " + ", ".join(invalid)
+            )
+            return
+
+        manager_id = int(raw_id)
+        expires_at = None
+        raw_expiry = self.expiry_days.value.strip()
+        if raw_expiry:
+            if not raw_expiry.isdigit() or int(raw_expiry) < 1:
+                await safe_reply(interaction, "❌ Masa akses harus angka hari minimal 1.")
+                return
+            expires_at = int(time.time()) + int(raw_expiry) * 86400
+
+        assign_host_manager(
+            self.host_id,
+            manager_id,
+            assigned_by=interaction.user.id,
+            permissions=requested,
+            expires_at=expires_at
+        )
+        await log_action(
+            self.guild_id,
+            interaction.user.id,
+            "Host Manager Permission",
+            (
+                f"host_id={self.host_id} manager={manager_id} "
+                f"permissions={','.join(sorted(requested)) or 'read-only'}"
+            )
+        )
+        await safe_reply(
+            interaction,
+            (
+                f"✅ Permission Host Manager <@{manager_id}> diperbarui.\n"
+                f"{host_manager_permission_text(manager_id, self.host_id)}"
+            )
+        )
+
+
 class UserServerHostCardView(discord.ui.View):
     def __init__(
         self,
@@ -18383,6 +18809,42 @@ class UserServerHostCardView(discord.ui.View):
                 self.user_id,
                 self.host_id
             )
+        )
+
+    @discord.ui.button(
+        label="Manager",
+        emoji="🎙️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def manager_permissions(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+        await interaction.response.send_modal(
+            ServerOwnerManagerPermissionModal(
+                self.guild_id,
+                self.host_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Clone",
+        emoji="🧬",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def clone_host(self, interaction: discord.Interaction, button: discord.ui.Button):
+        host = await self.valid(interaction)
+        if not host:
+            return
+        await interaction.response.send_modal(
+            HostCloneModal(self.host_id, self.user_id)
         )
 
     @discord.ui.button(
@@ -19926,10 +20388,12 @@ class ServerOwnerHostCreationApprovalView(discord.ui.View):
         guild_id: int,
         requester_id: int
     ):
-        super().__init__(timeout=86400)
+        super().__init__(timeout=None)
         self.request_id = int(request_id)
         self.guild_id = int(guild_id)
         self.requester_id = int(requester_id)
+        self.approve.custom_id = f"hin:host_create:{self.request_id}:approve"
+        self.deny.custom_id = f"hin:host_create:{self.request_id}:deny"
 
     async def valid(
         self,
@@ -21718,9 +22182,11 @@ class HostAccessRequestDecisionView(discord.ui.View):
         request_id: int,
         guild_id: int
     ):
-        super().__init__(timeout=86400)
+        super().__init__(timeout=None)
         self.request_id = int(request_id)
         self.guild_id = int(guild_id)
+        self.approve.custom_id = f"hin:host_access:{self.request_id}:approve"
+        self.deny.custom_id = f"hin:host_access:{self.request_id}:deny"
 
     async def valid_owner(
         self,
@@ -23911,6 +24377,425 @@ class PaymentCenterView(OwnerBasicBackView):
         )
 
 
+def record_incident(incident_key: str, incident_type: str, title: str, detail: str, *, status: str = "open") -> int:
+    now = int(time.time())
+    with closing(db()) as conn:
+        existing = conn.execute("""
+            SELECT id FROM incident_history
+            WHERE incident_key=? AND status IN ('open','investigating')
+            ORDER BY id DESC LIMIT 1
+        """, (incident_key,)).fetchone()
+        if existing:
+            conn.execute("""
+                UPDATE incident_history SET detail=?, updated_at=? WHERE id=?
+            """, (str(detail)[:2000], now, int(existing["id"])))
+            conn.commit()
+            return int(existing["id"])
+        cur = conn.execute("""
+            INSERT INTO incident_history(
+                incident_key, incident_type, title, detail,
+                status, opened_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?)
+        """, (
+            str(incident_key)[:200], str(incident_type)[:80],
+            str(title)[:200], str(detail)[:2000], status, now, now
+        ))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_incident_status(incident_id: int, status: str, actor_id: int):
+    allowed = {"open", "investigating", "resolved", "ignored"}
+    status = str(status).lower().strip()
+    if status not in allowed:
+        raise ValueError("Status incident tidak valid.")
+    now = int(time.time())
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE incident_history
+            SET status=?, updated_at=?, acknowledged_by=?, acknowledged_at=?,
+                resolved_at=CASE WHEN ?='resolved' THEN ? ELSE resolved_at END
+            WHERE id=?
+        """, (
+            status, now, int(actor_id), now, status, now, int(incident_id)
+        ))
+        conn.commit()
+
+
+def recent_incidents(limit: int = 15):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM incident_history ORDER BY id DESC LIMIT ?
+        """, (max(1, min(50, int(limit))),)).fetchall()
+
+
+class IncidentStatusModal(discord.ui.Modal):
+    incident_id = discord.ui.TextInput(label="Incident ID", max_length=12)
+    status_input = discord.ui.TextInput(
+        label="Status",
+        placeholder="investigating / resolved / ignored",
+        max_length=20
+    )
+
+    def __init__(self):
+        super().__init__(title="Update Incident", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+        if not self.incident_id.value.strip().isdigit():
+            await safe_reply(interaction, "❌ Incident ID harus angka.")
+            return
+        try:
+            update_incident_status(
+                int(self.incident_id.value),
+                self.status_input.value,
+                interaction.user.id
+            )
+        except ValueError as exc:
+            await safe_reply(interaction, f"❌ {exc}")
+            return
+        await safe_reply(interaction, "✅ Status incident diperbarui.")
+
+
+def incident_center_embed():
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        platform_rows = conn.execute("""
+            SELECT * FROM platform_incidents
+            WHERE state='outage'
+            ORDER BY updated_at DESC
+        """).fetchall()
+
+        dlq = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM notification_dead_letter
+            WHERE resolved_at IS NULL
+        """).fetchone()
+
+        payment_dlq = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM payment_event_dead_letter
+            WHERE resolved_at IS NULL
+        """).fetchone()
+
+        host_errors = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM hosts
+            WHERE last_error IS NOT NULL AND last_error<>''
+        """).fetchone()
+
+    lines = []
+    for row in platform_rows[:10]:
+        lines.append(
+            f"🌐 **{platform_display_name(row['platform'])}** • "
+            f"{int(row['error_hosts'] or 0)}/{int(row['total_hosts'] or 0)} host error • "
+            f"<t:{int(row['updated_at'])}:R>"
+        )
+
+    if not lines:
+        lines.append("✅ Tidak ada platform outage aktif.")
+
+    stats = sqlite_storage_stats()
+
+    embed = discord.Embed(
+        title="🚨 Incident Center",
+        description="\n".join(lines),
+        color=discord.Color.orange() if platform_rows else discord.Color.green()
+    )
+    embed.add_field(
+        name="Antrian Masalah",
+        value=(
+            f"Notification DLQ: **{int(dlq['total'] or 0)}**\n"
+            f"Payment DLQ: **{int(payment_dlq['total'] or 0)}**\n"
+            f"Host error: **{int(host_errors['total'] or 0)}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="SQLite",
+        value=(
+            f"DB **{stats['db_bytes']/1024/1024:.1f} MB**\n"
+            f"WAL **{stats['wal_bytes']/1024/1024:.1f} MB**"
+        ),
+        inline=True
+    )
+    recent = recent_incidents(8)
+    recent_text = "\n".join(
+        f"#{row['id']} • **{row['status']}** • {str(row['title'])[:60]} • "
+        f"<t:{int(row['updated_at'])}:R>"
+        for row in recent
+    ) or "Belum ada incident history."
+    embed.add_field(
+        name="Incident History",
+        value=recent_text[:1024],
+        inline=False
+    )
+    embed.set_footer(text="Incident Center • status operasional terpusat")
+    return embed
+
+
+class OwnerIncidentCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=incident_center_embed(),
+            view=OwnerIncidentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Update Incident", emoji="📝", style=discord.ButtonStyle.primary, row=0)
+    async def update_incident(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.send_modal(IncidentStatusModal())
+
+    @discord.ui.button(label="Checkpoint DB", emoji="🗃️", style=discord.ButtonStyle.secondary, row=0)
+    async def checkpoint(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+        with closing(db()) as conn:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            conn.commit()
+        await safe_reply(interaction, "✅ SQLite checkpoint selesai.")
+
+
+class RuntimeTuningModal(discord.ui.Modal):
+    monitor_concurrency = discord.ui.TextInput(
+        label="Monitor Concurrency", placeholder="5", max_length=2
+    )
+    notification_retries = discord.ui.TextInput(
+        label="Notification Max Retries", placeholder="3", max_length=2
+    )
+    error_threshold = discord.ui.TextInput(
+        label="Error Alert Threshold", placeholder="5", max_length=3
+    )
+    circuit_minutes = discord.ui.TextInput(
+        label="Circuit Breaker (menit)", placeholder="10", max_length=2
+    )
+
+    def __init__(self):
+        super().__init__(title="Runtime Tuning", timeout=300)
+        row = get_runtime_tuning()
+        self.monitor_concurrency.default = str(row["monitor_concurrency"])
+        self.notification_retries.default = str(row["notification_max_retries"])
+        self.error_threshold.default = str(row["error_alert_threshold"])
+        self.circuit_minutes.default = str(row["circuit_breaker_minutes"])
+
+    async def on_submit(self, interaction):
+        if not await require_owner_level(interaction, "super_owner"):
+            return
+        values = [
+            self.monitor_concurrency.value,
+            self.notification_retries.value,
+            self.error_threshold.value,
+            self.circuit_minutes.value,
+        ]
+        if not all(str(v).strip().isdigit() for v in values):
+            await safe_reply(interaction, "❌ Semua nilai harus berupa angka.")
+            return
+
+        saved = update_runtime_tuning(
+            monitor_concurrency=int(self.monitor_concurrency.value),
+            notification_max_retries=int(self.notification_retries.value),
+            error_alert_threshold=int(self.error_threshold.value),
+            circuit_breaker_minutes=int(self.circuit_minutes.value),
+            actor_id=interaction.user.id
+        )
+        await safe_reply(
+            interaction,
+            (
+                "✅ Runtime tuning diperbarui.\n"
+                f"Concurrency **{saved['monitor_concurrency']}** • "
+                f"Retry **{saved['notification_max_retries']}** • "
+                f"Threshold **{saved['error_alert_threshold']}** • "
+                f"Circuit **{saved['circuit_breaker_minutes']}m**"
+            )
+        )
+
+
+def runtime_tuning_embed():
+    row = get_runtime_tuning()
+    return discord.Embed(
+        title="⚙️ Runtime Tuning",
+        description=(
+            f"Monitor concurrency: **{row['monitor_concurrency']}**\n"
+            f"Notification retries: **{row['notification_max_retries']}**\n"
+            f"Error threshold: **{row['error_alert_threshold']}**\n"
+            f"Circuit breaker: **{row['circuit_breaker_minutes']} menit**"
+        ),
+        color=discord.Color.blurple()
+    )
+
+
+class OwnerRuntimeTuningView(OwnerBasicBackView):
+    @discord.ui.button(label="Edit", emoji="⚙️", style=discord.ButtonStyle.primary, row=0)
+    async def edit(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "super_owner"):
+            return
+        await interaction.response.send_modal(RuntimeTuningModal())
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=runtime_tuning_embed(),
+            view=OwnerRuntimeTuningView(self.viewer_id)
+        )
+
+
+def sanitize_backup_for_new_server(data: dict) -> dict:
+    payload = json.loads(json.dumps(data, ensure_ascii=False))
+    cfg = payload.get("guild_config") or {}
+    cfg["youtube_channel_id"] = None
+    cfg["tiktok_channel_id"] = None
+    cfg["mention_role_id"] = None
+    cfg["log_channel_id"] = None
+
+    for host in payload.get("hosts") or []:
+        host["channel_id"] = None
+        host["role_id"] = None
+        host["extra_channel_ids"] = None
+        host["extra_role_ids"] = None
+        host["webhook_url"] = None
+
+    return payload
+
+
+def migrate_server_configuration(source_guild_id: int, target_guild_id: int, actor_id: int) -> int:
+    if int(source_guild_id) == int(target_guild_id):
+        raise ValueError("Source dan target tidak boleh sama.")
+
+    source = bot.get_guild(int(source_guild_id))
+    target = bot.get_guild(int(target_guild_id))
+    if not source or not target:
+        raise ValueError("Source/target server harus sedang terhubung ke bot.")
+
+    create_rollback_snapshot(int(target_guild_id), "before_server_migration", actor_id)
+    data = sanitize_backup_for_new_server(export_guild_backup(int(source_guild_id)))
+    return restore_guild_backup(data, int(target_guild_id))
+
+
+class ServerMigrationModal(discord.ui.Modal):
+    source_id = discord.ui.TextInput(label="Source Server ID", max_length=24)
+    target_id = discord.ui.TextInput(label="Target Server ID", max_length=24)
+    confirm_text = discord.ui.TextInput(
+        label="Konfirmasi", placeholder="Ketik MIGRATE", max_length=20
+    )
+
+    def __init__(self):
+        super().__init__(title="Server Migration", timeout=300)
+
+    async def on_submit(self, interaction):
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+        if not (self.source_id.value.strip().isdigit() and self.target_id.value.strip().isdigit()):
+            await safe_reply(interaction, "❌ Server ID harus angka.")
+            return
+        if self.confirm_text.value.strip().upper() != "MIGRATE":
+            await safe_reply(interaction, "❌ Ketik `MIGRATE` untuk konfirmasi.")
+            return
+        try:
+            restored = migrate_server_configuration(
+                int(self.source_id.value), int(self.target_id.value), interaction.user.id
+            )
+        except Exception as exc:
+            await safe_reply(interaction, f"❌ Migration gagal: `{type(exc).__name__}: {exc}`")
+            return
+        await safe_reply(
+            interaction,
+            (
+                f"✅ Server migration selesai. **{restored} host** dipindahkan.\n"
+                "Channel/role/webhook sengaja dikosongkan karena ID Discord "
+                "tidak dapat dipakai lintas server."
+            )
+        )
+
+
+class HostCloneModal(discord.ui.Modal):
+    target_guild_id = discord.ui.TextInput(label="Target Server ID", max_length=24)
+
+    def __init__(self, source_host_id: int, actor_id: int):
+        super().__init__(title="Clone Host", timeout=300)
+        self.source_host_id = int(source_host_id)
+        self.actor_id = int(actor_id)
+
+    async def on_submit(self, interaction):
+        if int(interaction.user.id) != self.actor_id:
+            await safe_reply(interaction, "🔒 Modal ini bukan milikmu.")
+            return
+        raw = self.target_guild_id.value.strip()
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ Server ID harus angka.")
+            return
+
+        source = get_host(self.source_host_id)
+        if not source:
+            await safe_reply(interaction, "❌ Host sumber tidak ditemukan.")
+            return
+
+        target_guild_id = int(raw)
+        target = bot.get_guild(target_guild_id)
+        if not target:
+            await safe_reply(interaction, "❌ Target server tidak ditemukan.")
+            return
+
+        if not is_global_owner(interaction.user.id) and int(target.owner_id) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Kamu hanya dapat clone ke server milikmu sendiri.")
+            return
+
+        try:
+            add_host(
+                target_guild_id,
+                str(source["platform"]),
+                str(source["target"]),
+                source["display_name"],
+                source["extra"]
+            )
+            with closing(db()) as conn:
+                cloned = conn.execute("""
+                    SELECT id FROM hosts
+                    WHERE guild_id=? AND platform=? AND target=?
+                """, (
+                    target_guild_id, source["platform"], source["target"]
+                )).fetchone()
+            if not cloned:
+                raise RuntimeError("Clone host tidak ditemukan setelah dibuat.")
+            clone_id = int(cloned["id"])
+            with closing(db()) as conn:
+                conn.execute("""
+                    UPDATE hosts SET
+                        custom_live_message=?, custom_post_message=?, custom_end_message=?,
+                        notify_live_end=?, check_interval=?, schedule_days=?,
+                        quiet_start=?, quiet_end=?, timezone=?, language=?,
+                        embed_title=?, embed_footer=?, embed_color=?,
+                        auto_pause_threshold=?, channel_id=NULL, role_id=NULL,
+                        extra_channel_ids=NULL, extra_role_ids=NULL, webhook_url=NULL
+                    WHERE id=?
+                """, (
+                    source["custom_live_message"], source["custom_post_message"],
+                    source["custom_end_message"], source["notify_live_end"],
+                    source["check_interval"], source["schedule_days"],
+                    source["quiet_start"], source["quiet_end"],
+                    source["timezone"], source["language"], source["embed_title"],
+                    source["embed_footer"], source["embed_color"],
+                    source["auto_pause_threshold"], clone_id
+                ))
+                conn.commit()
+        except Exception as exc:
+            await safe_reply(interaction, f"❌ Clone gagal: `{type(exc).__name__}: {exc}`")
+            return
+
+        await safe_reply(interaction, f"✅ Host berhasil di-clone sebagai Host **#{clone_id}**.")
+
+
 class OwnerOpsHomeView(discord.ui.View):
     def __init__(self, viewer_id: int):
         super().__init__(timeout=900)
@@ -24045,6 +24930,30 @@ class OwnerOpsHomeView(discord.ui.View):
             embed=payment_health_embed(),
             view=PaymentCenterView(self.viewer_id)
         )
+
+    @discord.ui.button(label="Incidents", emoji="🚨", style=discord.ButtonStyle.secondary, row=4)
+    async def incidents(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=incident_center_embed(),
+            view=OwnerIncidentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Runtime", emoji="⚙️", style=discord.ButtonStyle.secondary, row=4)
+    async def runtime_tuning(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=runtime_tuning_embed(),
+            view=OwnerRuntimeTuningView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Migration", emoji="🚚", style=discord.ButtonStyle.secondary, row=4)
+    async def migration(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.send_modal(ServerMigrationModal())
 
     @discord.ui.button(label="Diagnostics", emoji="📦", style=discord.ButtonStyle.secondary, row=4)
     async def diagnostics(self, interaction, button):
@@ -24186,7 +25095,7 @@ def diagnostic_bundle_bytes() -> bytes:
     platform_health = platform_health_summary()
 
     non_secret = {
-        "schema_version": 18,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "db_path": str(DB_PATH),
         "server_count": len(bot.guilds),
         "started_at": STARTED_AT,
@@ -24664,6 +25573,218 @@ class OwnerEmergencyView(OwnerBasicBackView):
         await self.toggle(interaction, "maintenance_all")
 
 
+BACKUP_MAGIC = b"HINOTIFENC1"
+
+
+def encrypt_backup_bytes(raw: bytes, password: str) -> bytes:
+    if not password:
+        return raw
+    if AESGCM is None:
+        raise RuntimeError("cryptography belum tersedia. Install requirements terbaru.")
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    key = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 250000, dklen=32
+    )
+    encrypted = AESGCM(key).encrypt(nonce, raw, BACKUP_MAGIC)
+    return BACKUP_MAGIC + salt + nonce + encrypted
+
+
+def decrypt_backup_bytes(raw: bytes, password: str) -> bytes:
+    if not raw.startswith(BACKUP_MAGIC):
+        return raw
+    if AESGCM is None:
+        raise RuntimeError("cryptography belum tersedia.")
+    if not password:
+        raise ValueError("Password backup diperlukan.")
+    offset = len(BACKUP_MAGIC)
+    salt = raw[offset:offset + 16]
+    nonce = raw[offset + 16:offset + 28]
+    encrypted = raw[offset + 28:]
+    key = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, 250000, dklen=32
+    )
+    return AESGCM(key).decrypt(nonce, encrypted, BACKUP_MAGIC)
+
+
+def system_backup_export_bytes() -> tuple[bytes, str]:
+    raw = create_full_system_backup_zip()
+    if BACKUP_ENCRYPTION_PASSWORD:
+        return encrypt_backup_bytes(raw, BACKUP_ENCRYPTION_PASSWORD), "hnbak"
+    return raw, "zip"
+
+
+def system_backup_schedule_state():
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM system_backup_schedule_state WHERE id=1"
+        ).fetchone()
+
+
+async def run_scheduled_system_backup():
+    now = int(time.time())
+    data, ext = await asyncio.to_thread(system_backup_export_bytes)
+    folder = Path(AUTO_BACKUP_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"hi-notifku-system-{now}.{ext}"
+    path.write_bytes(data)
+
+    sent = 0
+    if len(data) <= 24 * 1024 * 1024:
+        for owner_id in primary_owner_ids():
+            try:
+                owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                await owner.send(
+                    content=(
+                        "📦 **Scheduled Full System Backup**\n"
+                        f"Encrypted: **{'YES' if ext == 'hnbak' else 'NO'}**"
+                    ),
+                    file=discord.File(io.BytesIO(data), filename=path.name)
+                )
+                sent += 1
+            except Exception:
+                log.exception("Scheduled system backup gagal dikirim owner_id=%s", owner_id)
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE system_backup_schedule_state
+            SET last_export_at=?, last_path=?, last_error=NULL
+            WHERE id=1
+        """, (now, str(path)))
+        conn.commit()
+
+    return path, sent
+
+
+@tasks.loop(hours=1)
+async def scheduled_system_backup_loop():
+    state = system_backup_schedule_state()
+    last = int(state["last_export_at"] or 0) if state else 0
+    now = int(time.time())
+    if last and now - last < FULL_BACKUP_HOURS * 3600:
+        return
+
+    try:
+        await run_scheduled_system_backup()
+    except Exception as exc:
+        log.exception("Scheduled system backup gagal")
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE system_backup_schedule_state SET last_error=? WHERE id=1
+            """, (f"{type(exc).__name__}: {exc}"[:1000],))
+            conn.commit()
+
+
+@scheduled_system_backup_loop.before_loop
+async def before_scheduled_system_backup_loop():
+    await bot.wait_until_ready()
+
+
+def create_full_system_backup_zip() -> bytes:
+    payload, config_raw = manual_backup_payload_and_bytes()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        db_copy = tmp_path / "live_notifier.db"
+
+        source = sqlite3.connect(str(Path(DB_PATH).expanduser()), timeout=30)
+        try:
+            dest = sqlite3.connect(str(db_copy))
+            try:
+                source.backup(dest)
+            finally:
+                dest.close()
+        finally:
+            source.close()
+
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("config-backup.json", config_raw)
+            z.write(db_copy, "database/live_notifier.db")
+
+            qris_dir = Path(QRIS_STORAGE_DIR)
+            if qris_dir.exists():
+                for item in qris_dir.rglob("*"):
+                    if item.is_file():
+                        z.write(
+                            item,
+                            Path("qris") / item.relative_to(qris_dir)
+                        )
+
+            env_template = Path(__file__).with_name("railway-variables.env")
+            if env_template.exists():
+                z.write(env_template, "railway-variables.env")
+
+            z.writestr(
+                "RESTORE-NOTE.txt",
+                (
+                    "Hi Notifku full system backup.\n"
+                    "Database: database/live_notifier.db\n"
+                    "QRIS: qris/\n"
+                    "Restore hanya saat bot dihentikan. "
+                    "Jangan menimpa DB aktif saat proses bot berjalan.\n"
+                )
+            )
+
+        return output.getvalue()
+
+
+def restore_center_embed():
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM restore_audit
+            ORDER BY created_at DESC
+            LIMIT 8
+        """).fetchall()
+
+    history = "\n".join(
+        f"• <t:{int(row['created_at'])}:R> guild `{row['guild_id']}` • "
+        f"{str(row['summary'])[:100]}"
+        for row in rows
+    ) or "Belum ada restore."
+
+    return discord.Embed(
+        title="♻️ Restore Center",
+        description=(
+            "Kirim file backup **JSON server** ke DM bot untuk preview otomatis.\n"
+            "Bot akan meminta konfirmasi sebelum restore.\n\n"
+            "Full System ZIP/backup terenkripsi dipulihkan saat bot dihentikan "
+            "agar SQLite tidak korup."
+        ),
+        color=discord.Color.orange()
+    ).add_field(
+        name="Riwayat",
+        value=history[:1024],
+        inline=False
+    )
+
+
+class OwnerRestoreCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=restore_center_embed(),
+            view=OwnerRestoreCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Panduan", emoji="📘", style=discord.ButtonStyle.primary, row=0)
+    async def guide(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await safe_reply(
+            interaction,
+            (
+                "**Restore server:** kirim file `.json` hasil backup ke DM bot.\n"
+                "Bot menampilkan preview → tekan **Konfirmasi Restore**.\n\n"
+                "**Full-system restore:** hentikan service Railway, ambil "
+                "`database/live_notifier.db` dari System ZIP, lalu pulihkan ke Volume `/data`."
+            )
+        )
+
+
 class OwnerBackupCenterView(OwnerBasicBackView):
     @discord.ui.button(label="Backup Sekarang", emoji="💾", style=discord.ButtonStyle.primary, row=0)
     async def backup_now(self, interaction, button):
@@ -24732,6 +25853,42 @@ class OwnerBackupCenterView(OwnerBasicBackView):
         await safe_reply(
             interaction,
             f"{'✅' if ok else '❌'} `{files[0].name}`\n{detail}"
+        )
+
+    @discord.ui.button(label="System ZIP", emoji="📦", style=discord.ButtonStyle.success, row=1)
+    async def system_zip(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        await defer_if_needed(interaction, ephemeral=True)
+        try:
+            data, ext = await asyncio.to_thread(system_backup_export_bytes)
+            await interaction.followup.send(
+                content=(
+                    "📦 Full system backup dibuat. "
+                    f"Encrypted: **{'YES' if ext == 'hnbak' else 'NO'}**"
+                ),
+                file=discord.File(
+                    io.BytesIO(data),
+                    filename=f"hi-notifku-system-{int(time.time())}.{ext}"
+                ),
+                ephemeral=True
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Full system backup gagal: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Restore Center", emoji="♻️", style=discord.ButtonStyle.secondary, row=1)
+    async def restore_center(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=restore_center_embed(),
+            view=OwnerRestoreCenterView(self.viewer_id)
         )
 
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
@@ -28786,6 +29943,50 @@ async def notify_startup_integrity():
 
 
 
+def register_pending_persistent_views() -> int:
+    registered = 0
+
+    with closing(db()) as conn:
+        access_rows = conn.execute("""
+            SELECT id, user_id, guild_id
+            FROM server_host_access_requests
+            WHERE status='pending'
+        """).fetchall()
+        host_rows = conn.execute("""
+            SELECT id, guild_id, requester_id
+            FROM host_creation_requests
+            WHERE status='pending'
+        """).fetchall()
+        direct_rows = conn.execute("""
+            SELECT id, host_id, user_id
+            FROM host_access_requests
+            WHERE status='pending'
+        """).fetchall() if table_exists(conn, "host_access_requests") else []
+
+    for row in access_rows:
+        bot.add_view(ServerOwnerAccessRequestView(
+            int(row["id"]), int(row["user_id"]), int(row["guild_id"])
+        ))
+        registered += 1
+
+    for row in host_rows:
+        bot.add_view(ServerOwnerHostCreationApprovalView(
+            int(row["id"]), int(row["guild_id"]), int(row["requester_id"])
+        ))
+        registered += 1
+
+    for row in direct_rows:
+        host = get_host(int(row["host_id"]))
+        if not host:
+            continue
+        bot.add_view(HostAccessRequestDecisionView(
+            int(row["id"]), int(host["guild_id"])
+        ))
+        registered += 1
+
+    return registered
+
+
 def evaluate_safe_mode() -> tuple[bool, str]:
     try:
         required = {
@@ -28838,8 +30039,10 @@ async def on_ready():
         )
     try:
         bot.add_view(StartVerifyView())
+        persistent_count = register_pending_persistent_views()
+        log.info("Persistent request views registered: %s", persistent_count)
     except Exception:
-        log.exception("Persistent verify view gagal didaftarkan")
+        log.exception("Persistent view gagal didaftarkan")
 
 
     # Sync exactly four global slash commands: /ping, /start, /menu and /owner.
@@ -28909,6 +30112,9 @@ async def on_ready():
     if not auto_backup_loop.is_running():
         auto_backup_loop.start()
 
+    if not scheduled_system_backup_loop.is_running():
+        scheduled_system_backup_loop.start()
+
     if not payment_reconciliation_loop.is_running():
         payment_reconciliation_loop.start()
 
@@ -28919,6 +30125,9 @@ async def on_ready():
         invoice_expiry_loop.start()
     if not db_maintenance_loop.is_running():
         db_maintenance_loop.start()
+
+    if not sqlite_wal_monitor_loop.is_running():
+        sqlite_wal_monitor_loop.start()
 
     if not pending_notification_loop.is_running():
         pending_notification_loop.start()
@@ -28966,10 +30175,12 @@ async def main():
             verification_retention_cleanup_loop,
             premium_expiry_loop,
             auto_backup_loop,
+            scheduled_system_backup_loop,
             payment_reconciliation_loop,
             payment_event_retry_loop,
             invoice_expiry_loop,
             db_maintenance_loop,
+            sqlite_wal_monitor_loop,
             pending_notification_loop,
             event_cleanup_loop,
             loop_lag_metrics,

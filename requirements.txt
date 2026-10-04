@@ -4,3 +4,4 @@ python-dotenv>=1.0,<2
 TikTokLive>=6,<7
 yt-dlp>=2025.9.26
 Pillow>=11,<13
+cryptography>=45,<47
