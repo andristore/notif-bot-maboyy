@@ -847,3 +847,160 @@ Submenu sekarang memakai navigasi konsisten:
 - `🏠 Menu Awal` untuk kembali langsung ke menu utama.
 
 Navigasi ditambahkan pada submenu user, Premium, pembayaran, server, host, plan, wizard, laporan, health, owner, security, dan restore.
+
+## Notifier Pro 2026.10
+
+Upgrade notifier:
+- multi-channel per host
+- multi-role mention + optional `@everyone`
+- Discord webhook mode
+- custom embed title/footer/color
+- timezone dan bahasa per host/server
+- schedule hari aktif
+- quiet hours + antrean notifikasi
+- anti-duplicate event tahan restart
+- notification history + resend
+- delivery status + latency
+- statistik notifikasi
+- YouTube API-call dashboard
+- TikTok LIVE fallback melalui yt-dlp
+- YouTube LIVE fallback melalui yt-dlp
+- retry/cooldown lama tetap dipertahankan
+- auto-pause host setelah error berulang
+- manual recheck
+- preview template
+- bulk pause/resume/reset error
+- CSV export/import host
+- clone notifier config antar-server
+- permission diagnostics
+- config snapshot + rollback
+- maintenance mode tanpa mematikan monitor
+- feature flags TikTok LIVE/Post/YouTube LIVE/Live End
+- status broadcast maintenance
+- optional AutoShardedBot
+- notification send concurrency/rate-limit protection
+- event-loop/runtime metrics
+- changelog panel
+
+Menu:
+`/owner → pilih server → Notif`
+
+Host:
+`/owner → pilih server → Host → pilih host → Lanjutan`
+
+Variable opsional:
+```env
+AUTO_PAUSE_ERRORS=20
+NOTIFICATION_SEND_CONCURRENCY=3
+NOTIFICATION_MIN_DELAY_MS=250
+EVENT_RETENTION_DAYS=30
+USE_AUTO_SHARDING=false
+```
+
+## Railway SQLite Path Fix
+
+Jika memakai Railway Volume:
+
+```env
+DB_PATH=/data/live_notifier.db
+QRIS_STORAGE_DIR=/data/qris
+AUTO_BACKUP_DIR=/data/backups
+```
+
+Railway Volume harus benar-benar di-mount ke:
+
+```text
+/data
+```
+
+Versi ini membuat parent directory database secara otomatis dan memberikan pesan error yang lebih jelas bila mount/path tidak tersedia.
+
+## Auto Backup ke DM Owner
+
+Setiap auto backup sekarang:
+1. disimpan ke `AUTO_BACKUP_DIR`;
+2. dikirim ke DM seluruh **primary owner** yang terdaftar di `OWNER_IDS`;
+3. opsional tetap dikirim ke `BACKUP_CHANNEL_ID` jika variable tersebut diisi.
+
+Kegagalan DM satu owner tidak menggagalkan backup lokal maupun pengiriman ke owner lain.
+
+Contoh:
+
+```env
+AUTO_BACKUP_HOURS=12
+AUTO_BACKUP_KEEP=7
+AUTO_BACKUP_DIR=/data/backups
+BACKUP_CHANNEL_ID=0
+```
+
+`BACKUP_CHANNEL_ID=0` tidak mematikan DM backup owner. Nilai `0` hanya mematikan salinan tambahan ke channel Discord.
+
+## Multi Social Host
+
+Platform host yang didukung:
+
+- YouTube — LIVE
+- TikTok — LIVE + post terbaru
+- Twitch — LIVE
+- Kick — LIVE
+- Instagram — konten terbaru (best-effort)
+- Facebook — konten terbaru (best-effort)
+
+Tambah dari:
+
+```text
+/owner
+→ pilih server
+→ Host
+→ Tambah
+```
+
+Contoh bulk import:
+
+```text
+tiktok,username
+youtube,UCxxxxxxxx
+twitch,username
+kick,username
+instagram,username
+facebook,https://www.facebook.com/namapage
+```
+
+Catatan:
+Instagram dan Facebook sering membatasi extractor tanpa login/cookies. Karena itu monitoring kedua platform bersifat best-effort dan akun privat/halaman login-protected dapat gagal.
+
+## Host Self-Service (Terpisah dari Owner)
+
+Host Manager dan Global Owner menggunakan jalur akses yang berbeda.
+
+### Global Owner
+`/owner` tetap hanya dapat dibuka oleh `is_global_owner()`. Dari kartu host:
+`Host → Manager Host` untuk menambah, memperbarui, melihat, atau mencabut manager.
+
+### Host Manager
+Host Manager **tidak** masuk ke `/owner` dan **tidak** dimasukkan ke tabel `bot_owners`.
+Aksesnya hanya:
+`DM bot → /menu → 🎙️ Host Saya`
+
+Fitur Host Manager:
+- status dan statistik 7 hari;
+- edit pesan notifikasi;
+- jadwal aktif + quiet hours + timezone;
+- preview;
+- test notification;
+- manual recheck;
+- pause/resume jika diberi izin;
+- history 10 notifikasi terakhir;
+- izin per host;
+- akses sementara dengan masa kedaluwarsa;
+- activity log terpisah.
+
+Permission Host Manager:
+`edit_messages,schedule,pause,recheck,history,test`
+
+Host Manager tidak dapat:
+- membuka `/owner`;
+- mengelola premium, pembayaran, QRIS, revenue, backup, owner, atau server lain;
+- menghapus host;
+- assign/revoke manager;
+- melihat host yang tidak ditugaskan kepadanya.

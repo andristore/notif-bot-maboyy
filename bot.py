@@ -161,6 +161,99 @@ runtime_metrics = {
 
 
 
+
+SUPPORTED_PLATFORMS = {
+    "youtube",
+    "tiktok",
+    "twitch",
+    "kick",
+    "instagram",
+    "facebook",
+}
+
+PLATFORM_META = {
+    "youtube": ("YouTube", "📺"),
+    "tiktok": ("TikTok", "🎵"),
+    "twitch": ("Twitch", "🟣"),
+    "kick": ("Kick", "🟢"),
+    "instagram": ("Instagram", "📸"),
+    "facebook": ("Facebook", "🔵"),
+}
+
+
+def platform_display_name(platform: str) -> str:
+    return PLATFORM_META.get(
+        str(platform).lower(),
+        (str(platform).title(), "🌐")
+    )[0]
+
+
+def platform_icon(platform: str) -> str:
+    return PLATFORM_META.get(
+        str(platform).lower(),
+        (str(platform).title(), "🌐")
+    )[1]
+
+
+def normalize_social_target(platform: str, target: str) -> str:
+    platform = platform.lower().strip()
+    target = target.strip()
+
+    if platform == "youtube":
+        return target
+
+    if platform == "tiktok":
+        target = target.replace("https://www.tiktok.com/@", "")
+        target = target.replace("https://tiktok.com/@", "")
+        return target.split("/")[0].lstrip("@").strip()
+
+    if platform == "twitch":
+        target = target.replace("https://www.twitch.tv/", "")
+        return target.split("/")[0].lstrip("@").strip()
+
+    if platform == "kick":
+        target = target.replace("https://kick.com/", "")
+        return target.split("/")[0].lstrip("@").strip()
+
+    if platform == "instagram":
+        target = target.replace("https://www.instagram.com/", "")
+        target = target.replace("https://instagram.com/", "")
+        return target.split("/")[0].lstrip("@").strip()
+
+    if platform == "facebook":
+        if target.startswith(("http://", "https://")):
+            return target.rstrip("/")
+        return target.lstrip("@").strip()
+
+    return target
+
+
+def host_public_url(host, *, live: bool = False) -> str:
+    platform = host["platform"]
+    target = str(host["target"]).strip()
+
+    if platform == "youtube":
+        return f"https://www.youtube.com/channel/{target}/live" if live else f"https://www.youtube.com/channel/{target}"
+
+    if platform == "tiktok":
+        username = target.lstrip("@")
+        return f"https://www.tiktok.com/@{username}/live" if live else f"https://www.tiktok.com/@{username}"
+
+    if platform == "twitch":
+        return f"https://www.twitch.tv/{target.lstrip('@')}"
+
+    if platform == "kick":
+        return f"https://kick.com/{target.lstrip('@')}"
+
+    if platform == "instagram":
+        return f"https://www.instagram.com/{target.lstrip('@')}/"
+
+    if platform == "facebook":
+        return target if target.startswith(("http://", "https://")) else f"https://www.facebook.com/{target.lstrip('@')}"
+
+    return target
+
+
 # ============================================================
 # BOT STATUS / PING
 # ============================================================
@@ -394,7 +487,7 @@ def migrate_database():
                 CREATE TABLE hosts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
-                    platform TEXT NOT NULL CHECK(platform IN ('youtube','tiktok')),
+                    platform TEXT NOT NULL,
                     target TEXT NOT NULL,
                     display_name TEXT,
                     extra TEXT,
@@ -681,6 +774,130 @@ def migrate_database():
         add_column_if_missing(conn, "hosts", "embed_footer", "TEXT")
         add_column_if_missing(conn, "hosts", "embed_color", "INTEGER")
         add_column_if_missing(conn, "hosts", "auto_pause_threshold", "INTEGER")
+
+
+        # Older databases restricted hosts.platform to youtube/tiktok.
+        # Rebuild the table once so new social platforms can be stored.
+        host_table_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='hosts'"
+        ).fetchone()
+
+        host_table_sql = (
+            host_table_sql_row["sql"]
+            if host_table_sql_row and host_table_sql_row["sql"]
+            else ""
+        )
+
+        if (
+            "CHECK(platform IN ('youtube','tiktok'))" in host_table_sql
+            or 'CHECK(platform IN ("youtube","tiktok"))' in host_table_sql
+        ):
+            conn.execute("DROP TABLE IF EXISTS hosts_social_v2")
+            conn.execute("""
+                CREATE TABLE hosts_social_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    platform TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    display_name TEXT,
+                    extra TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    channel_id INTEGER,
+                    role_id INTEGER,
+                    custom_live_message TEXT,
+                    custom_post_message TEXT,
+                    custom_end_message TEXT,
+                    notify_live_end INTEGER NOT NULL DEFAULT 0,
+                    check_interval INTEGER NOT NULL DEFAULT 120,
+                    last_check INTEGER,
+                    last_error TEXT,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    cooldown_until INTEGER,
+                    extra_channel_ids TEXT,
+                    extra_role_ids TEXT,
+                    schedule_days TEXT DEFAULT '0,1,2,3,4,5,6',
+                    quiet_start TEXT,
+                    quiet_end TEXT,
+                    timezone TEXT,
+                    language TEXT,
+                    webhook_url TEXT,
+                    mention_everyone INTEGER NOT NULL DEFAULT 0,
+                    embed_title TEXT,
+                    embed_footer TEXT,
+                    embed_color INTEGER,
+                    auto_pause_threshold INTEGER,
+                    UNIQUE(guild_id, platform, target)
+                )
+            """)
+
+            conn.execute("""
+                INSERT INTO hosts_social_v2(
+                    id, guild_id, platform, target, display_name, extra,
+                    enabled, channel_id, role_id, custom_live_message,
+                    custom_post_message, custom_end_message, notify_live_end,
+                    check_interval, last_check, last_error, error_count,
+                    cooldown_until, extra_channel_ids, extra_role_ids,
+                    schedule_days, quiet_start, quiet_end, timezone,
+                    language, webhook_url, mention_everyone, embed_title,
+                    embed_footer, embed_color, auto_pause_threshold
+                )
+                SELECT
+                    id, guild_id, platform, target, display_name, extra,
+                    enabled, channel_id, role_id, custom_live_message,
+                    custom_post_message, custom_end_message, notify_live_end,
+                    check_interval, last_check, last_error, error_count,
+                    cooldown_until, extra_channel_ids, extra_role_ids,
+                    schedule_days, quiet_start, quiet_end, timezone,
+                    language, webhook_url, mention_everyone, embed_title,
+                    embed_footer, embed_color, auto_pause_threshold
+                FROM hosts
+            """)
+
+            conn.execute("DROP TABLE hosts")
+            conn.execute("ALTER TABLE hosts_social_v2 RENAME TO hosts")
+
+        if not table_exists(conn, "social_content_state"):
+            conn.execute("""
+                CREATE TABLE social_content_state (
+                    host_id INTEGER PRIMARY KEY,
+                    last_item_id TEXT,
+                    initialized INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
+
+
+        # Host managers are intentionally separate from bot_owners.
+        # A host manager never becomes a global owner and never receives /owner access.
+        if not table_exists(conn, "host_managers"):
+            conn.execute("""
+                CREATE TABLE host_managers (
+                    host_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    can_edit_messages INTEGER NOT NULL DEFAULT 1,
+                    can_schedule INTEGER NOT NULL DEFAULT 1,
+                    can_pause INTEGER NOT NULL DEFAULT 1,
+                    can_recheck INTEGER NOT NULL DEFAULT 1,
+                    can_history INTEGER NOT NULL DEFAULT 1,
+                    can_test INTEGER NOT NULL DEFAULT 1,
+                    assigned_by INTEGER,
+                    assigned_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    PRIMARY KEY(host_id, user_id)
+                )
+            """)
+
+        if not table_exists(conn, "host_manager_activity"):
+            conn.execute("""
+                CREATE TABLE host_manager_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    host_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT,
+                    created_at INTEGER NOT NULL
+                )
+            """)
 
         if not table_exists(conn, "user_blacklist"):
             conn.execute("""
@@ -1026,6 +1243,198 @@ def get_enabled_hosts():
         """).fetchall()
 
 
+
+HOST_MANAGER_PERMISSION_COLUMNS = {
+    "edit_messages": "can_edit_messages",
+    "schedule": "can_schedule",
+    "pause": "can_pause",
+    "recheck": "can_recheck",
+    "history": "can_history",
+    "test": "can_test",
+}
+
+
+def host_manager_rows(user_id: int):
+    now = int(time.time())
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT
+                hm.*,
+                h.guild_id,
+                h.platform,
+                h.target,
+                h.display_name,
+                h.enabled,
+                h.last_error,
+                h.last_check
+            FROM host_managers hm
+            JOIN hosts h ON h.id=hm.host_id
+            WHERE hm.user_id=?
+              AND (hm.expires_at IS NULL OR hm.expires_at>?)
+            ORDER BY h.guild_id, h.platform, h.id
+        """, (
+            int(user_id),
+            now
+        )).fetchall()
+
+
+def host_manager_access(user_id: int, host_id: int):
+    now = int(time.time())
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM host_managers
+            WHERE host_id=? AND user_id=?
+              AND (expires_at IS NULL OR expires_at>?)
+        """, (
+            int(host_id),
+            int(user_id),
+            now
+        )).fetchone()
+
+
+def host_manager_has_permission(
+    user_id: int,
+    host_id: int,
+    permission: str
+) -> bool:
+    row = host_manager_access(user_id, host_id)
+    if not row:
+        return False
+
+    column = HOST_MANAGER_PERMISSION_COLUMNS.get(permission)
+    if not column:
+        return False
+
+    return bool(row[column])
+
+
+def assign_host_manager(
+    host_id: int,
+    user_id: int,
+    *,
+    assigned_by: int,
+    permissions: Optional[set[str]] = None,
+    expires_at: Optional[int] = None
+):
+    host = get_host(host_id)
+    if not host:
+        raise ValueError("Host tidak ditemukan.")
+
+    permissions = permissions or set(HOST_MANAGER_PERMISSION_COLUMNS)
+    values = {
+        key: 1 if key in permissions else 0
+        for key in HOST_MANAGER_PERMISSION_COLUMNS
+    }
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO host_managers(
+                host_id, user_id,
+                can_edit_messages, can_schedule, can_pause,
+                can_recheck, can_history, can_test,
+                assigned_by, assigned_at, expires_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(host_id, user_id)
+            DO UPDATE SET
+                can_edit_messages=excluded.can_edit_messages,
+                can_schedule=excluded.can_schedule,
+                can_pause=excluded.can_pause,
+                can_recheck=excluded.can_recheck,
+                can_history=excluded.can_history,
+                can_test=excluded.can_test,
+                assigned_by=excluded.assigned_by,
+                assigned_at=excluded.assigned_at,
+                expires_at=excluded.expires_at
+        """, (
+            int(host_id),
+            int(user_id),
+            values["edit_messages"],
+            values["schedule"],
+            values["pause"],
+            values["recheck"],
+            values["history"],
+            values["test"],
+            int(assigned_by),
+            int(time.time()),
+            int(expires_at) if expires_at else None
+        ))
+        conn.commit()
+
+
+def revoke_host_manager(host_id: int, user_id: int):
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM host_managers WHERE host_id=? AND user_id=?",
+            (int(host_id), int(user_id))
+        )
+        conn.commit()
+
+
+def list_host_managers(host_id: int):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM host_managers
+            WHERE host_id=?
+            ORDER BY assigned_at ASC
+        """, (int(host_id),)).fetchall()
+
+
+def log_host_manager_action(
+    host_id: int,
+    user_id: int,
+    action: str,
+    detail: Optional[str] = None
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO host_manager_activity(
+                host_id, user_id, action, detail, created_at
+            )
+            VALUES(?,?,?,?,?)
+        """, (
+            int(host_id),
+            int(user_id),
+            action[:100],
+            detail[:1000] if detail else None,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def host_manager_stats(host_id: int) -> dict:
+    now = int(time.time())
+    cutoff_7d = now - 7 * 86400
+
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS latency
+            FROM notification_history
+            WHERE host_id=? AND created_at>=?
+        """, (
+            int(host_id),
+            cutoff_7d
+        )).fetchone()
+
+    total = int(row["total"] or 0)
+    sent = int(row["sent"] or 0)
+    failed = int(row["failed"] or 0)
+
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "success_rate": round((sent / total) * 100, 1) if total else 0.0,
+        "latency": int(row["latency"] or 0),
+    }
+
+
 def add_host(
     guild_id: int,
     platform: str,
@@ -1034,6 +1443,18 @@ def add_host(
     extra=None
 ):
     ensure_guild(guild_id)
+
+    platform = platform.lower().strip()
+    target = normalize_social_target(platform, target)
+
+    if platform not in SUPPORTED_PLATFORMS:
+        raise ValueError(
+            "Platform tidak didukung. Gunakan: "
+            + ", ".join(sorted(SUPPORTED_PLATFORMS))
+        )
+
+    if not target:
+        raise ValueError("Target/username tidak boleh kosong.")
 
     existing = None
     with closing(db()) as conn:
@@ -1107,6 +1528,19 @@ def delete_host(host_id: int):
                 row["guild_id"],
                 row["target"].lstrip("@")
             ))
+
+        conn.execute(
+            "DELETE FROM social_content_state WHERE host_id=?",
+            (host_id,)
+        )
+        conn.execute(
+            "DELETE FROM host_managers WHERE host_id=?",
+            (host_id,)
+        )
+        conn.execute(
+            "DELETE FROM host_manager_activity WHERE host_id=?",
+            (host_id,)
+        )
 
         conn.commit()
 
@@ -3599,6 +4033,10 @@ DEFAULT_FEATURE_FLAGS = {
     "tiktok_live": True,
     "tiktok_post": True,
     "youtube_live": True,
+    "twitch_live": True,
+    "kick_live": True,
+    "instagram_post": True,
+    "facebook_post": True,
     "live_end": True,
 }
 
@@ -4915,6 +5353,309 @@ async def check_youtube_live_fallback(host):
     return True
 
 
+
+def _generic_live_extract_sync(url: str):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "noplaylist": True,
+    }
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        return None
+
+    is_live = bool(
+        info.get("is_live")
+        or info.get("live_status") == "is_live"
+    )
+
+    if not is_live:
+        return None
+
+    return {
+        "id": str(
+            info.get("id")
+            or info.get("display_id")
+            or url
+        ),
+        "title": info.get("title") or "LIVE",
+        "url": info.get("webpage_url") or url,
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+async def check_generic_live(host):
+    platform = host["platform"]
+    url = host_public_url(host, live=True)
+
+    record_api_call(platform, "yt-dlp-live")
+
+    data = await asyncio.wait_for(
+        asyncio.to_thread(
+            _generic_live_extract_sync,
+            url
+        ),
+        timeout=35
+    )
+
+    previous = get_live_state(
+        host["guild_id"],
+        platform,
+        host["target"]
+    )
+
+    if not data:
+        if (
+            previous
+            and previous["is_live"]
+            and host["notify_live_end"]
+            and feature_enabled(host["guild_id"], "live_end")
+        ):
+            embed = discord.Embed(
+                title=f"⚫ {platform_display_name(platform)} LIVE Selesai",
+                description=(
+                    f"**{host['display_name'] or host['target']}** "
+                    "sudah selesai LIVE."
+                ),
+                color=discord.Color.dark_grey()
+            )
+
+            await send_notification(
+                host,
+                embed,
+                render_template(
+                    host["custom_end_message"],
+                    creator=host["display_name"] or host["target"],
+                    url=url,
+                    platform=platform_display_name(platform)
+                ),
+                event_type=f"{platform}_live_end",
+                event_key=(
+                    f"{platform}:live_end:{host['target']}:"
+                    f"{previous['live_key'] or int(time.time() // 60)}"
+                ),
+                source_url=url
+            )
+
+        update_live_state(
+            host["guild_id"],
+            platform,
+            host["target"],
+            False,
+            None
+        )
+        return False
+
+    if (
+        previous
+        and previous["is_live"]
+        and previous["live_key"] == data["id"]
+    ):
+        return True
+
+    embed = discord.Embed(
+        title=f"🔴 {platform_display_name(platform)} LIVE",
+        description=(
+            f"**{host['display_name'] or host['target']}** sedang LIVE!"
+        ),
+        url=data["url"],
+        color=discord.Color.red()
+    )
+    embed.add_field(
+        name="Judul",
+        value=str(data["title"])[:1024],
+        inline=False
+    )
+
+    if data.get("thumbnail"):
+        embed.set_thumbnail(url=data["thumbnail"])
+
+    await send_notification(
+        host,
+        embed,
+        render_template(
+            host["custom_live_message"],
+            creator=host["display_name"] or host["target"],
+            url=data["url"],
+            platform=platform_display_name(platform)
+        ),
+        event_type=f"{platform}_live",
+        event_key=f"{platform}:live:{host['target']}:{data['id']}",
+        source_url=data["url"]
+    )
+
+    update_live_state(
+        host["guild_id"],
+        platform,
+        host["target"],
+        True,
+        data["id"]
+    )
+    return True
+
+
+def _generic_latest_content_sync(url: str):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "playlistend": 3,
+        "socket_timeout": 20,
+    }
+
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    if not info:
+        return None
+
+    entries = info.get("entries")
+
+    if entries:
+        entries = [
+            entry
+            for entry in entries
+            if entry
+        ]
+        if not entries:
+            return None
+        item = entries[0]
+    else:
+        item = info
+
+    item_id = str(
+        item.get("id")
+        or item.get("display_id")
+        or item.get("url")
+        or ""
+    ).strip()
+
+    if not item_id:
+        return None
+
+    item_url = (
+        item.get("webpage_url")
+        or item.get("url")
+        or url
+    )
+
+    return {
+        "id": item_id,
+        "title": item.get("title") or item.get("description") or "Konten baru",
+        "url": item_url,
+        "thumbnail": item.get("thumbnail"),
+    }
+
+
+def get_social_content_state(host_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM social_content_state WHERE host_id=?",
+            (int(host_id),)
+        ).fetchone()
+
+
+def set_social_content_state(
+    host_id: int,
+    item_id: str,
+    initialized: bool = True
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO social_content_state(
+                host_id, last_item_id, initialized, updated_at
+            )
+            VALUES(?,?,?,?)
+            ON CONFLICT(host_id)
+            DO UPDATE SET
+                last_item_id=excluded.last_item_id,
+                initialized=excluded.initialized,
+                updated_at=excluded.updated_at
+        """, (
+            int(host_id),
+            str(item_id),
+            1 if initialized else 0,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+async def check_generic_content(host):
+    platform = host["platform"]
+    url = host_public_url(host)
+
+    record_api_call(platform, "yt-dlp-latest-content")
+
+    latest = await asyncio.wait_for(
+        asyncio.to_thread(
+            _generic_latest_content_sync,
+            url
+        ),
+        timeout=35
+    )
+
+    if not latest:
+        return False
+
+    state = get_social_content_state(host["id"])
+
+    if not state or not state["initialized"]:
+        set_social_content_state(
+            host["id"],
+            latest["id"],
+            True
+        )
+        return True
+
+    if state["last_item_id"] == latest["id"]:
+        return True
+
+    embed = discord.Embed(
+        title=f"🆕 {platform_display_name(platform)} • Konten Baru",
+        description=(
+            f"**{host['display_name'] or host['target']}** "
+            "mengunggah konten baru."
+        ),
+        url=latest["url"],
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Konten",
+        value=str(latest["title"])[:1024],
+        inline=False
+    )
+
+    if latest.get("thumbnail"):
+        embed.set_thumbnail(url=latest["thumbnail"])
+
+    await send_notification(
+        host,
+        embed,
+        render_template(
+            host["custom_post_message"],
+            creator=host["display_name"] or host["target"],
+            url=latest["url"],
+            platform=platform_display_name(platform)
+        ),
+        event_type=f"{platform}_post",
+        event_key=f"{platform}:post:{host['target']}:{latest['id']}",
+        source_url=latest["url"]
+    )
+
+    set_social_content_state(
+        host["id"],
+        latest["id"],
+        True
+    )
+    return True
+
+
 # ============================================================
 # TIKTOK
 # ============================================================
@@ -5399,6 +6140,28 @@ async def monitor_loop():
                                 raise
                     set_host_health(host["id"], success=True)
 
+                elif host["platform"] in {"twitch", "kick"}:
+                    feature_name = f"{host['platform']}_live"
+
+                    if feature_enabled(guild.id, feature_name):
+                        await check_generic_live(host)
+
+                    set_host_health(
+                        host["id"],
+                        success=True
+                    )
+
+                elif host["platform"] in {"instagram", "facebook"}:
+                    feature_name = f"{host['platform']}_post"
+
+                    if feature_enabled(guild.id, feature_name):
+                        await check_generic_content(host)
+
+                    set_host_health(
+                        host["id"],
+                        success=True
+                    )
+
                 elif host["platform"] == "tiktok":
                     errors = []
 
@@ -5594,6 +6357,61 @@ def prune_auto_backups():
         log.exception("Gagal membersihkan backup lama")
 
 
+
+async def send_auto_backup_to_primary_owners(
+    payload: dict,
+    ts: int
+) -> dict:
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2
+    ).encode("utf-8")
+
+    sent = 0
+    failed = 0
+
+    for owner_id in primary_owner_ids():
+        try:
+            owner = bot.get_user(owner_id)
+
+            if owner is None:
+                owner = await bot.fetch_user(owner_id)
+
+            await owner.send(
+                content=(
+                    "🗄️ **Auto Backup Hi Notifku**\n"
+                    f"Waktu: <t:{ts}:F>\n"
+                    f"Server: **{len(payload.get('guilds', []))}**\n"
+                    "Simpan file ini di tempat aman."
+                ),
+                file=discord.File(
+                    io.BytesIO(raw),
+                    filename=f"hi-notifku-auto-{ts}.json"
+                )
+            )
+
+            sent += 1
+            log.info(
+                "Auto backup berhasil dikirim ke primary owner_id=%s",
+                owner_id
+            )
+
+        except Exception as exc:
+            failed += 1
+            log.warning(
+                "Auto backup gagal dikirim ke primary owner_id=%s: %s: %s",
+                owner_id,
+                type(exc).__name__,
+                exc
+            )
+
+    return {
+        "sent": sent,
+        "failed": failed
+    }
+
+
 @tasks.loop(hours=AUTO_BACKUP_HOURS)
 async def auto_backup_loop():
     try:
@@ -5604,10 +6422,13 @@ async def auto_backup_loop():
         ts = int(time.time())
         path = folder / f"hi-notifku-auto-{ts}.json"
 
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
+        backup_bytes = json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
+
+        path.write_bytes(backup_bytes)
 
         with closing(db()) as conn:
             conn.execute("""
@@ -5624,6 +6445,17 @@ async def auto_backup_loop():
         prune_auto_backups()
         log.info("Auto backup dibuat: %s", path)
 
+        dm_result = await send_auto_backup_to_primary_owners(
+            payload,
+            ts
+        )
+
+        log.info(
+            "Auto backup DM owner: sent=%s failed=%s",
+            dm_result["sent"],
+            dm_result["failed"]
+        )
+
         if BACKUP_CHANNEL_ID:
             channel = bot.get_channel(BACKUP_CHANNEL_ID)
 
@@ -5638,13 +6470,7 @@ async def auto_backup_loop():
                             f"<t:{ts}:F> • {len(payload['guilds'])} server"
                         ),
                         file=discord.File(
-                            io.BytesIO(
-                                json.dumps(
-                                    payload,
-                                    ensure_ascii=False,
-                                    indent=2
-                                ).encode("utf-8")
-                            ),
+                            io.BytesIO(backup_bytes),
                             filename=f"hi-notifku-auto-{ts}.json"
                         )
                     )
@@ -5760,7 +6586,7 @@ def restore_guild_backup(data: dict, target_guild_id: int):
     restored = 0
 
     for raw in hosts:
-        if raw.get("platform") not in {"tiktok", "youtube"}:
+        if raw.get("platform") not in SUPPORTED_PLATFORMS:
             continue
 
         target = str(raw.get("target") or "").strip()
@@ -5947,7 +6773,7 @@ def server_embed(guild: discord.Guild):
 
 
 def host_embed(host):
-    platform_name = "TikTok" if host["platform"] == "tiktok" else "YouTube"
+    platform_name = platform_display_name(host["platform"])
     status = host_status_text(host)
 
     channel_text = (
@@ -5960,7 +6786,7 @@ def host_embed(host):
     )
 
     embed = discord.Embed(
-        title=f"{'🎵' if host['platform']=='tiktok' else '📺'} {platform_name}",
+        title=f"{platform_icon(host['platform'])} {platform_name}",
         description=(
             f"`{host['target']}`\n"
             f"{status} • Interval **{host['check_interval']}s**"
@@ -6009,108 +6835,131 @@ def host_embed(host):
 class AddHostModal(discord.ui.Modal):
     platform = discord.ui.TextInput(
         label="Platform",
-        placeholder="tiktok atau youtube",
-        max_length=10
+        placeholder="youtube/tiktok/twitch/kick/instagram/facebook",
+        max_length=20
     )
     target = discord.ui.TextInput(
-        label="Username / YouTube Channel ID",
-        placeholder="TikTok: username | YouTube: UC...",
-        max_length=120
+        label="Username / Channel ID / URL",
+        placeholder="Username, YouTube Channel ID, atau URL Facebook",
+        max_length=300
     )
 
     def __init__(self, guild_id: int):
-        super().__init__(title="Tambah Host", timeout=300)
+        super().__init__(title="Tambah Host Sosmed", timeout=300)
         self.guild_id = guild_id
 
     async def on_submit(self, interaction: discord.Interaction):
         platform = self.platform.value.strip().lower()
-        target = self.target.value.strip()
+        target_raw = self.target.value.strip()
 
-        if platform not in {"tiktok", "youtube"}:
+        if platform not in SUPPORTED_PLATFORMS:
             await safe_reply(
                 interaction,
-                "❌ Platform harus `tiktok` atau `youtube`."
+                (
+                    "❌ Platform belum didukung.\n"
+                    "Gunakan: `youtube`, `tiktok`, `twitch`, `kick`, "
+                    "`instagram`, atau `facebook`."
+                )
             )
             return
 
-        if platform == "tiktok":
-            username = (
-                target
-                .replace("https://www.tiktok.com/@", "")
-                .replace("https://tiktok.com/@", "")
-                .split("/")[0]
-                .lstrip("@")
-                .strip()
-            )
+        target = normalize_social_target(
+            platform,
+            target_raw
+        )
 
-            if not username:
-                await safe_reply(
-                    interaction,
-                    "❌ Username TikTok tidak valid."
-                )
-                return
+        if not target:
+            await safe_reply(
+                interaction,
+                "❌ Username/target tidak valid."
+            )
+            return
+
+        if platform == "youtube":
+            await interaction.response.defer(ephemeral=True)
 
             try:
+                name, uploads = await resolve_youtube_channel(target)
                 add_host(
                     self.guild_id,
-                    "tiktok",
-                    username,
-                    f"@{username}"
+                    "youtube",
+                    target,
+                    name,
+                    uploads
                 )
-            except ValueError as exc:
-                await safe_reply(interaction, f"❌ {exc}")
-                return
 
-            await log_action(
+                await log_action(
+                    self.guild_id,
+                    interaction.user.id,
+                    "Tambah Host",
+                    f"YouTube {name} ({target})"
+                )
+
+                await interaction.followup.send(
+                    f"✅ YouTube **{name}** ditambahkan.",
+                    ephemeral=True
+                )
+            except Exception as exc:
+                await interaction.followup.send(
+                    f"❌ `{exc}`",
+                    ephemeral=True
+                )
+            return
+
+        display = (
+            f"@{target}"
+            if platform != "facebook" or not target.startswith("http")
+            else target
+        )
+
+        try:
+            add_host(
                 self.guild_id,
-                interaction.user.id,
-                "Tambah Host",
-                f"TikTok @{username}"
+                platform,
+                target,
+                display
             )
-
+        except ValueError as exc:
             await safe_reply(
                 interaction,
-                f"✅ TikTok **@{username}** ditambahkan."
+                f"❌ {exc}"
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        await log_action(
+            self.guild_id,
+            interaction.user.id,
+            "Tambah Host",
+            f"{platform_display_name(platform)} {display}"
+        )
 
-        try:
-            name, uploads = await resolve_youtube_channel(target)
-            add_host(
-                self.guild_id,
-                "youtube",
-                target,
-                name,
-                uploads
-            )
-
-            await log_action(
-                self.guild_id,
-                interaction.user.id,
-                "Tambah Host",
-                f"YouTube {name} ({target})"
+        note = ""
+        if platform in {"instagram", "facebook"}:
+            note = (
+                "\n⚠️ Instagram/Facebook memakai extractor best-effort; "
+                "akun privat atau halaman yang meminta login bisa gagal dipantau."
             )
 
-            await interaction.followup.send(
-                f"✅ YouTube **{name}** ditambahkan.",
-                ephemeral=True
+        await safe_reply(
+            interaction,
+            (
+                f"✅ {platform_icon(platform)} "
+                f"**{platform_display_name(platform)}** `{display}` ditambahkan."
+                f"{note}"
             )
-        except Exception as exc:
-            await interaction.followup.send(
-                f"❌ `{exc}`",
-                ephemeral=True
-            )
+        )
 
 
 class BulkImportModal(discord.ui.Modal):
     data = discord.ui.TextInput(
         label="Daftar Host",
         placeholder=(
-            "tiktok,username1\n"
-            "tiktok,username2\n"
-            "youtube,UCxxxxxxxx"
+            "tiktok,username\n"
+            "youtube,UCxxxxxxxx\n"
+            "twitch,username\n"
+            "kick,username\n"
+            "instagram,username\n"
+            "facebook,https://facebook.com/namapage"
         ),
         style=discord.TextStyle.paragraph,
         max_length=4000
@@ -6128,6 +6977,7 @@ class BulkImportModal(discord.ui.Modal):
 
         for line in self.data.value.splitlines():
             line = line.strip()
+
             if not line:
                 continue
 
@@ -6135,40 +6985,47 @@ class BulkImportModal(discord.ui.Modal):
                 errors.append(f"`{line}` → format salah")
                 continue
 
-            platform, target = [
+            platform, target_raw = [
                 x.strip()
                 for x in line.split(",", 1)
             ]
-
             platform = platform.lower()
 
-            try:
-                if platform == "tiktok":
-                    username = target.lstrip("@")
-                    add_host(
-                        self.guild_id,
-                        "tiktok",
-                        username,
-                        f"@{username}"
-                    )
-                    added += 1
+            if platform not in SUPPORTED_PLATFORMS:
+                errors.append(
+                    f"`{line}` → platform tidak didukung"
+                )
+                continue
 
-                elif platform == "youtube":
+            target = normalize_social_target(
+                platform,
+                target_raw
+            )
+
+            try:
+                if platform == "youtube":
                     name, uploads = await resolve_youtube_channel(target)
                     add_host(
                         self.guild_id,
-                        "youtube",
+                        platform,
                         target,
                         name,
                         uploads
                     )
-                    added += 1
-
                 else:
-                    errors.append(f"`{line}` → platform tidak valid")
+                    add_host(
+                        self.guild_id,
+                        platform,
+                        target,
+                        f"@{target}" if not target.startswith("http") else target
+                    )
+
+                added += 1
 
             except Exception as exc:
-                errors.append(f"`{line}` → {exc}")
+                errors.append(
+                    f"`{line}` → {exc}"
+                )
 
         await log_action(
             self.guild_id,
@@ -7435,6 +8292,34 @@ class DMUserGuildPickerView(discord.ui.View):
             )
         )
 
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="🎙️",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def host_saya(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        if not host_manager_rows(self.user_id):
+            await safe_reply(
+                interaction,
+                "ℹ️ Belum ada host yang ditugaskan kepadamu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(self.user_id),
+            view=HostManagerHomeView(self.user_id)
+        )
+
     @discord.ui.button(
         label="Menu Awal",
         emoji="🏠",
@@ -7454,10 +8339,14 @@ class DMUserGuildPickerView(discord.ui.View):
 
 def dm_menu_home_embed(user_id: int):
     guilds = user_owned_guilds(user_id)
+    managed_hosts = host_manager_rows(user_id)
 
     embed = discord.Embed(
         title="📩 Hi Notifku",
-        description="Pilih server yang ingin dikelola.",
+        description=(
+            "Pilih server yang ingin dikelola atau buka **🎙️ Host Saya** "
+            "jika kamu ditugaskan sebagai Host Manager."
+        ),
         color=discord.Color.blue()
     )
     embed.add_field(
@@ -7468,6 +8357,11 @@ def dm_menu_home_embed(user_id: int):
     embed.add_field(
         name="Mode",
         value="DM",
+        inline=True
+    )
+    embed.add_field(
+        name="Host Saya",
+        value=str(len(managed_hosts)),
         inline=True
     )
     embed.set_footer(text="/menu • Hi Notifku")
@@ -7637,6 +8531,1052 @@ class UserServerMenuView(discord.ui.View):
                     "tetapi DM ke owner belum berhasil dikirim."
                 )
             )
+
+
+
+def host_manager_home_embed(user_id: int):
+    rows = host_manager_rows(user_id)
+
+    embed = discord.Embed(
+        title="🎙️ Host Saya",
+        description=(
+            "Panel ini khusus **Host Manager** dan terpisah dari panel Owner.\n"
+            "Kamu hanya dapat mengelola host yang ditugaskan kepadamu."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Host yang Dikelola",
+        value=str(len(rows)),
+        inline=True
+    )
+    embed.add_field(
+        name="Akses Owner",
+        value="Tidak ada",
+        inline=True
+    )
+    embed.set_footer(text="Host Panel • /menu")
+    return embed
+
+
+def host_manager_detail_embed(host, user_id: int):
+    access = host_manager_access(user_id, host["id"])
+    stats = host_manager_stats(host["id"])
+
+    permissions = []
+    if access:
+        for key, column in HOST_MANAGER_PERMISSION_COLUMNS.items():
+            if access[column]:
+                permissions.append(key.replace("_", " ").title())
+
+    embed = host_embed(host)
+    embed.title = f"🎙️ Host Saya • {platform_display_name(host['platform'])}"
+    embed.add_field(
+        name="Statistik 7 Hari",
+        value=(
+            f"Notif: **{stats['total']}**\n"
+            f"Berhasil: **{stats['sent']}**\n"
+            f"Gagal: **{stats['failed']}**\n"
+            f"Success: **{stats['success_rate']}%**\n"
+            f"Latency: **{stats['latency']} ms**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Izin Host Manager",
+        value=", ".join(permissions) if permissions else "Read-only",
+        inline=False
+    )
+    embed.set_footer(
+        text=f"Host Panel terisolasi • Host ID {host['id']} • Tidak ada akses Owner"
+    )
+    return embed
+
+
+class HostManagerSelect(discord.ui.Select):
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
+        rows = host_manager_rows(self.user_id)
+
+        options = []
+        for row in rows[:25]:
+            guild = bot.get_guild(int(row["guild_id"]))
+            guild_name = guild.name if guild else f"Server {row['guild_id']}"
+            label = (
+                row["display_name"]
+                or row["target"]
+                or f"Host {row['host_id']}"
+            )
+            options.append(
+                discord.SelectOption(
+                    label=f"{platform_display_name(row['platform'])} • {label}"[:100],
+                    description=guild_name[:100],
+                    value=str(row["host_id"]),
+                    emoji=platform_icon(row["platform"])
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Belum ada host",
+                    description="Owner belum menugaskan host kepadamu.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih host yang kamu kelola",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        host_id = int(self.values[0])
+        if not host_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Belum ada host yang ditugaskan kepadamu."
+            )
+            return
+
+        if not host_manager_access(interaction.user.id, host_id):
+            await safe_reply(
+                interaction,
+                "🔒 Akses Host Manager sudah tidak aktif."
+            )
+            return
+
+        host = get_host(host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_detail_embed(
+                host,
+                interaction.user.id
+            ),
+            view=HostManagerDetailView(
+                interaction.user.id,
+                host_id
+            )
+        )
+
+
+class HostManagerHomeView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.add_item(HostManagerSelect(self.user_id))
+
+    @discord.ui.button(
+        label="Menu Pengguna",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back_user_menu(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(self.user_id, 0)
+        )
+
+
+class HostManagerMessageModal(discord.ui.Modal):
+    live_message = discord.ui.TextInput(
+        label="Pesan LIVE (opsional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+    post_message = discord.ui.TextInput(
+        label="Pesan Post (opsional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+    end_message = discord.ui.TextInput(
+        label="Pesan LIVE Selesai (opsional)",
+        required=False,
+        style=discord.TextStyle.paragraph,
+        max_length=1000
+    )
+
+    def __init__(self, user_id: int, host_id: int):
+        super().__init__(
+            title="Host Saya • Pesan Notifikasi",
+            timeout=300
+        )
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+        host = get_host(host_id)
+        if host:
+            self.live_message.default = host["custom_live_message"] or ""
+            self.post_message.default = host["custom_post_message"] or ""
+            self.end_message.default = host["custom_end_message"] or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_has_permission(
+                interaction.user.id,
+                self.host_id,
+                "edit_messages"
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Kamu tidak punya izin mengubah pesan host ini."
+            )
+            return
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET custom_live_message=?,
+                    custom_post_message=?,
+                    custom_end_message=?
+                WHERE id=?
+            """, (
+                self.live_message.value.strip() or None,
+                self.post_message.value.strip() or None,
+                self.end_message.value.strip() or None,
+                self.host_id
+            ))
+            conn.commit()
+
+        log_host_manager_action(
+            self.host_id,
+            interaction.user.id,
+            "edit_messages",
+            "Mengubah template notifikasi."
+        )
+
+        await safe_reply(
+            interaction,
+            "✅ Pesan notifikasi host diperbarui."
+        )
+
+
+class HostManagerScheduleModal(discord.ui.Modal):
+    days = discord.ui.TextInput(
+        label="Hari aktif (0=Senin ... 6=Minggu)",
+        placeholder="0,1,2,3,4,5,6",
+        max_length=30
+    )
+    quiet_start = discord.ui.TextInput(
+        label="Quiet mulai (HH:MM, kosong=OFF)",
+        required=False,
+        max_length=5
+    )
+    quiet_end = discord.ui.TextInput(
+        label="Quiet selesai (HH:MM, kosong=OFF)",
+        required=False,
+        max_length=5
+    )
+    timezone_input = discord.ui.TextInput(
+        label="Timezone",
+        placeholder="Asia/Jakarta",
+        max_length=60
+    )
+
+    def __init__(self, user_id: int, host_id: int):
+        super().__init__(
+            title="Host Saya • Jadwal",
+            timeout=300
+        )
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+        host = get_host(host_id)
+
+        if host:
+            self.days.default = host["schedule_days"] or "0,1,2,3,4,5,6"
+            self.quiet_start.default = host["quiet_start"] or ""
+            self.quiet_end.default = host["quiet_end"] or ""
+            self.timezone_input.default = host["timezone"] or "Asia/Jakarta"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_has_permission(
+                interaction.user.id,
+                self.host_id,
+                "schedule"
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Kamu tidak punya izin mengubah jadwal host ini."
+            )
+            return
+
+        raw_days = self.days.value.strip()
+        day_values = []
+        for raw in raw_days.split(","):
+            raw = raw.strip()
+            if not raw.isdigit() or not 0 <= int(raw) <= 6:
+                await safe_reply(
+                    interaction,
+                    "❌ Hari aktif harus angka 0–6 dipisahkan koma."
+                )
+                return
+            if raw not in day_values:
+                day_values.append(raw)
+
+        qs = self.quiet_start.value.strip()
+        qe = self.quiet_end.value.strip()
+        if bool(qs) != bool(qe):
+            await safe_reply(
+                interaction,
+                "❌ Quiet start dan quiet end harus diisi bersamaan."
+            )
+            return
+
+        if qs and (not _parse_hhmm(qs) or not _parse_hhmm(qe)):
+            await safe_reply(
+                interaction,
+                "❌ Format quiet hours harus HH:MM."
+            )
+            return
+
+        tz = self.timezone_input.value.strip() or "Asia/Jakarta"
+        try:
+            ZoneInfo(tz)
+        except Exception:
+            await safe_reply(
+                interaction,
+                "❌ Timezone tidak valid. Contoh: `Asia/Jakarta`."
+            )
+            return
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET schedule_days=?,
+                    quiet_start=?,
+                    quiet_end=?,
+                    timezone=?
+                WHERE id=?
+            """, (
+                ",".join(day_values),
+                qs or None,
+                qe or None,
+                tz,
+                self.host_id
+            ))
+            conn.commit()
+
+        log_host_manager_action(
+            self.host_id,
+            interaction.user.id,
+            "schedule",
+            f"days={','.join(day_values)} quiet={qs or '-'}-{qe or '-'} tz={tz}"
+        )
+
+        await safe_reply(interaction, "✅ Jadwal host diperbarui.")
+
+
+async def host_manager_recheck(host):
+    platform = host["platform"]
+
+    if platform == "youtube":
+        try:
+            await check_youtube_live(host)
+        except Exception:
+            await check_youtube_live_fallback(host)
+    elif platform == "tiktok":
+        await check_tiktok_live(host)
+        await check_tiktok_post(host)
+    elif platform in {"twitch", "kick"}:
+        await check_generic_live(host)
+    elif platform in {"instagram", "facebook"}:
+        await check_generic_content(host)
+
+
+class HostManagerHistoryView(discord.ui.View):
+    def __init__(self, user_id: int, host_id: int):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+    @discord.ui.button(
+        label="Kembali ke Host",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_access(self.user_id, self.host_id)
+        ):
+            await safe_reply(interaction, "🔒 Akses ditolak.")
+            return
+
+        host = get_host(self.host_id)
+        await interaction.response.edit_message(
+            embed=host_manager_detail_embed(
+                host,
+                self.user_id
+            ),
+            view=HostManagerDetailView(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+
+class HostManagerDetailView(discord.ui.View):
+    def __init__(self, user_id: int, host_id: int):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+    async def valid(
+        self,
+        interaction: discord.Interaction,
+        permission: Optional[str] = None
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return None
+
+        access = host_manager_access(
+            interaction.user.id,
+            self.host_id
+        )
+
+        if not access:
+            await safe_reply(
+                interaction,
+                "🔒 Akses Host Manager sudah dicabut atau kedaluwarsa."
+            )
+            return None
+
+        if permission and not host_manager_has_permission(
+            interaction.user.id,
+            self.host_id,
+            permission
+        ):
+            await safe_reply(
+                interaction,
+                f"🔒 Kamu tidak punya izin `{permission}` untuk host ini."
+            )
+            return None
+
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(
+                interaction,
+                "❌ Host tidak ditemukan."
+            )
+            return None
+
+        return host
+
+    @discord.ui.button(
+        label="Pesan",
+        emoji="✏️",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def messages(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction, "edit_messages"):
+            return
+        await interaction.response.send_modal(
+            HostManagerMessageModal(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Jadwal",
+        emoji="🗓️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def schedule(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction, "schedule"):
+            return
+        await interaction.response.send_modal(
+            HostManagerScheduleModal(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Preview",
+        emoji="👁️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def preview(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        live_mode = host["platform"] in {
+            "youtube", "tiktok", "twitch", "kick"
+        }
+        url = host_public_url(host, live=live_mode)
+
+        embed = discord.Embed(
+            title=f"🔔 Preview • {platform_display_name(host['platform'])}",
+            description=(
+                f"Contoh notifikasi untuk "
+                f"**{host['display_name'] or host['target']}**."
+            ),
+            url=url,
+            color=discord.Color.blurple()
+        )
+
+        await safe_reply(
+            interaction,
+            "Preview hanya terlihat olehmu.",
+            embed=embed
+        )
+
+    @discord.ui.button(
+        label="Test",
+        emoji="🧪",
+        style=discord.ButtonStyle.success,
+        row=1
+    )
+    async def test(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction, "test")
+        if not host:
+            return
+
+        url = host_public_url(
+            host,
+            live=host["platform"] in {"youtube", "tiktok", "twitch", "kick"}
+        )
+        embed = discord.Embed(
+            title=f"🧪 TEST • {platform_display_name(host['platform'])}",
+            description=(
+                f"Test notifikasi dari "
+                f"**{host['display_name'] or host['target']}**."
+            ),
+            url=url,
+            color=discord.Color.green()
+        )
+
+        ok = await send_notification(
+            host,
+            embed,
+            render_template(
+                host["custom_live_message"] or host["custom_post_message"],
+                creator=host["display_name"] or host["target"],
+                url=url,
+                platform=platform_display_name(host["platform"])
+            ),
+            event_type="host_manager_test",
+            source_url=url
+        )
+
+        log_host_manager_action(
+            self.host_id,
+            interaction.user.id,
+            "test",
+            f"success={bool(ok)}"
+        )
+
+        await safe_reply(
+            interaction,
+            "✅ Test dikirim." if ok else "❌ Test gagal dikirim."
+        )
+
+    @discord.ui.button(
+        label="Recheck",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def recheck(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction, "recheck")
+        if not host:
+            return
+
+        key = f"host_manager_recheck:{self.host_id}"
+        if action_rate_limited(interaction.user.id, key):
+            await safe_reply(
+                interaction,
+                "⏳ Recheck terlalu cepat. Tunggu beberapa detik."
+            )
+            return
+
+        await defer_if_needed(interaction)
+
+        try:
+            await host_manager_recheck(host)
+            log_host_manager_action(
+                self.host_id,
+                interaction.user.id,
+                "recheck",
+                "Manual recheck."
+            )
+            await interaction.followup.send(
+                "✅ Recheck selesai.",
+                ephemeral=True
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Recheck gagal: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(
+        label="Pause / Resume",
+        emoji="⏯️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def pause(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction, "pause")
+        if not host:
+            return
+
+        enabled = toggle_host(self.host_id)
+
+        log_host_manager_action(
+            self.host_id,
+            interaction.user.id,
+            "pause_resume",
+            f"enabled={enabled}"
+        )
+
+        refreshed = get_host(self.host_id)
+        await interaction.response.edit_message(
+            embed=host_manager_detail_embed(
+                refreshed,
+                self.user_id
+            ),
+            view=HostManagerDetailView(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="History",
+        emoji="🕘",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def history(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction, "history")
+        if not host:
+            return
+
+        with closing(db()) as conn:
+            rows = conn.execute("""
+                SELECT *
+                FROM notification_history
+                WHERE host_id=?
+                ORDER BY id DESC
+                LIMIT 10
+            """, (self.host_id,)).fetchall()
+
+        if rows:
+            lines = []
+            for row in rows:
+                icon = "✅" if row["status"] == "sent" else (
+                    "⏳" if row["status"] == "queued" else "❌"
+                )
+                lines.append(
+                    f"{icon} <t:{row['created_at']}:R> • "
+                    f"`{row['event_type'] or 'notification'}` • "
+                    f"{row['status']}"
+                )
+            description = "\n".join(lines)
+        else:
+            description = "Belum ada riwayat notifikasi."
+
+        embed = discord.Embed(
+            title="🕘 History Host Saya",
+            description=description,
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(
+            text="Hanya history host yang ditugaskan kepadamu."
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=HostManagerHistoryView(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="📊",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_detail_embed(
+                host,
+                self.user_id
+            ),
+            view=HostManagerDetailView(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def back_hosts(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(
+                self.user_id
+            ),
+            view=HostManagerHomeView(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Menu Pengguna",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def user_home(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(self.user_id, 0)
+        )
+
+
+class AssignHostManagerModal(discord.ui.Modal):
+    user_id_input = discord.ui.TextInput(
+        label="Discord User ID",
+        placeholder="Contoh: 123456789012345678",
+        max_length=25
+    )
+    permissions_input = discord.ui.TextInput(
+        label="Izin (pisahkan koma)",
+        placeholder="edit_messages,schedule,pause,recheck,history,test",
+        default="edit_messages,schedule,pause,recheck,history,test",
+        max_length=120
+    )
+    expiry_days = discord.ui.TextInput(
+        label="Masa akses hari (kosong=permanen)",
+        required=False,
+        placeholder="30",
+        max_length=5
+    )
+
+    def __init__(self, host_id: int):
+        super().__init__(
+            title="Owner • Assign Host Manager",
+            timeout=300
+        )
+        self.host_id = int(host_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return
+
+        raw_user = self.user_id_input.value.strip()
+        if not raw_user.isdigit():
+            await safe_reply(
+                interaction,
+                "❌ Discord User ID harus angka."
+            )
+            return
+
+        user_id = int(raw_user)
+        requested = {
+            x.strip().lower()
+            for x in self.permissions_input.value.split(",")
+            if x.strip()
+        }
+        invalid = requested - set(HOST_MANAGER_PERMISSION_COLUMNS)
+        if invalid:
+            await safe_reply(
+                interaction,
+                "❌ Izin tidak valid: " + ", ".join(sorted(invalid))
+            )
+            return
+
+        expires_at = None
+        raw_expiry = self.expiry_days.value.strip()
+        if raw_expiry:
+            if not raw_expiry.isdigit() or int(raw_expiry) < 1:
+                await safe_reply(
+                    interaction,
+                    "❌ Masa akses harus jumlah hari."
+                )
+                return
+            expires_at = int(time.time()) + int(raw_expiry) * 86400
+
+        assign_host_manager(
+            self.host_id,
+            user_id,
+            assigned_by=interaction.user.id,
+            permissions=requested,
+            expires_at=expires_at
+        )
+
+        host = get_host(self.host_id)
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            await user.send(
+                embed=discord.Embed(
+                    title="🎙️ Kamu ditambahkan sebagai Host Manager",
+                    description=(
+                        f"Host: **{platform_display_name(host['platform'])} • "
+                        f"{host['display_name'] or host['target']}**\n\n"
+                        "Buka DM bot dan gunakan **`/menu` → `🎙️ Host Saya`**.\n"
+                        "Akses Host Manager terpisah dari panel Owner."
+                    ),
+                    color=discord.Color.blurple()
+                )
+            )
+        except Exception:
+            pass
+
+        await safe_reply(
+            interaction,
+            (
+                f"✅ <@{user_id}> ditambahkan sebagai Host Manager.\n"
+                f"Izin: `{', '.join(sorted(requested)) or 'read-only'}`"
+            )
+        )
+
+
+class RevokeHostManagerModal(discord.ui.Modal):
+    user_id_input = discord.ui.TextInput(
+        label="Discord User ID yang dicabut",
+        max_length=25
+    )
+
+    def __init__(self, host_id: int):
+        super().__init__(
+            title="Owner • Revoke Host Manager",
+            timeout=300
+        )
+        self.host_id = int(host_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return
+
+        raw = self.user_id_input.value.strip()
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ ID harus angka.")
+            return
+
+        user_id = int(raw)
+        revoke_host_manager(
+            self.host_id,
+            user_id
+        )
+
+        await safe_reply(
+            interaction,
+            f"✅ Akses Host Manager <@{user_id}> dicabut."
+        )
+
+
+class OwnerHostManagerView(discord.ui.View):
+    def __init__(self, guild_id: int, host_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.host_id = int(host_id)
+
+    async def valid(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return False
+        host = get_host(self.host_id)
+        if not host or int(host["guild_id"]) != self.guild_id:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Tambah / Update Manager",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+        row=0
+    )
+    async def add_manager(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.send_modal(
+            AssignHostManagerModal(self.host_id)
+        )
+
+    @discord.ui.button(
+        label="Cabut Manager",
+        emoji="➖",
+        style=discord.ButtonStyle.danger,
+        row=0
+    )
+    async def revoke_manager(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.send_modal(
+            RevokeHostManagerModal(self.host_id)
+        )
+
+    @discord.ui.button(
+        label="Daftar Manager",
+        emoji="👥",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def list_managers(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        rows = list_host_managers(self.host_id)
+        if rows:
+            lines = []
+            now = int(time.time())
+            for row in rows:
+                expiry = (
+                    f"<t:{row['expires_at']}:R>"
+                    if row["expires_at"]
+                    else "Permanen"
+                )
+                status = (
+                    "aktif"
+                    if not row["expires_at"] or row["expires_at"] > now
+                    else "kedaluwarsa"
+                )
+                lines.append(
+                    f"• <@{row['user_id']}> • {status} • {expiry}"
+                )
+            description = "\n".join(lines[:25])
+        else:
+            description = "Belum ada Host Manager."
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=discord.Embed(
+                title="👥 Host Manager",
+                description=description,
+                color=discord.Color.blue()
+            )
+        )
+
+    @discord.ui.button(
+        label="Kembali ke Host Owner",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        host = get_host(self.host_id)
+        await interaction.response.edit_message(
+            embed=host_embed(host),
+            view=HostCardView(
+                self.guild_id,
+                self.host_id
+            )
+        )
 
 
 
@@ -8195,6 +10135,7 @@ def owner_dashboard_embed():
     error_hosts = 0
     youtube_hosts = 0
     tiktok_hosts = 0
+    other_hosts = 0
 
     for guild in bot.guilds:
         try:
@@ -8204,6 +10145,7 @@ def owner_dashboard_embed():
                 error_hosts += 1 if host["last_error"] else 0
                 youtube_hosts += 1 if host["platform"] == "youtube" else 0
                 tiktok_hosts += 1 if host["platform"] == "tiktok" else 0
+                other_hosts += 1 if host["platform"] not in {"youtube", "tiktok"} else 0
         except Exception:
             pass
 
@@ -9947,9 +11889,16 @@ class HostAdvancedView(discord.ui.View):
                     await check_youtube_live(host)
                 except Exception:
                     await check_youtube_live_fallback(host)
-            else:
+
+            elif host["platform"] == "tiktok":
                 await check_tiktok_live(host)
                 await check_tiktok_post(host)
+
+            elif host["platform"] in {"twitch", "kick"}:
+                await check_generic_live(host)
+
+            elif host["platform"] in {"instagram", "facebook"}:
+                await check_generic_content(host)
 
             set_host_health(host["id"], success=True)
             await interaction.followup.send(
@@ -9970,10 +11919,9 @@ class HostAdvancedView(discord.ui.View):
             await safe_reply(interaction, "❌ Host tidak ditemukan.")
             return
 
-        url = (
-            f"https://www.tiktok.com/@{host['target'].lstrip('@')}/live"
-            if host["platform"] == "tiktok"
-            else f"https://www.youtube.com/channel/{host['target']}/live"
+        url = host_public_url(
+            host,
+            live=host["platform"] in {"youtube", "tiktok", "twitch", "kick"}
         )
 
         embed = discord.Embed(
@@ -10018,7 +11966,7 @@ class HostAdvancedView(discord.ui.View):
 class FeatureFlagsModal(discord.ui.Modal):
     features = discord.ui.TextInput(
         label="Fitur aktif (pisahkan koma)",
-        placeholder="tiktok_live,tiktok_post,youtube_live,live_end",
+        placeholder="tiktok_live,tiktok_post,youtube_live,twitch_live,kick_live,instagram_post,facebook_post,live_end",
         style=discord.TextStyle.paragraph,
         max_length=300
     )
@@ -10139,7 +12087,7 @@ class HostCSVImportModal(discord.ui.Modal):
 
             platform, target = parts[0].lower(), parts[1]
 
-            if platform not in {"tiktok", "youtube"} or not target:
+            if platform not in SUPPORTED_PLATFORMS or not target:
                 errors += 1
                 continue
 
@@ -10147,7 +12095,7 @@ class HostCSVImportModal(discord.ui.Modal):
                 add_host(
                     self.guild_id,
                     platform,
-                    target.lstrip("@") if platform == "tiktok" else target
+                    normalize_social_target(platform, target)
                 )
                 added += 1
             except Exception:
@@ -10803,7 +12751,7 @@ class HostAdminSelect(discord.ui.Select):
             discord.SelectOption(
                 label=(
                     f"#{h['id']} • "
-                    f"{'TikTok' if h['platform']=='tiktok' else 'YouTube'} • "
+                    f"{platform_display_name(h['platform'])} • "
                     f"{h['target']}"
                 )[:100],
                 value=str(h["id"]),
@@ -11185,6 +13133,7 @@ class HostCardView(discord.ui.View):
             ("Clear Pesan", "🧹", discord.ButtonStyle.secondary, 3, self.clear_messages),
             ("Hapus", "🗑️", discord.ButtonStyle.danger, 3, self.delete),
             ("Lanjutan", "🛠️", discord.ButtonStyle.primary, 4, self.advanced),
+            ("Manager Host", "🎙️", discord.ButtonStyle.primary, 4, self.managers),
             ("Kembali", "⬅️", discord.ButtonStyle.secondary, 4, self.back),
             ("Menu Awal", "🏠", discord.ButtonStyle.secondary, 4, self.home),
         ]
@@ -11425,6 +13374,31 @@ class HostCardView(discord.ui.View):
             await interaction.message.delete()
         except Exception:
             pass
+
+    async def managers(self, interaction):
+        host = await self.valid_host(interaction)
+        if not host:
+            return
+
+        managers = list_host_managers(self.host_id)
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🎙️ Owner • Host Manager",
+                description=(
+                    f"Host: **{platform_display_name(host['platform'])} • "
+                    f"{host['display_name'] or host['target']}**\n"
+                    f"Manager terdaftar: **{len(managers)}**\n\n"
+                    "Panel ini khusus Owner untuk assign/revoke Host Manager. "
+                    "Host Manager tidak dapat masuk ke panel Owner."
+                ),
+                color=discord.Color.blue()
+            ),
+            view=OwnerHostManagerView(
+                self.guild_id,
+                self.host_id
+            )
+        )
 
     async def advanced(self, interaction):
         host = await self.valid_host(interaction)
@@ -11699,13 +13673,14 @@ async def menu_command(interaction: discord.Interaction):
                 return
 
         guilds = user_owned_guilds(interaction.user.id)
+        managed_hosts = host_manager_rows(interaction.user.id)
 
-        if not guilds:
+        if not guilds and not managed_hosts:
             await safe_reply(
                 interaction,
                 (
-                    "ℹ️ Saya tidak menemukan server milikmu yang memakai Hi Notifku.\n"
-                    "Pastikan bot sudah ditambahkan ke server dan akunmu adalah **owner server**."
+                    "ℹ️ Tidak ada server milikmu dan belum ada host yang ditugaskan kepadamu.\n"
+                    "Jika kamu adalah creator/host, minta owner bot menambahkanmu sebagai **Host Manager**."
                 )
             )
             return
