@@ -168,3 +168,75 @@ print("OK: Premium purchase access + UI guards")
 print("OK: no duplicate class methods")
 print("OK: Premium customer database guards")
 print("OK: Premium production hardening guards")
+
+# Premium Stability Pack v1.13 regression guards.
+for required_def in {
+    "premium_status_snapshot",
+    "premium_downgrade_preview",
+    "premium_usage_metrics",
+    "premium_usage_embed",
+    "premium_health_report",
+    "repair_premium_customer_ledger",
+    "persist_payment_proof_file",
+    "register_payment_proof_attempt",
+    "premium_invoice_abuse_check",
+    "reconcile_premium_after_refund",
+}:
+    if required_def not in defs:
+        fail(f"Premium Stability Pack function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS premium_feature_usage',
+    'CREATE TABLE IF NOT EXISTS premium_health_audit',
+    'proof_storage_path',
+    'proof_upload_attempts',
+    'premium_recovery_watchdog_loop',
+    'premium_health_watch_loop',
+    'label="Health"',
+    'label="Analytics"',
+    'proof_upload_limit',
+    'source="recovery_watchdog"',
+    'reconcile_premium_after_refund',
+    'dm_latest_premium_buyer',
+}:
+    if required_text not in bot_text:
+        fail(f"Premium Stability Pack guard missing: {required_text}")
+
+# Premium payment UX + anti-spam backup guards (v1.14).
+for required_def in {
+    "claim_auto_backup_run",
+    "complete_auto_backup_run",
+    "release_auto_backup_run",
+    "should_notify_auto_backup_owner",
+    "latest_open_premium_order",
+    "open_user_premium_payment",
+}:
+    if required_def not in defs:
+        fail(f"v1.14 function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS auto_backup_state',
+    'BEGIN IMMEDIATE',
+    'label="Pembayaran"',
+    'label="QRIS Otomatis"',
+    'preferred_qris',
+    'Auto backup owner DM dilewati untuk mencegah spam.',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.14 regression guard missing: {required_text}")
+
+print("OK: Premium payment UX + auto-backup anti-spam v1.14 guards")
+
+# Ensure every explicitly declared Discord component custom_id is unique.
+custom_ids = re.findall(r'custom_id\s*=\s*["\']([^"\']+)["\']', bot_text)
+seen = set()
+duplicate_custom_ids = set()
+for cid in custom_ids:
+    if cid in seen:
+        duplicate_custom_ids.add(cid)
+    seen.add(cid)
+if duplicate_custom_ids:
+    fail(f"duplicate explicit custom_id values: {sorted(duplicate_custom_ids)}")
+
+print("OK: Premium Stability Pack v1.13 guards")
+print("OK: explicit custom_id uniqueness")
