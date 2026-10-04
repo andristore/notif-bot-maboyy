@@ -9219,50 +9219,70 @@ class SelectedServerOwnerView(discord.ui.View):
 
         hosts = get_hosts(guild.id)
 
-        if not hosts:
-            await safe_reply(
-                interaction,
-                (
-                    "ℹ️ Server ini belum mempunyai host.\n"
-                    "Pemilik server perlu menambahkan host terlebih dahulu."
-                )
-            )
-            return
-
         try:
             owner = (
                 guild.owner
                 or await bot.fetch_user(int(guild.owner_id))
             )
 
-            await owner.send(
-                content=(
-                    f"📨 **Permintaan Host Manager**\n"
-                    f"Server: **{guild.name}**\n"
-                    f"User: <@{self.user_id}> (`{self.user_id}`)\n\n"
-                    "Pilih host di bawah untuk memberikan akses kepada user ini."
-                ),
-                view=ServerOwnerHostGrantView(
-                    self.user_id,
-                    guild.id
+            if hosts:
+                await owner.send(
+                    content=(
+                        f"📨 **Permintaan Host Manager**\n"
+                        f"Server: **{guild.name}**\n"
+                        f"User: <@{self.user_id}> (`{self.user_id}`)\n\n"
+                        "Pilih host di bawah untuk memberikan akses kepada user ini."
+                    ),
+                    view=ServerOwnerHostGrantView(
+                        self.user_id,
+                        guild.id
+                    )
                 )
-            )
+            else:
+                await owner.send(
+                    embed=discord.Embed(
+                        title="📨 Permintaan Host Manager",
+                        description=(
+                            f"User <@{self.user_id}> (`{self.user_id}`) meminta "
+                            f"akses Host Manager di server **{guild.name}**.\n\n"
+                            "⚠️ Server ini **belum mempunyai host**.\n"
+                            "Buat host terlebih dahulu melalui:\n"
+                            "`/menu → pilih server → Kelola Host → Tambah Host`\n\n"
+                            "Setelah host dibuat, buka kembali pengelolaan host dan "
+                            "tambahkan user tersebut sebagai Host Manager."
+                        ),
+                        color=discord.Color.orange()
+                    )
+                )
+
             sent = True
         except Exception:
             sent = False
 
+        if sent:
+            if hosts:
+                message = (
+                    f"✅ Permintaan akses sudah dikirim ke pemilik server "
+                    f"<@{guild.owner_id}>."
+                )
+            else:
+                message = (
+                    f"✅ Permintaan sudah dikirim ke pemilik server "
+                    f"<@{guild.owner_id}>.\n"
+                    "ℹ️ Karena server belum mempunyai host, owner diminta "
+                    "membuat host terlebih dahulu lalu memberikan akses kepadamu."
+                )
+        else:
+            message = (
+                f"⚠️ Pemilik server adalah <@{guild.owner_id}>, tetapi bot "
+                "tidak dapat mengirim DM kepadanya. "
+                "Kemungkinan DM owner tertutup. Kamu bisa menekan mention "
+                "tersebut dan menghubunginya langsung."
+            )
+
         await safe_reply(
             interaction,
-            (
-                f"✅ Permintaan sudah dikirim ke pemilik server "
-                f"<@{guild.owner_id}>."
-                if sent
-                else (
-                    f"⚠️ Pemilik server adalah <@{guild.owner_id}>, tetapi bot "
-                    "tidak dapat mengirim DM kepadanya. "
-                    "Kamu bisa menekan mention tersebut dan menghubunginya langsung."
-                )
-            )
+            message
         )
 
     @discord.ui.button(
@@ -11412,7 +11432,7 @@ class HostManagerScopedHostSelect(discord.ui.Select):
             )
 
 
-class HostSearchModal(discord.ui.Modal):
+class HostManagerSearchModal(discord.ui.Modal):
     query = discord.ui.TextInput(
         label="Cari Host",
         placeholder="Username, nama, platform, atau ID host",
@@ -11795,7 +11815,7 @@ class HostManagerGuildDashboardView(discord.ui.View):
             return
 
         await interaction.response.send_modal(
-            HostSearchModal(
+            HostManagerSearchModal(
                 self.user_id,
                 self.guild_id
             )
