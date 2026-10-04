@@ -724,3 +724,126 @@ Owner harus menekan `Konfirmasi Restore`.
 ### Bukti Pembayaran Anti-Duplikat
 Bot menghitung SHA-256 dari isi file bukti pembayaran.
 Screenshot/file bukti yang sama tidak dapat digunakan pada request berbeda.
+
+## /menu DM Only
+
+`/menu` sekarang hanya membuka menu ketika dijalankan melalui DM Hi Notifku.
+
+Jika `/menu` dijalankan di channel server, bot hanya memberikan petunjuk untuk membuka DM.
+
+Alur pengguna:
+
+```text
+DM Hi Notifku
+→ /start (verifikasi support server bila diperlukan)
+→ /menu
+→ pilih server milik pengguna
+→ status FREE/PREMIUM
+→ paket / perpanjangan
+→ pembayaran
+```
+
+Di DM, bot menampilkan selector server yang dimiliki user dan yang sudah memasang Hi Notifku.
+
+`/owner` tetap menjadi panel administrasi khusus Global Owner.
+
+## Compact UI + Runtime Fix
+
+Menu utama dibuat lebih ringkas:
+- `/menu` DM: hanya pilih server + status inti
+- `/owner`: tombol dipersingkat
+- panel server: ringkasan plan/host/channel
+- panel host: status inti tanpa field duplikat
+
+Perbaikan runtime:
+- `ServerOwnerView` dipulihkan karena sebelumnya direferensikan tetapi tidak ada.
+- callback pilih server sekarang mempunyai target view yang valid.
+- static scan memastikan tidak ada custom `*View` yang direferensikan tetapi belum didefinisikan.
+
+## Production Stability Pack
+
+Fitur yang ditambahkan:
+- global slash-command error handler dengan Error ID
+- global View error handler agar tombol error tidak diam/timeout
+- defer untuk proses lambat
+- persistent tombol verifikasi `/start`
+- host search + pagination + pilih host detail
+- edit, aktif/nonaktif, dan ganti gambar QRIS
+- reference invoice `INV-YYYYMMDD-XXXXXX`
+- invoice PNG yang bisa dikirim ke user
+- payment log ke channel admin
+- optional audit webhook
+- database retention + VACUUM maintenance
+- upload QRIS restart-safe melalui SQLite
+- atomic Premium activation lock
+- proteksi double activation dan tombol transaksi lama
+- health detail untuk semua background loops
+- flag setup selesai + onboarding server baru
+- UI mobile yang lebih ringkas
+- `self_test.py` untuk cek struktur bot sebelum deploy
+
+### Variable baru
+
+```env
+PAYMENT_LOG_CHANNEL_ID=0
+AUDIT_WEBHOOK_URL=
+TRANSACTION_RETENTION_DAYS=365
+ACTIVITY_RETENTION_DAYS=90
+EXPIRED_INVOICE_RETENTION_DAYS=30
+DB_MAINTENANCE_HOURS=24
+```
+
+### Test sebelum deploy
+
+```bash
+python self_test.py
+```
+
+Hasil yang diharapkan:
+
+```text
+SELF TEST: PASS
+```
+
+## QRIS Permanent Storage
+
+QRIS sekarang tidak bergantung pada URL attachment Discord.
+
+Alur:
+
+```text
+/owner
+→ Owner
+→ Pembayaran
+→ QRIS / Ganti QRIS
+→ kirim gambar ke DM bot
+→ bot menyimpan file permanen
+```
+
+Path default QRIS berada di folder `qris` yang sejajar dengan database.
+
+Untuk Railway Volume `/data`, gunakan:
+
+```env
+DB_PATH=/data/live_notifier.db
+QRIS_STORAGE_DIR=/data/qris
+```
+
+Saat user memilih metode QRIS, bot membaca file lokal tersebut dan mengirimnya sebagai attachment Discord dengan `attachment://qris.png`/JPG/WEBP.
+
+Format yang diterima:
+- PNG
+- JPG/JPEG
+- WEBP
+- maksimal 10 MB
+
+Menghapus metode QRIS juga menghapus file QRIS terkait dari storage bot.
+
+## Standard Navigation
+
+Submenu sekarang memakai navigasi konsisten:
+
+- `⬅️ Kembali` untuk kembali ke menu induk sebelumnya.
+- `🏠 Menu Awal` untuk kembali langsung ke menu utama.
+
+Navigasi ditambahkan pada submenu user, Premium, pembayaran, server, host, plan, wizard, laporan, health, owner, security, dan restore.

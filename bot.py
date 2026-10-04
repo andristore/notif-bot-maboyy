@@ -11,6 +11,7 @@ import sqlite3
 import shutil
 from contextlib import closing
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -19,6 +20,12 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from TikTokLive import TikTokLiveClient
 from yt_dlp import YoutubeDL
+
+try:
+    from PIL import Image, ImageDraw
+except Exception:
+    Image = None
+    ImageDraw = None
 
 load_dotenv()
 
@@ -56,11 +63,22 @@ PREMIUM_GRACE_HOURS = max(0, int(os.getenv("PREMIUM_GRACE_HOURS", "24")))
 USER_RATE_LIMIT_SECONDS = max(2, int(os.getenv("USER_RATE_LIMIT_SECONDS", "5")))
 ERROR_ALERT_THRESHOLD = max(2, int(os.getenv("ERROR_ALERT_THRESHOLD", "5")))
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
+PAYMENT_LOG_CHANNEL_ID = int(os.getenv("PAYMENT_LOG_CHANNEL_ID", "0") or 0)
+AUDIT_WEBHOOK_URL = os.getenv("AUDIT_WEBHOOK_URL", "").strip()
+TRANSACTION_RETENTION_DAYS = max(30, int(os.getenv("TRANSACTION_RETENTION_DAYS", "365")))
+ACTIVITY_RETENTION_DAYS = max(7, int(os.getenv("ACTIVITY_RETENTION_DAYS", "90")))
+EXPIRED_INVOICE_RETENTION_DAYS = max(7, int(os.getenv("EXPIRED_INVOICE_RETENTION_DAYS", "30")))
+DB_MAINTENANCE_HOURS = max(6, int(os.getenv("DB_MAINTENANCE_HOURS", "24")))
 
 _db_parent = os.path.dirname(os.path.abspath(DB_PATH))
 AUTO_BACKUP_DIR = os.getenv(
     "AUTO_BACKUP_DIR",
     os.path.join(_db_parent, "backups")
+).strip()
+
+QRIS_STORAGE_DIR = os.getenv(
+    "QRIS_STORAGE_DIR",
+    os.path.join(_db_parent, "qris")
 ).strip()
 
 PREMIUM_PACKAGES_RAW = os.getenv(
@@ -575,6 +593,8 @@ def migrate_database():
                     int(time.time())
                 ))
 
+        add_column_if_missing(conn, "payment_methods", "qris_image_path", "TEXT")
+
         # Extend premium orders with manual payment proof metadata
         add_column_if_missing(conn, "premium_orders", "proof_url", "TEXT")
         add_column_if_missing(conn, "premium_orders", "proof_message_id", "INTEGER")
@@ -590,8 +610,12 @@ def migrate_database():
         add_column_if_missing(conn, "premium_orders", "owner_note", "TEXT")
         add_column_if_missing(conn, "premium_orders", "proof_hash", "TEXT")
         add_column_if_missing(conn, "premium_orders", "payment_checked_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "invoice_ref", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "processing_by", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "processing_at", "INTEGER")
 
         add_column_if_missing(conn, "guild_settings", "premium_grace_until", "INTEGER")
+        add_column_if_missing(conn, "guild_settings", "setup_completed", "INTEGER NOT NULL DEFAULT 0")
 
         if not table_exists(conn, "user_blacklist"):
             conn.execute("""
@@ -632,6 +656,22 @@ def migrate_database():
                     summary TEXT
                 )
             """)
+
+        if not table_exists(conn, "pending_uploads"):
+            conn.execute("""
+                CREATE TABLE pending_uploads (
+                    user_id INTEGER PRIMARY KEY,
+                    upload_type TEXT NOT NULL,
+                    target_id INTEGER,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_premium_orders_invoice_ref
+            ON premium_orders(invoice_ref)
+            WHERE invoice_ref IS NOT NULL
+        """)
 
         conn.commit()
         log.info("Database schema ready.")
@@ -1379,6 +1419,17 @@ async def notify_primary_owners_premium_request(
                 owner_id
             )
 
+    await send_payment_admin_log(
+        "🆕 Premium Request Baru",
+        (
+            f"Invoice: `{ensure_invoice_ref(order_id)}`\n"
+            f"Server: **{guild.name}** (`{guild.id}`)\n"
+            f"User: <@{requester.id}>\n"
+            f"Paket: **{days} hari** • **{rupiah(price)}**"
+        ),
+        guild_id=guild.id
+    )
+
     add_activity(
         guild.id,
         requester.id,
@@ -1533,7 +1584,7 @@ def payment_amount_status(order) -> str:
 
 ORDER_STATUSES = {
     "pending", "proof_submitted", "amount_mismatch",
-    "amount_verified", "paid", "active",
+    "amount_verified", "paid", "processing", "active",
     "rejected", "expired", "invoice_expired"
 }
 
@@ -1601,7 +1652,10 @@ def create_premium_order(
             deadline
         ))
         conn.commit()
-        return int(cur.lastrowid)
+        order_id = int(cur.lastrowid)
+
+    ensure_invoice_ref(order_id)
+    return order_id
 
 
 def get_premium_order(order_id: int):
@@ -1712,6 +1766,11 @@ def premium_order_embed(order):
         title=f"💳 Premium Request #{order['id']}",
         description=f"**{guild_name}**",
         color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="Invoice",
+        value=f"`{order['invoice_ref'] or ensure_invoice_ref(order['id'])}`",
+        inline=False
     )
     embed.add_field(
         name="Status",
@@ -1855,6 +1914,155 @@ def get_payment_method(method_id: int):
         ).fetchone()
 
 
+
+def ensure_qris_storage_dir() -> Path:
+    folder = Path(QRIS_STORAGE_DIR)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def qris_image_path_for_method(method_id: int, extension: str = ".png") -> Path:
+    ext = extension.lower().strip()
+
+    if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+        ext = ".png"
+
+    return ensure_qris_storage_dir() / f"qris-{int(method_id)}{ext}"
+
+
+def remove_qris_file(path_value: Optional[str]):
+    if not path_value:
+        return
+
+    try:
+        path = Path(path_value)
+        storage_root = ensure_qris_storage_dir().resolve()
+        resolved = path.resolve()
+
+        # Only remove files inside the configured QRIS storage directory.
+        if storage_root == resolved.parent and resolved.exists():
+            resolved.unlink()
+    except Exception:
+        log.exception("Gagal menghapus file QRIS lama")
+
+
+async def save_qris_attachment(method_id: int, attachment: discord.Attachment) -> str:
+    content_type = (attachment.content_type or "").lower()
+    filename = (attachment.filename or "").lower()
+
+    extension = Path(filename).suffix.lower()
+
+    if extension not in {".png", ".jpg", ".jpeg", ".webp"}:
+        if content_type == "image/png":
+            extension = ".png"
+        elif content_type in {"image/jpeg", "image/jpg"}:
+            extension = ".jpg"
+        elif content_type == "image/webp":
+            extension = ".webp"
+        else:
+            raise ValueError(
+                "File QRIS harus berupa PNG, JPG, JPEG, atau WEBP."
+            )
+
+    raw = await attachment.read()
+
+    # Basic size guard: 10 MB.
+    if len(raw) > 10 * 1024 * 1024:
+        raise ValueError("Ukuran gambar QRIS maksimal 10 MB.")
+
+    # Basic file-signature validation.
+    valid_signature = (
+        raw.startswith(b"\x89PNG\r\n\x1a\n")
+        or raw.startswith(b"\xff\xd8\xff")
+        or raw.startswith(b"RIFF") and b"WEBP" in raw[:16]
+    )
+
+    if not valid_signature:
+        raise ValueError("File tidak terdeteksi sebagai gambar QRIS yang valid.")
+
+    method = get_payment_method(method_id)
+
+    if not method:
+        raise ValueError("Metode QRIS tidak ditemukan.")
+
+    old_path = method["qris_image_path"] if "qris_image_path" in method.keys() else None
+    new_path = qris_image_path_for_method(method_id, extension)
+
+    # Replace old format/path cleanly.
+    if old_path and Path(old_path) != new_path:
+        remove_qris_file(old_path)
+
+    new_path.write_bytes(raw)
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE payment_methods
+            SET
+                qris_image_path=?,
+                qris_image_url=NULL,
+                updated_at=?
+            WHERE id=?
+        """, (
+            str(new_path),
+            int(time.time()),
+            int(method_id)
+        ))
+        conn.commit()
+
+    return str(new_path)
+
+
+def get_qris_file(method):
+    if not method or method["method_type"] != "qris":
+        return None
+
+    path_value = (
+        method["qris_image_path"]
+        if "qris_image_path" in method.keys()
+        else None
+    )
+
+    if not path_value:
+        return None
+
+    path = Path(path_value)
+
+    if not path.exists() or not path.is_file():
+        return None
+
+    extension = path.suffix.lower()
+    filename = (
+        "qris.png"
+        if extension == ".png"
+        else "qris.jpg"
+        if extension in {".jpg", ".jpeg"}
+        else "qris.webp"
+    )
+
+    return discord.File(
+        str(path),
+        filename=filename
+    )
+
+
+def apply_qris_attachment_image(embed: discord.Embed, method) -> Optional[discord.File]:
+    qris_file = get_qris_file(method)
+
+    if qris_file:
+        embed.set_image(url=f"attachment://{qris_file.filename}")
+        return qris_file
+
+    # Legacy fallback while old QRIS records are migrated/re-uploaded.
+    if (
+        method
+        and method["method_type"] == "qris"
+        and method["qris_image_url"]
+    ):
+        embed.set_image(url=method["qris_image_url"])
+
+    return None
+
+
 def add_payment_method(
     method_type: str,
     method_name: str,
@@ -1910,7 +2118,8 @@ def update_payment_method(
     account_name: Optional[str] = None,
     account_number: Optional[str] = None,
     payment_note: Optional[str] = None,
-    qris_image_url: Optional[str] = None
+    qris_image_url: Optional[str] = None,
+    qris_image_path: Optional[str] = None
 ):
     row = get_payment_method(method_id)
 
@@ -1926,6 +2135,7 @@ def update_payment_method(
                 account_number=?,
                 payment_note=?,
                 qris_image_url=?,
+                qris_image_path=?,
                 updated_at=?
             WHERE id=?
         """, (
@@ -1934,6 +2144,7 @@ def update_payment_method(
             row["account_number"] if account_number is None else (account_number.strip() or None),
             row["payment_note"] if payment_note is None else (payment_note.strip() or None),
             row["qris_image_url"] if qris_image_url is None else (qris_image_url.strip() or None),
+            row["qris_image_path"] if qris_image_path is None else (qris_image_path.strip() or None),
             int(time.time()),
             int(method_id)
         ))
@@ -1941,6 +2152,16 @@ def update_payment_method(
 
 
 def delete_payment_method(method_id: int):
+    method = get_payment_method(method_id)
+
+    if method and method["method_type"] == "qris":
+        path_value = (
+            method["qris_image_path"]
+            if "qris_image_path" in method.keys()
+            else None
+        )
+        remove_qris_file(path_value)
+
     with closing(db()) as conn:
         conn.execute(
             "DELETE FROM payment_methods WHERE id=?",
@@ -1962,8 +2183,9 @@ def payment_method_embed(method, order=None):
     if order:
         expected = int(order["expected_amount"] or order["price"])
 
+        invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
         embed.description = (
-            f"Request **#{order['id']}**\n"
+            f"Invoice **`{invoice_ref}`**\n"
             f"📅 Paket: **{order['days']} hari**\n"
             f"💰 Harga paket: **{rupiah(order['price'])}**\n"
             f"🔢 Kode unik: **{int(order['unique_code'] or 0):03d}**\n"
@@ -2017,7 +2239,17 @@ def payment_method_embed(method, order=None):
         inline=False
     )
 
-    if method["method_type"] == "qris" and method["qris_image_url"]:
+    # QRIS image is attached by apply_qris_attachment_image().
+    # Legacy remote URLs remain available as fallback.
+    if (
+        method["method_type"] == "qris"
+        and not (
+            "qris_image_path" in method.keys()
+            and method["qris_image_path"]
+            and Path(method["qris_image_path"]).exists()
+        )
+        and method["qris_image_url"]
+    ):
         embed.set_image(url=method["qris_image_url"])
 
     return embed
@@ -2041,10 +2273,19 @@ def payment_methods_overview_embed():
         kind = "QRIS" if method["method_type"] == "qris" else "Akun/Rekening"
         status = "✅ Aktif" if method["enabled"] else "⏸️ Nonaktif"
 
+        qris_path_ready = bool(
+            method["method_type"] == "qris"
+            and "qris_image_path" in method.keys()
+            and method["qris_image_path"]
+            and Path(method["qris_image_path"]).exists()
+        )
+
         detail = method["account_number"] or (
-            "Gambar QRIS tersimpan"
+            "Gambar QRIS tersimpan permanen"
+            if qris_path_ready
+            else "Gambar QRIS legacy"
             if method["qris_image_url"]
-            else "Belum lengkap"
+            else "Belum ada gambar QRIS"
         )
 
         lines.append(
@@ -2257,6 +2498,7 @@ def invoice_status_label(status: str) -> str:
         "amount_mismatch": "🔴 Nominal Tidak Sesuai",
         "amount_verified": "🟢 Nominal Sesuai",
         "paid": "🔵 Dibayar",
+        "processing": "🟣 Diproses",
         "active": "✅ Aktif",
         "rejected": "❌ Ditolak",
         "expired": "⚫ Premium Selesai",
@@ -2475,6 +2717,25 @@ def health_detail_embed():
         ),
         inline=True
     )
+    try:
+        qris_folder = ensure_qris_storage_dir()
+        qris_files = len([
+            item for item in qris_folder.iterdir()
+            if item.is_file()
+        ])
+        qris_storage_text = (
+            f"`{qris_folder}`\n"
+            f"File: **{qris_files}**"
+        )
+    except Exception as exc:
+        qris_storage_text = f"❌ {type(exc).__name__}"
+
+    embed.add_field(
+        name="QRIS Storage",
+        value=qris_storage_text,
+        inline=False
+    )
+
     embed.add_field(
         name="API",
         value=(
@@ -2517,6 +2778,18 @@ def health_detail_embed():
             value="\n".join(lines),
             inline=False
         )
+
+    embed.add_field(
+        name="Loops",
+        value=(
+            f"Monitor **{'ON' if monitor_loop.is_running() else 'OFF'}** • "
+            f"Premium **{'ON' if premium_expiry_loop.is_running() else 'OFF'}**\n"
+            f"Invoice **{'ON' if invoice_expiry_loop.is_running() else 'OFF'}** • "
+            f"Backup **{'ON' if auto_backup_loop.is_running() else 'OFF'}**\n"
+            f"Maintenance **{'ON' if db_maintenance_loop.is_running() else 'OFF'}**"
+        ),
+        inline=False
+    )
 
     return embed
 
@@ -2562,6 +2835,425 @@ def backup_preview_embed(data: dict):
     )
 
     return embed
+
+
+
+# ============================================================
+# STABILITY / INVOICE / AUDIT / MAINTENANCE
+# ============================================================
+
+async def defer_if_needed(interaction: discord.Interaction, *, ephemeral: bool = True) -> bool:
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+            return True
+    except Exception:
+        log.exception("Interaction defer gagal")
+    return False
+
+
+def make_error_id() -> str:
+    return f"E{int(time.time()) % 1000000:06d}"
+
+
+async def report_interaction_error(
+    interaction: Optional[discord.Interaction],
+    error: Exception,
+    context: str = "interaction"
+):
+    error_id = make_error_id()
+    log.error(
+        "Error ID %s | %s | %s: %s",
+        error_id,
+        context,
+        type(error).__name__,
+        error,
+        exc_info=(type(error), error, error.__traceback__)
+    )
+
+    if interaction is not None:
+        try:
+            await safe_reply(
+                interaction,
+                f"❌ Fitur gagal diproses. Error ID: `{error_id}`"
+            )
+        except Exception:
+            pass
+
+    for owner_id in primary_owner_ids():
+        try:
+            user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+            await user.send(
+                "🚨 **Hi Notifku Error** `" + error_id + "`\n"
+                "Konteks: `" + context + "`\n"
+                "`" + type(error).__name__ + ": " + str(error)[:1200] + "`"
+            )
+        except Exception:
+            pass
+
+    return error_id
+
+
+async def global_view_error(
+    self,
+    interaction: discord.Interaction,
+    error: Exception,
+    item
+):
+    await report_interaction_error(
+        interaction,
+        error,
+        context=(
+            "view:"
+            + self.__class__.__name__
+            + ":"
+            + str(getattr(item, "custom_id", None))
+        )
+    )
+
+
+discord.ui.View.on_error = global_view_error
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: discord.app_commands.AppCommandError
+):
+    original = getattr(error, "original", error)
+    await report_interaction_error(
+        interaction,
+        original,
+        context="slash_command"
+    )
+
+
+def generate_invoice_ref(order_id: int, created_at: Optional[int] = None) -> str:
+    ts = int(created_at or time.time())
+    date_part = datetime.fromtimestamp(
+        ts,
+        tz=timezone.utc
+    ).strftime("%Y%m%d")
+    return f"INV-{date_part}-{int(order_id):06d}"
+
+
+def ensure_invoice_ref(order_id: int) -> str:
+    order = get_premium_order(order_id)
+
+    if not order:
+        raise ValueError("Order tidak ditemukan.")
+
+    if order["invoice_ref"]:
+        return str(order["invoice_ref"])
+
+    ref = generate_invoice_ref(order_id, order["created_at"])
+
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE premium_orders SET invoice_ref=? WHERE id=?",
+            (ref, int(order_id))
+        )
+        conn.commit()
+
+    return ref
+
+
+def invoice_image_bytes(order) -> bytes:
+    if Image is None or ImageDraw is None:
+        raise RuntimeError("Pillow belum tersedia.")
+
+    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
+    image = Image.new("RGB", (900, 650), "white")
+    draw = ImageDraw.Draw(image)
+
+    deadline = "-"
+    if order["invoice_deadline"]:
+        deadline = datetime.fromtimestamp(
+            int(order["invoice_deadline"]),
+            tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC")
+
+    lines = [
+        ("HI NOTIFKU - PREMIUM INVOICE", 40, 35),
+        (invoice_ref, 40, 90),
+        ("Server ID: " + str(order["guild_id"]), 40, 160),
+        ("Paket: " + str(order["days"]) + " hari", 40, 210),
+        ("Harga: " + rupiah(order["price"]), 40, 260),
+        ("Kode unik: " + f"{int(order['unique_code'] or 0):03d}", 40, 310),
+        (
+            "TOTAL TRANSFER: "
+            + rupiah(int(order["expected_amount"] or order["price"])),
+            40,
+            370
+        ),
+        (
+            "Metode: " + str(order["payment_method_name"] or "Belum dipilih"),
+            40,
+            440
+        ),
+        ("Deadline: " + deadline, 40, 495),
+        ("Bayar sesuai nominal tepat. Jangan dibulatkan.", 40, 560),
+    ]
+
+    for text_value, x, y in lines:
+        draw.text((x, y), text_value, fill="black")
+
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def send_payment_admin_log(
+    title: str,
+    description: str,
+    *,
+    guild_id: Optional[int] = None
+):
+    if not PAYMENT_LOG_CHANNEL_ID:
+        return
+
+    channel = bot.get_channel(PAYMENT_LOG_CHANNEL_ID)
+    if not channel:
+        return
+
+    try:
+        embed = discord.Embed(
+            title=title,
+            description=description[:4000],
+            color=discord.Color.gold()
+        )
+        if guild_id:
+            embed.set_footer(text=f"Guild ID: {guild_id}")
+        await channel.send(embed=embed)
+    except Exception:
+        log.exception("Gagal mengirim payment log")
+
+
+async def audit_webhook(
+    action: str,
+    detail: str,
+    *,
+    actor_id: Optional[int] = None,
+    guild_id: Optional[int] = None
+):
+    if not AUDIT_WEBHOOK_URL or http is None or http.closed:
+        return
+
+    content = (
+        "🧾 **" + action + "**\n"
+        "Actor: `" + str(actor_id or "-") + "` • "
+        "Guild: `" + str(guild_id or "-") + "`\n"
+        + detail[:1500]
+    )
+
+    try:
+        async with http.post(
+            AUDIT_WEBHOOK_URL,
+            json={"content": content},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as response:
+            if response.status >= 300:
+                log.warning("Audit webhook HTTP %s", response.status)
+    except Exception:
+        log.exception("Audit webhook gagal")
+
+
+def set_pending_upload(user_id: int, upload_type: str, target_id: int):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO pending_uploads(user_id, upload_type, target_id, created_at)
+            VALUES(?,?,?,?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                upload_type=excluded.upload_type,
+                target_id=excluded.target_id,
+                created_at=excluded.created_at
+        """, (
+            int(user_id),
+            upload_type,
+            int(target_id),
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def get_pending_upload(user_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM pending_uploads WHERE user_id=?",
+            (int(user_id),)
+        ).fetchone()
+
+
+def clear_pending_upload(user_id: int):
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM pending_uploads WHERE user_id=?",
+            (int(user_id),)
+        )
+        conn.commit()
+
+
+def claim_order_for_activation(order_id: int, actor_id: int) -> bool:
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            UPDATE premium_orders
+            SET
+                status='processing',
+                processing_by=?,
+                processing_at=?,
+                updated_at=?
+            WHERE id=?
+              AND activated_at IS NULL
+              AND status IN ('amount_verified','paid')
+        """, (
+            int(actor_id),
+            now,
+            now,
+            int(order_id)
+        ))
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def release_order_claim(
+    order_id: int,
+    fallback_status: str = "amount_verified"
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE premium_orders
+            SET
+                status=?,
+                processing_by=NULL,
+                processing_at=NULL,
+                updated_at=?
+            WHERE id=?
+              AND status='processing'
+              AND activated_at IS NULL
+        """, (
+            fallback_status,
+            int(time.time()),
+            int(order_id)
+        ))
+        conn.commit()
+
+
+def order_is_actionable(order) -> bool:
+    if not order:
+        return False
+
+    if order["activated_at"]:
+        return False
+
+    if order["status"] in {
+        "active",
+        "expired",
+        "invoice_expired",
+        "rejected",
+        "processing"
+    }:
+        return False
+
+    if (
+        order["invoice_deadline"]
+        and int(order["invoice_deadline"]) <= int(time.time())
+    ):
+        return False
+
+    return True
+
+
+def set_payment_method_enabled(method_id: int, enabled: bool):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE payment_methods
+            SET enabled=?, updated_at=?
+            WHERE id=?
+        """, (
+            1 if enabled else 0,
+            int(time.time()),
+            int(method_id)
+        ))
+        conn.commit()
+
+
+def database_maintenance():
+    now = int(time.time())
+    tx_cutoff = now - TRANSACTION_RETENTION_DAYS * 86400
+    invoice_cutoff = now - EXPIRED_INVOICE_RETENTION_DAYS * 86400
+    activity_cutoff = now - ACTIVITY_RETENTION_DAYS * 86400
+
+    with closing(db()) as conn:
+        conn.execute("""
+            DELETE FROM premium_orders
+            WHERE updated_at<?
+              AND status IN ('expired','rejected')
+        """, (tx_cutoff,))
+        conn.execute("""
+            DELETE FROM premium_orders
+            WHERE updated_at<?
+              AND status='invoice_expired'
+        """, (invoice_cutoff,))
+
+        if table_exists(conn, "activity_log"):
+            activity_cols = columns(conn, "activity_log")
+            time_col = (
+                "created_at"
+                if "created_at" in activity_cols
+                else ("ts" if "ts" in activity_cols else None)
+            )
+            if time_col:
+                conn.execute(
+                    f"DELETE FROM activity_log WHERE {time_col}<?",
+                    (activity_cutoff,)
+                )
+
+        conn.execute(
+            "DELETE FROM premium_reminders WHERE sent_at<?",
+            (tx_cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM pending_uploads WHERE created_at<?",
+            (now - 86400,)
+        )
+        conn.execute("""
+            UPDATE premium_orders
+            SET
+                status=CASE
+                    WHEN amount_verified=1 THEN 'amount_verified'
+                    ELSE 'paid'
+                END,
+                processing_by=NULL,
+                processing_at=NULL,
+                updated_at=?
+            WHERE status='processing'
+              AND processing_at IS NOT NULL
+              AND processing_at<?
+              AND activated_at IS NULL
+        """, (
+            now,
+            now - 600
+        ))
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+
+
+@tasks.loop(hours=DB_MAINTENANCE_HOURS)
+async def db_maintenance_loop():
+    try:
+        await asyncio.to_thread(database_maintenance)
+        log.info("Database maintenance selesai.")
+    except Exception:
+        log.exception("Database maintenance gagal")
+
+
+@db_maintenance_loop.before_loop
+async def before_db_maintenance():
+    await bot.wait_until_ready()
 
 
 # ============================================================
@@ -2797,6 +3489,12 @@ async def log_action(
         guild_id,
         action,
         f"Actor: <@{actor_id}>\n{detail}"
+    )
+    await audit_webhook(
+        action,
+        detail,
+        actor_id=actor_id,
+        guild_id=guild_id
     )
 
 
@@ -4539,6 +5237,7 @@ class QRISNameModal(discord.ui.Modal):
 
         # Remember which QRIS method awaits image upload.
         pending_qris_uploads[interaction.user.id] = method_id
+        set_pending_upload(interaction.user.id, "qris", method_id)
 
         await safe_reply(
             interaction,
@@ -4547,6 +5246,171 @@ class QRISNameModal(discord.ui.Modal):
                 "Sekarang kirim **gambar QRIS** ke DM bot ini.\n"
                 "Gambar pertama yang kamu kirim akan dipasang ke QRIS tersebut."
             )
+        )
+
+
+
+class EditPaymentMethodModal(discord.ui.Modal):
+    method_name = discord.ui.TextInput(
+        label="Nama Metode",
+        max_length=100
+    )
+    account_name = discord.ui.TextInput(
+        label="Atas Nama",
+        max_length=100,
+        required=False
+    )
+    account_number = discord.ui.TextInput(
+        label="Nomor / Rekening",
+        max_length=100,
+        required=False
+    )
+    payment_note = discord.ui.TextInput(
+        label="Instruksi",
+        style=discord.TextStyle.paragraph,
+        max_length=1000,
+        required=False
+    )
+
+    def __init__(self, method_id: int):
+        self.method_id = int(method_id)
+        method = get_payment_method(self.method_id)
+        super().__init__(title="Edit Metode Pembayaran", timeout=300)
+
+        if method:
+            self.method_name.default = method["method_name"] or ""
+            self.account_name.default = method["account_name"] or ""
+            self.account_number.default = method["account_number"] or ""
+            self.payment_note.default = method["payment_note"] or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
+            return
+
+        update_payment_method(
+            self.method_id,
+            method_name=self.method_name.value,
+            account_name=self.account_name.value,
+            account_number=self.account_number.value,
+            payment_note=self.payment_note.value
+        )
+        await safe_reply(interaction, "✅ Metode pembayaran diperbarui.")
+
+
+class PaymentMethodAdminSelect(discord.ui.Select):
+    def __init__(self, action: str):
+        self.action = action
+        methods = list_payment_methods(False)[:25]
+
+        options = [
+            discord.SelectOption(
+                label=f"#{m['id']} • {m['method_name']}"[:100],
+                value=str(m["id"]),
+                description=(
+                    ("Aktif" if m["enabled"] else "Nonaktif")
+                    + " • "
+                    + ("QRIS" if m["method_type"] == "qris" else "Rekening/E-Wallet")
+                )[:100]
+            )
+            for m in methods
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Tidak ada metode",
+                    value="0"
+                )
+            ]
+
+        super().__init__(
+            placeholder="Pilih metode pembayaran...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
+            return
+
+        method_id = int(self.values[0])
+
+        if method_id == 0:
+            await safe_reply(interaction, "Belum ada metode pembayaran.")
+            return
+
+        method = get_payment_method(method_id)
+
+        if not method:
+            await safe_reply(interaction, "❌ Metode tidak ditemukan.")
+            return
+
+        if self.action == "edit":
+            await interaction.response.send_modal(
+                EditPaymentMethodModal(method_id)
+            )
+            return
+
+        if self.action == "toggle":
+            set_payment_method_enabled(
+                method_id,
+                not bool(method["enabled"])
+            )
+            await safe_reply(
+                interaction,
+                "✅ Status metode pembayaran diperbarui."
+            )
+
+            return
+
+        if self.action == "qris":
+            if method["method_type"] != "qris":
+                await safe_reply(
+                    interaction,
+                    "❌ Metode yang dipilih bukan QRIS."
+                )
+                return
+
+            pending_qris_uploads[interaction.user.id] = method_id
+            set_pending_upload(
+                interaction.user.id,
+                "qris",
+                method_id
+            )
+            await safe_reply(
+                interaction,
+                "📎 Kirim gambar QRIS baru ke DM bot ini."
+            )
+
+
+class PaymentMethodAdminSelectView(discord.ui.View):
+    def __init__(self, action: str):
+        super().__init__(timeout=300)
+        self.add_item(PaymentMethodAdminSelect(action))
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=payment_methods_overview_embed(),
+            view=PaymentSettingsView()
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
         )
 
 
@@ -4593,7 +5457,7 @@ class PaymentSettingsView(discord.ui.View):
         super().__init__(timeout=900)
 
     @discord.ui.button(
-        label="Tambah Rekening / E-Wallet",
+        label="Rekening",
         emoji="🏦",
         style=discord.ButtonStyle.success,
         row=0
@@ -4608,7 +5472,7 @@ class PaymentSettingsView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Tambah QRIS",
+        label="QRIS",
         emoji="🧾",
         style=discord.ButtonStyle.success,
         row=0
@@ -4623,7 +5487,52 @@ class PaymentSettingsView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Hapus Metode",
+        label="Edit",
+        emoji="✏️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def edit_method(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
+            return
+        await interaction.response.edit_message(
+            embed=payment_methods_overview_embed(),
+            view=PaymentMethodAdminSelectView("edit")
+        )
+
+    @discord.ui.button(
+        label="Aktif / Nonaktif",
+        emoji="⏯️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def toggle_method(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
+            return
+        await interaction.response.edit_message(
+            embed=payment_methods_overview_embed(),
+            view=PaymentMethodAdminSelectView("toggle")
+        )
+
+    @discord.ui.button(
+        label="Ganti QRIS",
+        emoji="🖼️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def replace_qris(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
+            return
+        await interaction.response.edit_message(
+            embed=payment_methods_overview_embed(),
+            view=PaymentMethodAdminSelectView("qris")
+        )
+
+    @discord.ui.button(
+        label="Hapus",
         emoji="🗑️",
         style=discord.ButtonStyle.danger,
         row=1
@@ -4672,6 +5581,18 @@ class PaymentSettingsView(discord.ui.View):
         await interaction.response.edit_message(
             embed=embed,
             view=OwnerManagementView()
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
         )
 
 
@@ -4859,7 +5780,7 @@ def start_verify_embed(user_id: int, verified: bool):
 
 class StartVerifyView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
 
         if REQUIRED_GUILD_INVITE:
             self.add_item(
@@ -4874,7 +5795,8 @@ class StartVerifyView(discord.ui.View):
     @discord.ui.button(
         label="Verifikasi Join",
         emoji="✅",
-        style=discord.ButtonStyle.success
+        style=discord.ButtonStyle.success,
+        custom_id="hi_notifku:start_verify"
     )
     async def verify_join(
         self,
@@ -5102,6 +6024,22 @@ class DMUserGuildPickerView(discord.ui.View):
             )
         )
 
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(self.user_id, 0)
+        )
+
 
 def dm_menu_home_embed(user_id: int):
     guilds = user_owned_guilds(user_id)
@@ -5123,6 +6061,22 @@ def dm_menu_home_embed(user_id: int):
     )
     embed.set_footer(text="/menu • Hi Notifku")
     return embed
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(self.user_id, 0)
+        )
 
 
 class UserServerMenuView(discord.ui.View):
@@ -5158,6 +6112,36 @@ class UserServerMenuView(discord.ui.View):
 
             button.callback = package_callback
             self.add_item(button)
+
+        back = discord.ui.Button(
+            label="Kembali",
+            emoji="⬅️",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+        back.callback = self.back
+        self.add_item(back)
+
+        home = discord.ui.Button(
+            label="Menu Awal",
+            emoji="🏠",
+            style=discord.ButtonStyle.secondary,
+            row=4
+        )
+        home.callback = self.home
+        self.add_item(home)
+
+    async def back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            view=DMUserGuildPickerView(interaction.user.id, 0)
+        )
+
+    async def home(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            view=DMUserGuildPickerView(interaction.user.id, 0)
+        )
 
     async def request_package(
         self,
@@ -5296,16 +6280,66 @@ class PaymentMethodSelect(discord.ui.Select):
         order = get_premium_order(self.order_id)
         method = get_payment_method(method_id)
 
-        await interaction.response.edit_message(
-            embed=payment_method_embed(method, order),
-            view=PaymentConfirmView(self.order_id)
-        )
+        embed = payment_method_embed(method, order)
+        qris_file = apply_qris_attachment_image(embed, method)
+
+        if qris_file:
+            await interaction.response.edit_message(
+                embed=embed,
+                attachments=[qris_file],
+                view=PaymentConfirmView(self.order_id)
+            )
+        else:
+            await interaction.response.edit_message(
+                embed=embed,
+                attachments=[],
+                view=PaymentConfirmView(self.order_id)
+            )
 
 
 class PaymentMethodSelectView(discord.ui.View):
     def __init__(self, order_id: int):
         super().__init__(timeout=900)
+        self.order_id = int(order_id)
         self.add_item(PaymentMethodSelect(order_id))
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+
+        if not order:
+            await safe_reply(interaction, "❌ Request tidak ditemukan.")
+            return
+
+        guild = bot.get_guild(int(order["guild_id"]))
+
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            attachments=[],
+            view=UserServerMenuView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            attachments=[],
+            view=DMUserGuildPickerView(interaction.user.id, 0)
+        )
 
 
 class PaymentConfirmView(discord.ui.View):
@@ -5354,6 +6388,84 @@ class PaymentConfirmView(discord.ui.View):
                 f"Metode: **{order['payment_method_name']}**\n"
                 "Kirim gambar/screenshot pembayaran sebagai attachment."
             )
+        )
+
+    @discord.ui.button(
+        label="Invoice",
+        emoji="🧾",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def invoice(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+
+        if not order or int(order["requester_id"]) != interaction.user.id:
+            await safe_reply(interaction, "❌ Invoice tidak ditemukan.")
+            return
+
+        await defer_if_needed(interaction, ephemeral=True)
+
+        try:
+            image_bytes = await asyncio.to_thread(
+                invoice_image_bytes,
+                order
+            )
+            invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
+            await interaction.followup.send(
+                content=f"🧾 `{invoice_ref}`",
+                file=discord.File(
+                    io.BytesIO(image_bytes),
+                    filename=f"{invoice_ref}.png"
+                ),
+                ephemeral=True
+            )
+        except Exception as exc:
+            await report_interaction_error(
+                interaction,
+                exc,
+                context="invoice_image"
+            )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+
+        if not order:
+            await safe_reply(interaction, "❌ Request tidak ditemukan.")
+            return
+
+        embed = discord.Embed(
+            title=f"💳 Pilih Metode Pembayaran • #{self.order_id}",
+            description=(
+                f"📅 Paket: **{order['days']} hari**\n"
+                f"💰 Harga: **{rupiah(order['price'])}**\n"
+                f"💳 Transfer tepat: **{rupiah(int(order['expected_amount'] or order['price']))}**"
+            ),
+            color=discord.Color.gold()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            attachments=[],
+            view=PaymentMethodSelectView(self.order_id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(interaction.user.id),
+            attachments=[],
+            view=DMUserGuildPickerView(interaction.user.id, 0)
         )
 
 
@@ -5481,6 +6593,30 @@ class ServerBrowserView(discord.ui.View):
             view=ServerBrowserView(0, "")
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 
 
@@ -5531,6 +6667,30 @@ def plan_overview_embed():
     embed.set_footer(text="Pilihan submenu dibuat abu-abu agar lebih rapi.")
     return embed
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class PlanOverviewView(discord.ui.View):
     def __init__(self):
@@ -5575,6 +6735,18 @@ class PlanOverviewView(discord.ui.View):
 
     @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
             view=OwnerHomeView()
@@ -5689,6 +6861,18 @@ def owner_dashboard_embed():
     embed.set_footer(text="Gunakan tombol submenu untuk melihat detail.")
     return embed
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class PremiumOrderSelect(discord.ui.Select):
     def __init__(self):
@@ -5776,6 +6960,17 @@ class PremiumOrdersView(discord.ui.View):
             view=OwnerHomeView()
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
 
 
 class RejectPremiumModal(discord.ui.Modal):
@@ -5874,41 +7069,75 @@ class OwnerOrderNoteModal(discord.ui.Modal):
 class PremiumOrderManageView(discord.ui.View):
     def __init__(self, order_id: int):
         super().__init__(timeout=900)
-        self.order_id = order_id
+        self.order_id = int(order_id)
 
-    @discord.ui.button(label="Cek Nominal Transfer", emoji="🔢", style=discord.ButtonStyle.primary)
-    async def check_amount(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def get_actionable(
+        self,
+        interaction: discord.Interaction,
+        *,
+        require_verified: bool = False,
+        require_proof: bool = False
+    ):
         if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
-            return
+            await safe_reply(
+                interaction,
+                "❌ Akses Payment Admin diperlukan."
+            )
+            return None
 
         order = get_premium_order(self.order_id)
 
         if not order:
             await safe_reply(interaction, "❌ Request tidak ditemukan.")
-            return
-        if order["invoice_deadline"] and int(order["invoice_deadline"]) <= int(time.time()):
+            return None
+
+        if not order_is_actionable(order):
             await safe_reply(
                 interaction,
-                "⌛ Invoice sudah kedaluwarsa. User harus membuat request baru."
+                "ℹ️ Request sudah diproses, kedaluwarsa, atau tidak aktif."
             )
-            return
+            return None
 
+        if require_proof and not order["proof_url"]:
+            await safe_reply(interaction, "❌ Bukti pembayaran belum dikirim.")
+            return None
+
+        if require_verified and not int(order["amount_verified"] or 0):
+            await safe_reply(
+                interaction,
+                "❌ Nominal transfer belum dinyatakan sesuai."
+            )
+            return None
+
+        return order
+
+    @discord.ui.button(
+        label="Cek Nominal",
+        emoji="🔢",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def check_amount(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = await self.get_actionable(interaction)
+        if not order:
+            return
 
         await interaction.response.send_modal(
             ReceivedAmountModal(self.order_id)
         )
 
-    @discord.ui.button(label="Tandai Dibayar", emoji="💵", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="Dibayar",
+        emoji="💵",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
     async def mark_paid(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
-            return
-
-        order = get_premium_order(self.order_id)
-
-        if not order or order["status"] not in {"pending", "proof_submitted", "amount_mismatch", "amount_verified", "paid"}:
-            await safe_reply(interaction, "❌ Request sudah tidak dapat diproses.")
+        order = await self.get_actionable(
+            interaction,
+            require_verified=True
+        )
+        if not order:
             return
 
         update_order_status(
@@ -5918,251 +7147,198 @@ class PremiumOrderManageView(discord.ui.View):
         )
 
         add_activity(
-            order["guild_id"],
+            int(order["guild_id"]),
             interaction.user.id,
             "Premium Payment",
-            f"Order #{self.order_id} ditandai dibayar."
+            f"{order['invoice_ref'] or ensure_invoice_ref(order['id'])} dibayar."
         )
 
-        order = get_premium_order(self.order_id)
-
-        await notify_order_user(
-            order,
-            (
-                f"💵 Pembayaran request Premium **#{self.order_id}** "
-                "sudah ditandai diterima.\n"
-                "Status: **Dibayar**. Menunggu aktivasi owner."
-            )
+        await audit_webhook(
+            "Payment Marked Paid",
+            order["invoice_ref"] or ensure_invoice_ref(order["id"]),
+            actor_id=interaction.user.id,
+            guild_id=int(order["guild_id"])
         )
 
-        await interaction.response.edit_message(
-            embed=premium_order_embed(order),
-            view=PremiumOrderManageView(self.order_id)
+        await safe_reply(
+            interaction,
+            "✅ Pembayaran ditandai **Dibayar**."
         )
 
-    @discord.ui.button(label="Terima Bukti & Aktifkan", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(
+        label="Terima & Aktif",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        row=0
+    )
     async def approve_payment(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
-            return
-
-        order = get_premium_order(self.order_id)
-
+        order = await self.get_actionable(
+            interaction,
+            require_verified=True,
+            require_proof=True
+        )
         if not order:
-            await safe_reply(interaction, "❌ Request tidak ditemukan.")
-            return
-        if order["invoice_deadline"] and int(order["invoice_deadline"]) <= int(time.time()):
-            await safe_reply(
-                interaction,
-                "⌛ Invoice sudah kedaluwarsa. User harus membuat request baru."
-            )
             return
 
-
-        if not order["proof_url"]:
-            await safe_reply(
-                interaction,
-                "❌ Belum ada bukti pembayaran untuk request ini."
-            )
-            return
-
-        if not int(order["amount_verified"] or 0):
-            await safe_reply(
-                interaction,
-                (
-                    "❌ Nominal transfer belum dinyatakan **SESUAI**.\n"
-                    "Tekan **Cek Nominal Transfer** dan masukkan nominal "
-                    "yang benar-benar masuk terlebih dahulu."
-                )
-            )
-            return
-
-        guild_id = int(order["guild_id"])
-        existing = get_guild_settings(guild_id)
-        extend = existing["plan"] == "premium"
-
-        set_plan(
-            guild_id,
-            "premium",
-            duration_days=int(order["days"]),
-            extend=extend
-        )
-
-        settings = get_guild_settings(guild_id)
-        expires_at = int(settings["premium_expires_at"]) if settings["premium_expires_at"] else None
-
-        update_order_status(
+        if not claim_order_for_activation(
             self.order_id,
-            "active",
-            processed_by=interaction.user.id,
-            activated_at=int(time.time()),
-            expires_at=expires_at
-        )
-
-        add_activity(
-            guild_id,
-            interaction.user.id,
-            "Payment Approved",
-            f"Order #{self.order_id} diterima dan Premium diaktifkan."
-        )
-
-        msg = (
-            f"✅ Bukti pembayaran request **#{self.order_id}** diterima.\\n"
-            f"⭐ Premium sudah aktif selama **{order['days']} hari**.\\n"
-            f"Berakhir: {premium_expiry_text(guild_id)}"
-        )
-
-        await notify_order_user(order, msg)
-
-        guild = bot.get_guild(guild_id)
-        if guild:
-            await dm_guild_owner(guild, msg)
-
-        order = get_premium_order(self.order_id)
-
-        await interaction.response.edit_message(
-            embed=premium_order_embed(order),
-            view=PremiumOrderManageView(self.order_id)
-        )
-
-    @discord.ui.button(label="Aktifkan Premium", emoji="⭐", style=discord.ButtonStyle.success)
-    async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
-            return
-
-        order = get_premium_order(self.order_id)
-
-        if not order or order["status"] not in {"pending", "proof_submitted", "amount_mismatch", "amount_verified", "paid"}:
-            await safe_reply(interaction, "❌ Request sudah tidak dapat diproses.")
-            return
-
-        if not int(order["amount_verified"] or 0):
+            interaction.user.id
+        ):
             await safe_reply(
                 interaction,
-                (
-                    "❌ Cek nominal transfer terlebih dahulu. "
-                    "Premium hanya dapat diaktifkan jika nominal **SESUAI**."
-                )
+                "⏳ Request sedang atau sudah diproses owner lain."
             )
             return
 
-        guild_id = int(order["guild_id"])
-        existing = get_guild_settings(guild_id)
-        extend = existing["plan"] == "premium"
+        await defer_if_needed(interaction, ephemeral=True)
 
-        set_plan(
-            guild_id,
-            "premium",
-            duration_days=int(order["days"]),
-            extend=extend
-        )
+        try:
+            guild_id = int(order["guild_id"])
+            existing = get_guild_settings(guild_id)
+            extend = existing["plan"] == "premium"
 
-        settings = get_guild_settings(guild_id)
-        expires_at = int(settings["premium_expires_at"]) if settings["premium_expires_at"] else None
-
-        update_order_status(
-            self.order_id,
-            "active",
-            processed_by=interaction.user.id,
-            activated_at=int(time.time()),
-            expires_at=expires_at
-        )
-
-        add_activity(
-            guild_id,
-            interaction.user.id,
-            "Premium Activated",
-            (
-                f"Order #{self.order_id}; {order['days']} hari; "
-                f"{rupiah(order['price'])}; extend={extend}"
+            set_plan(
+                guild_id,
+                "premium",
+                duration_days=int(order["days"]),
+                extend=extend
             )
-        )
 
-        guild = bot.get_guild(guild_id)
+            settings = get_guild_settings(guild_id)
+            expires_at = (
+                int(settings["premium_expires_at"])
+                if settings["premium_expires_at"]
+                else None
+            )
 
-        msg = (
-            f"⭐ Premium request **#{self.order_id}** sudah aktif.\n"
-            f"📅 Paket: **{order['days']} hari**\n"
-            f"💰 Harga: **{rupiah(order['price'])}**\n"
-            f"Berakhir: {premium_expiry_text(guild_id)}"
-        )
+            update_order_status(
+                self.order_id,
+                "active",
+                processed_by=interaction.user.id,
+                activated_at=int(time.time()),
+                expires_at=expires_at
+            )
 
-        await notify_order_user(order, msg)
+            invoice_ref = (
+                order["invoice_ref"]
+                or ensure_invoice_ref(order["id"])
+            )
 
-        if guild:
-            await dm_guild_owner(guild, msg)
+            add_activity(
+                guild_id,
+                interaction.user.id,
+                "Premium Activated",
+                f"{invoice_ref}; {order['days']} hari."
+            )
 
-        order = get_premium_order(self.order_id)
+            await audit_webhook(
+                "Premium Activated",
+                invoice_ref,
+                actor_id=interaction.user.id,
+                guild_id=guild_id
+            )
 
-        await interaction.response.edit_message(
-            embed=premium_order_embed(order),
-            view=PremiumOrderManageView(self.order_id)
-        )
+            await send_payment_admin_log(
+                "✅ Premium Aktif",
+                (
+                    f"Invoice: `{invoice_ref}`\n"
+                    f"Paket: **{order['days']} hari**\n"
+                    f"Nominal: **{rupiah(int(order['expected_amount'] or order['price']))}**"
+                ),
+                guild_id=guild_id
+            )
 
-    @discord.ui.button(label="Tolak", emoji="✖️", style=discord.ButtonStyle.danger)
+            msg = (
+                f"✅ Pembayaran `{invoice_ref}` diterima.\n"
+                f"⭐ Premium aktif **{order['days']} hari**.\n"
+                f"Berakhir: {premium_expiry_text(guild_id)}"
+            )
+
+            await notify_order_user(order, msg)
+
+            guild = bot.get_guild(guild_id)
+            if guild:
+                await dm_guild_owner(guild, msg)
+
+            await interaction.followup.send(
+                "✅ Premium berhasil diaktifkan.",
+                ephemeral=True
+            )
+
+        except Exception as exc:
+            release_order_claim(self.order_id)
+            await report_interaction_error(
+                interaction,
+                exc,
+                context="premium_activation"
+            )
+
+    @discord.ui.button(
+        label="Tolak",
+        emoji="✖️",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
+        order = await self.get_actionable(interaction)
+        if not order:
             return
 
         await interaction.response.send_modal(
             RejectPremiumModal(self.order_id)
         )
 
-
-    @discord.ui.button(label="Catatan", emoji="📝", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="Catatan",
+        emoji="📝",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
     async def owner_note(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
+            await safe_reply(
+                interaction,
+                "❌ Akses Payment Admin diperlukan."
+            )
             return
 
         await interaction.response.send_modal(
             OwnerOrderNoteModal(self.order_id)
         )
 
-    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         counts = premium_order_counts()
+
         await interaction.response.edit_message(
             embed=discord.Embed(
-                title="💳 Permintaan Premium",
+                title="💳 Request Premium",
                 description=(
-                    f"🟡 Pending: **{counts['pending']}**\n"
-                    f"🔵 Dibayar: **{counts['paid']}**"
+                    f"Pending **{counts['pending']}** • "
+                    f"Bukti **{counts.get('proof_submitted', 0)}** • "
+                    f"Dibayar **{counts['paid']}**"
                 ),
                 color=discord.Color.gold()
             ),
             view=PremiumOrdersView()
         )
 
-
-def transaction_history_embed():
-    rows = list_transaction_history(15)
-
-    embed = discord.Embed(
-        title="🧾 Riwayat Premium",
-        color=discord.Color.blue()
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
     )
-
-    if not rows:
-        embed.description = "Belum ada transaksi Premium."
-        return embed
-
-    lines = []
-
-    for row in rows:
-        guild = bot.get_guild(int(row["guild_id"]))
-        guild_name = guild.name if guild else str(row["guild_id"])
-        lines.append(
-            f"**#{row['id']} • {guild_name}**\n"
-            f"{order_status_label(row['status'])} • "
-            f"{row['days']} hari • {rupiah(row['price'])}\n"
-            f"<t:{row['created_at']}:R>"
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
         )
-
-    embed.description = "\n\n".join(lines)[:4000]
-    return embed
 
 
 class TransactionHistoryView(discord.ui.View):
@@ -6178,6 +7354,18 @@ class TransactionHistoryView(discord.ui.View):
 
     @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
             view=OwnerHomeView()
@@ -6219,6 +7407,18 @@ def revenue_embed():
     )
     return embed
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class RevenueReportView(discord.ui.View):
     def __init__(self):
@@ -6256,6 +7456,18 @@ class RevenueReportView(discord.ui.View):
             view=OwnerHomeView()
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class HealthDetailView(discord.ui.View):
     def __init__(self):
@@ -6275,6 +7487,18 @@ class HealthDetailView(discord.ui.View):
             view=OwnerHomeView()
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class OwnerDashboardView(discord.ui.View):
     def __init__(self):
@@ -6289,6 +7513,18 @@ class OwnerDashboardView(discord.ui.View):
 
     @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
             view=OwnerHomeView()
@@ -6685,19 +7921,31 @@ class AdvancedSecurityView(discord.ui.View):
             view=OwnerManagementView()
         )
 
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class OwnerManagementView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
 
-    @discord.ui.button(label="Tambah Owner", emoji="➕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Tambah", emoji="➕", style=discord.ButtonStyle.success, row=0)
     async def add_owner(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
             await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
             return
         await interaction.response.send_modal(OwnerIdModal("add"))
 
-    @discord.ui.button(label="Hapus Owner", emoji="➖", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Hapus", emoji="➖", style=discord.ButtonStyle.danger, row=0)
     async def remove_owner(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
             await safe_reply(interaction, "❌ Hanya OWNER_IDS utama.")
@@ -6705,9 +7953,10 @@ class OwnerManagementView(discord.ui.View):
         await interaction.response.send_modal(OwnerIdModal("remove"))
 
     @discord.ui.button(
-        label="Harga Premium",
+        label="Harga",
         emoji="💰",
-        style=discord.ButtonStyle.secondary
+        style=discord.ButtonStyle.secondary,
+        row=1
     )
     async def premium_prices(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
@@ -6729,9 +7978,10 @@ class OwnerManagementView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Pembayaran Premium",
+        label="Pembayaran",
         emoji="💳",
-        style=discord.ButtonStyle.secondary
+        style=discord.ButtonStyle.secondary,
+        row=1
     )
     async def payment_settings(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
@@ -6747,9 +7997,10 @@ class OwnerManagementView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Keamanan & Role",
+        label="Keamanan",
         emoji="🛡️",
-        style=discord.ButtonStyle.secondary
+        style=discord.ButtonStyle.secondary,
+        row=2
     )
     async def security_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
@@ -6771,8 +8022,20 @@ class OwnerManagementView(discord.ui.View):
             view=AdvancedSecurityView()
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
             view=OwnerHomeView()
@@ -6852,6 +8115,18 @@ class PlanListView(discord.ui.View):
             view=OwnerHomeView()
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=plan_overview_embed(),
+            view=PlanOverviewView()
+        )
+
 
 class PlanServerManageView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -6892,6 +8167,14 @@ class PlanServerManageView(discord.ui.View):
         )
         open_server.callback = self.open_server
         self.add_item(open_server)
+
+        back = discord.ui.Button(
+            label="Kembali",
+            emoji="⬅️",
+            style=discord.ButtonStyle.secondary
+        )
+        back.callback = self.back
+        self.add_item(back)
 
         home = discord.ui.Button(
             label="Menu Awal",
@@ -6963,6 +8246,17 @@ class PlanServerManageView(discord.ui.View):
                 embed=server_embed(guild),
                 view=ServerOwnerView(self.guild_id)
             )
+
+    async def back(self, interaction: discord.Interaction):
+        guild = bot.get_guild(self.guild_id)
+
+        if guild:
+            await interaction.response.edit_message(
+                embed=server_embed(guild),
+                view=ServerOwnerView(self.guild_id)
+            )
+        else:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
 
     async def home(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
@@ -7132,6 +8426,192 @@ class ServerOwnerView(discord.ui.View):
             view=OwnerHomeView()
         )
 
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🔎 Browser Server",
+                description=f"Total server: **{len(bot.guilds)}**",
+                color=discord.Color.blue()
+            ),
+            view=ServerBrowserView(0, "")
+        )
+
+
+class HostSearchModal(discord.ui.Modal):
+    query = discord.ui.TextInput(
+        label="Host ID / Username / Channel ID",
+        placeholder="Contoh: 12 / creator123 / UC...",
+        max_length=120
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__(title="Cari Host", timeout=300)
+        self.guild_id = int(guild_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🔎 Host",
+                description=f"Hasil untuk `{self.query.value.strip()}`",
+                color=discord.Color.blue()
+            ),
+            view=HostBrowserView(
+                self.guild_id,
+                page=0,
+                query=self.query.value.strip()
+            )
+        )
+
+
+class HostAdminSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, page: int = 0, query: str = ""):
+        self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+        self.query = query.strip().lower()
+
+        hosts = list(get_hosts(self.guild_id))
+
+        if self.query:
+            hosts = [
+                h for h in hosts
+                if self.query in str(h["id"]).lower()
+                or self.query in str(h["target"]).lower()
+                or self.query in str(h["display_name"] or "").lower()
+            ]
+
+        start = self.page * 25
+        current = hosts[start:start + 25]
+
+        options = [
+            discord.SelectOption(
+                label=(
+                    f"#{h['id']} • "
+                    f"{'TikTok' if h['platform']=='tiktok' else 'YouTube'} • "
+                    f"{h['target']}"
+                )[:100],
+                value=str(h["id"]),
+                description=host_status_text(h)[:100]
+            )
+            for h in current
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Tidak ada host",
+                    value="0"
+                )
+            ]
+
+        super().__init__(
+            placeholder=f"Pilih host • Halaman {self.page + 1}",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return
+
+        host_id = int(self.values[0])
+
+        if host_id == 0:
+            await safe_reply(interaction, "Host tidak ditemukan.")
+            return
+
+        host = get_host(host_id)
+
+        if not host or int(host["guild_id"]) != self.guild_id:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_embed(host),
+            view=HostCardView(self.guild_id, host_id)
+        )
+
+
+class HostBrowserView(discord.ui.View):
+    def __init__(self, guild_id: int, page: int = 0, query: str = ""):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+        self.query = query
+        self.add_item(
+            HostAdminSelect(
+                self.guild_id,
+                self.page,
+                self.query
+            )
+        )
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            view=HostBrowserView(
+                self.guild_id,
+                max(0, self.page - 1),
+                self.query
+            )
+        )
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        hosts = list(get_hosts(self.guild_id))
+
+        if self.query:
+            q = self.query.lower()
+            hosts = [
+                h for h in hosts
+                if q in str(h["id"]).lower()
+                or q in str(h["target"]).lower()
+                or q in str(h["display_name"] or "").lower()
+            ]
+
+        max_page = max(0, (len(hosts) - 1) // 25)
+
+        await interaction.response.edit_message(
+            view=HostBrowserView(
+                self.guild_id,
+                min(max_page, self.page + 1),
+                self.query
+            )
+        )
+
+    @discord.ui.button(label="Cari", emoji="🔎", style=discord.ButtonStyle.secondary, row=1)
+    async def search(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            HostSearchModal(self.guild_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="📡 Host",
+                description=f"Total **{len(get_hosts(self.guild_id))}** host.",
+                color=discord.Color.blue()
+            ),
+            view=HostMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 class HostMenuView(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -7154,41 +8634,20 @@ class HostMenuView(discord.ui.View):
             BulkImportModal(self.guild_id)
         )
 
-    @discord.ui.button(label="Daftar", emoji="📋", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Host", emoji="📋", style=discord.ButtonStyle.primary)
     async def list_hosts_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await require_global_owner(interaction):
             return
 
-        rows = get_hosts(self.guild_id)
-
-        if not rows:
-            await safe_reply(interaction, "Belum ada host.")
-            return
-
-        lines = []
-        for host in rows[:20]:
-            lines.append(
-                f"**#{host['id']}** • "
-                f"{'🎵' if host['platform']=='tiktok' else '📺'} "
-                f"`{host['target']}` • {host_status_text(host)}"
-            )
-
-        if len(rows) > 20:
-            lines.append(f"… +{len(rows)-20} host lainnya")
-
-        embed = discord.Embed(
-            title="📋 Daftar Host",
-            description="\n".join(lines),
-            color=discord.Color.blue()
-        )
-        embed.set_footer(
-            text="Gunakan ID host dari daftar untuk pengelolaan detail."
-        )
-
         await interaction.response.edit_message(
-            embed=embed,
-            view=HostMenuView(self.guild_id)
+            embed=discord.Embed(
+                title="📋 Browser Host",
+                description=f"Total **{len(get_hosts(self.guild_id))}** host.",
+                color=discord.Color.blue()
+            ),
+            view=HostBrowserView(self.guild_id)
         )
+
 
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -7322,11 +8781,49 @@ class WizardView(discord.ui.View):
     @discord.ui.button(label="Selesai", emoji="✅", style=discord.ButtonStyle.success, row=1)
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = bot.get_guild(self.guild_id)
+
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE guild_settings SET setup_completed=1 WHERE guild_id=?",
+                (self.guild_id,)
+            )
+            conn.commit()
+
         if guild:
             await interaction.response.edit_message(
                 embed=server_embed(guild),
                 view=ServerOwnerView(self.guild_id)
             )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = bot.get_guild(self.guild_id)
+
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=server_embed(guild),
+            view=ServerOwnerView(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
 
 
 class HostCardView(discord.ui.View):
@@ -7704,6 +9201,20 @@ class RestoreConfirmView(discord.ui.View):
             view=None
         )
 
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pending_restore_previews.pop(self.actor_id, None)
+        await interaction.response.edit_message(
+            content=None,
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
 
 # ============================================================
 # ONE GLOBAL SLASH COMMAND
@@ -7909,6 +9420,12 @@ async def owner_command(interaction: discord.Interaction):
             view=OwnerHomeView()
         )
 
+        await audit_webhook(
+            "Owner Panel Opened",
+            "Global owner membuka panel /owner.",
+            actor_id=interaction.user.id
+        )
+
         await safe_reply(
             interaction,
             "✅ Panel khusus Owner sudah dikirim ke DM kamu."
@@ -8034,23 +9551,45 @@ async def on_message(message: discord.Message):
                             owner_id
                         )
 
-                await message.channel.send(
+                invoice_ref = (
+                    updated_order["invoice_ref"]
+                    or ensure_invoice_ref(updated_order["id"])
+                )
+
+                await send_payment_admin_log(
+                    "📎 Bukti Pembayaran Baru",
                     (
-                        f"✅ Bukti pembayaran untuk request **#{order['id']}** "
-                        "sudah diterima dan diteruskan ke owner.\n"
-                        "Tunggu owner memverifikasi pembayaran."
-                    )
+                        f"Invoice: `{invoice_ref}`\n"
+                        f"User: <@{message.author.id}>\n"
+                        f"Nominal wajib: **{rupiah(int(updated_order['expected_amount'] or updated_order['price']))}**"
+                    ),
+                    guild_id=int(updated_order["guild_id"])
+                )
+
+                await message.channel.send(
+                    f"✅ Bukti `{invoice_ref}` sudah diterima. Tunggu verifikasi owner."
                 )
                 return
 
         if is_global_owner(message.author.id):
             # QRIS image upload flow.
-            if message.author.id in pending_qris_uploads and message.attachments:
-                method_id = pending_qris_uploads[message.author.id]
+            pending_upload = get_pending_upload(message.author.id)
+            pending_method_id = (
+                pending_qris_uploads.get(message.author.id)
+                or (
+                    int(pending_upload["target_id"])
+                    if pending_upload and pending_upload["upload_type"] == "qris"
+                    else None
+                )
+            )
+
+            if pending_method_id and message.attachments:
+                method_id = int(pending_method_id)
                 method = get_payment_method(method_id)
 
                 if not method:
                     pending_qris_uploads.pop(message.author.id, None)
+                    clear_pending_upload(message.author.id)
                     await message.channel.send(
                         "❌ Data QRIS tidak ditemukan. Silakan ulangi dari `/owner`."
                     )
@@ -8072,21 +9611,49 @@ async def on_message(message: discord.Message):
                     )
                     return
 
-                update_payment_method(
-                    method_id,
-                    qris_image_url=attachment.url
-                )
+                try:
+                    stored_path = await save_qris_attachment(
+                        method_id,
+                        attachment
+                    )
+                except ValueError as exc:
+                    await message.channel.send(
+                        f"❌ {exc}"
+                    )
+                    return
+                except Exception as exc:
+                    log.exception("Gagal menyimpan gambar QRIS permanen")
+                    await message.channel.send(
+                        f"❌ Gagal menyimpan gambar QRIS: `{type(exc).__name__}`"
+                    )
+                    return
 
                 pending_qris_uploads.pop(message.author.id, None)
+                clear_pending_upload(message.author.id)
 
                 method = get_payment_method(method_id)
 
                 embed = payment_method_embed(method)
                 embed.title = f"✅ QRIS #{method_id} Tersimpan"
-
-                await message.channel.send(
-                    embed=embed
+                embed.description = (
+                    f"Gambar disimpan permanen di storage bot.\n"
+                    f"`{stored_path}`"
                 )
+
+                qris_file = apply_qris_attachment_image(
+                    embed,
+                    method
+                )
+
+                if qris_file:
+                    await message.channel.send(
+                        embed=embed,
+                        file=qris_file
+                    )
+                else:
+                    await message.channel.send(
+                        embed=embed
+                    )
                 return
 
             if await handle_backup_attachment(message):
@@ -8167,6 +9734,26 @@ async def on_guild_join(guild: discord.Guild):
                     allowed_mentions=discord.AllowedMentions(users=True)
                 )
 
+        try:
+            owner_user = guild.owner or await guild.fetch_member(guild.owner_id)
+            await owner_user.send(
+                "👋 **Setup Hi Notifku**\n"
+                "Gunakan `/start` lalu `/menu` di DM bot. "
+                "Global Owner dapat menjalankan `/owner` → pilih server → **Wizard**."
+            )
+        except Exception:
+            pass
+
+        for owner_id in primary_owner_ids():
+            try:
+                global_owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                await global_owner.send(
+                    f"🆕 Server baru: **{guild.name}** (`{guild.id}`). "
+                    "Buka `/owner` untuk menjalankan Wizard setup."
+                )
+            except Exception:
+                pass
+
     except Exception:
         log.exception("on_guild_join error")
 
@@ -8192,6 +9779,11 @@ async def on_ready():
         bot.user,
         bot.user.id
     )
+    try:
+        bot.add_view(StartVerifyView())
+    except Exception:
+        log.exception("Persistent verify view gagal didaftarkan")
+
 
     # Sync exactly four global slash commands: /ping, /start, /menu and /owner.
     try:
@@ -8214,6 +9806,8 @@ async def on_ready():
 
     if not invoice_expiry_loop.is_running():
         invoice_expiry_loop.start()
+    if not db_maintenance_loop.is_running():
+        db_maintenance_loop.start()
 
 
 # ============================================================
@@ -8237,3 +9831,17 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pending_restore_previews.pop(self.actor_id, None)
+        await interaction.response.edit_message(
+            content=None,
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
