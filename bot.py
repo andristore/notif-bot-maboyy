@@ -12,6 +12,7 @@ import shutil
 from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 import aiohttp
@@ -62,6 +63,11 @@ INVOICE_EXPIRE_MINUTES = max(10, int(os.getenv("INVOICE_EXPIRE_MINUTES", "60")))
 PREMIUM_GRACE_HOURS = max(0, int(os.getenv("PREMIUM_GRACE_HOURS", "24")))
 USER_RATE_LIMIT_SECONDS = max(2, int(os.getenv("USER_RATE_LIMIT_SECONDS", "5")))
 ERROR_ALERT_THRESHOLD = max(2, int(os.getenv("ERROR_ALERT_THRESHOLD", "5")))
+AUTO_PAUSE_ERRORS = max(ERROR_ALERT_THRESHOLD, int(os.getenv("AUTO_PAUSE_ERRORS", "20")))
+NOTIFICATION_SEND_CONCURRENCY = max(1, min(10, int(os.getenv("NOTIFICATION_SEND_CONCURRENCY", "3"))))
+NOTIFICATION_MIN_DELAY_MS = max(0, min(5000, int(os.getenv("NOTIFICATION_MIN_DELAY_MS", "250"))))
+EVENT_RETENTION_DAYS = max(7, int(os.getenv("EVENT_RETENTION_DAYS", "30")))
+USE_AUTO_SHARDING = os.getenv("USE_AUTO_SHARDING", "false").strip().lower() in {"1", "true", "yes", "on"}
 BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0") or 0)
 PAYMENT_LOG_CHANNEL_ID = int(os.getenv("PAYMENT_LOG_CHANNEL_ID", "0") or 0)
 AUDIT_WEBHOOK_URL = os.getenv("AUDIT_WEBHOOK_URL", "").strip()
@@ -128,7 +134,11 @@ log = logging.getLogger("hi-notifku")
 intents = discord.Intents.default()
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = (
+    commands.AutoShardedBot(command_prefix="!", intents=intents)
+    if USE_AUTO_SHARDING
+    else commands.Bot(command_prefix="!", intents=intents)
+)
 
 http: Optional[aiohttp.ClientSession] = None
 STARTED_AT = int(time.time())
@@ -138,6 +148,16 @@ pending_qris_uploads = {}
 
 user_action_cooldowns = {}
 pending_restore_previews = {}
+
+notification_send_semaphore = asyncio.Semaphore(NOTIFICATION_SEND_CONCURRENCY)
+runtime_metrics = {
+    "notifications_sent": 0,
+    "notifications_failed": 0,
+    "notifications_queued": 0,
+    "checker_runs": 0,
+    "checker_errors": 0,
+    "last_loop_lag_ms": 0.0,
+}
 
 
 
@@ -617,6 +637,25 @@ def migrate_database():
         add_column_if_missing(conn, "guild_settings", "premium_grace_until", "INTEGER")
         add_column_if_missing(conn, "guild_settings", "setup_completed", "INTEGER NOT NULL DEFAULT 0")
 
+        add_column_if_missing(conn, "guild_settings", "maintenance_mode", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing(conn, "guild_settings", "timezone", "TEXT DEFAULT 'Asia/Jakarta'")
+        add_column_if_missing(conn, "guild_settings", "language", "TEXT DEFAULT 'id'")
+        add_column_if_missing(conn, "guild_settings", "feature_flags", "TEXT")
+
+        add_column_if_missing(conn, "hosts", "extra_channel_ids", "TEXT")
+        add_column_if_missing(conn, "hosts", "extra_role_ids", "TEXT")
+        add_column_if_missing(conn, "hosts", "schedule_days", "TEXT DEFAULT '0,1,2,3,4,5,6'")
+        add_column_if_missing(conn, "hosts", "quiet_start", "TEXT")
+        add_column_if_missing(conn, "hosts", "quiet_end", "TEXT")
+        add_column_if_missing(conn, "hosts", "timezone", "TEXT")
+        add_column_if_missing(conn, "hosts", "language", "TEXT")
+        add_column_if_missing(conn, "hosts", "webhook_url", "TEXT")
+        add_column_if_missing(conn, "hosts", "mention_everyone", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing(conn, "hosts", "embed_title", "TEXT")
+        add_column_if_missing(conn, "hosts", "embed_footer", "TEXT")
+        add_column_if_missing(conn, "hosts", "embed_color", "INTEGER")
+        add_column_if_missing(conn, "hosts", "auto_pause_threshold", "INTEGER")
+
         if not table_exists(conn, "user_blacklist"):
             conn.execute("""
                 CREATE TABLE user_blacklist (
@@ -666,6 +705,80 @@ def migrate_database():
                     created_at INTEGER NOT NULL
                 )
             """)
+
+        if not table_exists(conn, "notification_history"):
+            conn.execute("""
+                CREATE TABLE notification_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    host_id INTEGER,
+                    event_type TEXT,
+                    event_key TEXT,
+                    channel_id INTEGER,
+                    message_id INTEGER,
+                    status TEXT NOT NULL,
+                    latency_ms INTEGER,
+                    source_url TEXT,
+                    title TEXT,
+                    content TEXT,
+                    embed_json TEXT,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+
+        if not table_exists(conn, "notification_events"):
+            conn.execute("""
+                CREATE TABLE notification_events (
+                    host_id INTEGER NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_type TEXT,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(host_id, event_key)
+                )
+            """)
+
+        if not table_exists(conn, "pending_notifications"):
+            conn.execute("""
+                CREATE TABLE pending_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    host_id INTEGER NOT NULL,
+                    event_type TEXT,
+                    event_key TEXT,
+                    content TEXT,
+                    embed_json TEXT NOT NULL,
+                    source_url TEXT,
+                    release_after INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+
+        if not table_exists(conn, "api_usage"):
+            conn.execute("""
+                CREATE TABLE api_usage (
+                    day TEXT NOT NULL,
+                    service TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    calls INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(day, service, endpoint)
+                )
+            """)
+
+        if not table_exists(conn, "config_snapshots"):
+            conn.execute("""
+                CREATE TABLE config_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    reason TEXT,
+                    payload TEXT NOT NULL
+                )
+            """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_notification_history_guild
+            ON notification_history(guild_id, created_at DESC)
+        """)
 
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_premium_orders_invoice_ref
@@ -1157,18 +1270,31 @@ def set_host_health(
                 cooldown_seconds = min(1800, 60 * (2 ** min(errors - 3, 4)))
                 cooldown = now + cooldown_seconds
 
+            threshold_row = conn.execute(
+                "SELECT auto_pause_threshold FROM hosts WHERE id=?",
+                (host_id,)
+            ).fetchone()
+
+            pause_threshold = int(
+                (threshold_row["auto_pause_threshold"] if threshold_row else None)
+                or AUTO_PAUSE_ERRORS
+            )
+            auto_disable = errors >= pause_threshold
+
             conn.execute("""
                 UPDATE hosts SET
                     last_check=?,
                     last_error=?,
                     error_count=?,
-                    cooldown_until=?
+                    cooldown_until=?,
+                    enabled=CASE WHEN ? THEN 0 ELSE enabled END
                 WHERE id=?
             """, (
                 now,
                 (error or "Unknown error")[:1000],
                 errors,
                 cooldown,
+                1 if auto_disable else 0,
                 host_id
             ))
 
@@ -2791,6 +2917,18 @@ def health_detail_embed():
         inline=False
     )
 
+    embed.add_field(
+        name="Runtime Metrics",
+        value=(
+            f"Notif sent **{runtime_metrics['notifications_sent']}** • "
+            f"failed **{runtime_metrics['notifications_failed']}**\n"
+            f"Queued **{runtime_metrics['notifications_queued']}** • "
+            f"checker errors **{runtime_metrics['checker_errors']}**\n"
+            f"Event-loop lag **{runtime_metrics['last_loop_lag_ms']} ms**"
+        ),
+        inline=False
+    )
+
     return embed
 
 
@@ -3219,6 +3357,19 @@ def database_maintenance():
             "DELETE FROM pending_uploads WHERE created_at<?",
             (now - 86400,)
         )
+        notifier_cutoff = now - EVENT_RETENTION_DAYS * 86400
+        conn.execute(
+            "DELETE FROM notification_history WHERE created_at<?",
+            (notifier_cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM notification_events WHERE created_at<?",
+            (notifier_cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM config_snapshots WHERE created_at<?",
+            (now - max(30, TRANSACTION_RETENTION_DAYS) * 86400,)
+        )
         conn.execute("""
             UPDATE premium_orders
             SET
@@ -3413,30 +3564,625 @@ def notification_target(host):
     return channel_id, role_id
 
 
-async def send_notification(
-    host,
-    embed: discord.Embed,
-    content_override: Optional[str] = None
-):
-    channel_id, role_id = notification_target(host)
-    channel = await resolve_channel(channel_id)
 
-    if not channel:
+# ============================================================
+# NOTIFIER PRO
+# ============================================================
+
+DEFAULT_FEATURE_FLAGS = {
+    "tiktok_live": True,
+    "tiktok_post": True,
+    "youtube_live": True,
+    "live_end": True,
+}
+
+
+def parse_id_csv(value: Optional[str]) -> list[int]:
+    if not value:
+        return []
+
+    result = []
+    for raw in str(value).replace(";", ",").split(","):
+        raw = raw.strip()
+        if raw.isdigit():
+            number = int(raw)
+            if number not in result:
+                result.append(number)
+    return result[:20]
+
+
+def feature_flags_for_guild(guild_id: int) -> dict:
+    settings = get_guild_settings(guild_id)
+    flags = dict(DEFAULT_FEATURE_FLAGS)
+
+    raw = settings["feature_flags"]
+    if raw:
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                for key in flags:
+                    if key in loaded:
+                        flags[key] = bool(loaded[key])
+        except Exception:
+            pass
+
+    return flags
+
+
+def feature_enabled(guild_id: int, feature: str) -> bool:
+    return feature_flags_for_guild(guild_id).get(feature, True)
+
+
+def set_feature_flags(guild_id: int, enabled_names: list[str]):
+    allowed = set(DEFAULT_FEATURE_FLAGS)
+    enabled = {x.strip().lower() for x in enabled_names}
+    payload = {
+        key: key in enabled
+        for key in allowed
+    }
+
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
+            (json.dumps(payload), int(guild_id))
+        )
+        conn.commit()
+
+
+def set_guild_notifier_settings(
+    guild_id: int,
+    *,
+    timezone_name: Optional[str] = None,
+    language: Optional[str] = None,
+    maintenance_mode: Optional[bool] = None
+):
+    ensure_guild(guild_id)
+    current = get_guild_settings(guild_id)
+
+    tz = timezone_name if timezone_name is not None else current["timezone"]
+    lang = language if language is not None else current["language"]
+    maintenance = (
+        int(bool(maintenance_mode))
+        if maintenance_mode is not None
+        else int(current["maintenance_mode"] or 0)
+    )
+
+    try:
+        ZoneInfo(tz or "Asia/Jakarta")
+    except Exception:
+        raise ValueError("Timezone tidak valid. Contoh: Asia/Jakarta")
+
+    lang = (lang or "id").lower()
+    if lang not in {"id", "en"}:
+        lang = "id"
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE guild_settings
+            SET timezone=?, language=?, maintenance_mode=?
+            WHERE guild_id=?
+        """, (
+            tz or "Asia/Jakarta",
+            lang,
+            maintenance,
+            int(guild_id)
+        ))
+        conn.commit()
+
+
+def host_timezone(host) -> ZoneInfo:
+    tz_name = host["timezone"] if "timezone" in host.keys() else None
+    if not tz_name:
+        settings = get_guild_settings(int(host["guild_id"]))
+        tz_name = settings["timezone"] or "Asia/Jakarta"
+
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Asia/Jakarta")
+
+
+def host_schedule_allowed(host, now_ts: Optional[int] = None) -> bool:
+    now_dt = datetime.fromtimestamp(
+        int(now_ts or time.time()),
+        tz=host_timezone(host)
+    )
+
+    raw_days = (
+        host["schedule_days"]
+        if "schedule_days" in host.keys()
+        else None
+    ) or "0,1,2,3,4,5,6"
+
+    days = {
+        int(x)
+        for x in raw_days.split(",")
+        if x.strip().isdigit() and 0 <= int(x) <= 6
+    }
+
+    return not days or now_dt.weekday() in days
+
+
+def _parse_hhmm(value: Optional[str]):
+    if not value or ":" not in value:
+        return None
+    try:
+        hh, mm = value.split(":", 1)
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return hh, mm
+    except Exception:
+        pass
+    return None
+
+
+def host_quiet_now(host, now_ts: Optional[int] = None) -> bool:
+    start = _parse_hhmm(host["quiet_start"] if "quiet_start" in host.keys() else None)
+    end = _parse_hhmm(host["quiet_end"] if "quiet_end" in host.keys() else None)
+
+    if not start or not end or start == end:
         return False
 
-    content_parts = []
+    now_dt = datetime.fromtimestamp(
+        int(now_ts or time.time()),
+        tz=host_timezone(host)
+    )
+    current = now_dt.hour * 60 + now_dt.minute
+    s = start[0] * 60 + start[1]
+    e = end[0] * 60 + end[1]
 
-    if role_id:
-        content_parts.append(f"<@&{role_id}>")
+    if s < e:
+        return s <= current < e
+    return current >= s or current < e
+
+
+def quiet_release_timestamp(host, now_ts: Optional[int] = None) -> int:
+    now_dt = datetime.fromtimestamp(
+        int(now_ts or time.time()),
+        tz=host_timezone(host)
+    )
+    end = _parse_hhmm(host["quiet_end"] if "quiet_end" in host.keys() else None)
+
+    if not end:
+        return int(now_dt.timestamp())
+
+    release = now_dt.replace(
+        hour=end[0],
+        minute=end[1],
+        second=0,
+        microsecond=0
+    )
+
+    if release <= now_dt:
+        from datetime import timedelta
+        release = release + timedelta(days=1)
+
+    return int(release.timestamp())
+
+
+def reserve_notification_event(
+    host_id: int,
+    event_key: Optional[str],
+    event_type: str
+) -> bool:
+    if not event_key:
+        return True
+
+    try:
+        with closing(db()) as conn:
+            conn.execute("""
+                INSERT INTO notification_events(
+                    host_id, event_key, event_type, created_at
+                )
+                VALUES(?,?,?,?)
+            """, (
+                int(host_id),
+                str(event_key)[:300],
+                event_type[:80],
+                int(time.time())
+            ))
+            conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def record_notification_history(
+    *,
+    guild_id: int,
+    host_id: Optional[int],
+    event_type: str,
+    event_key: Optional[str],
+    channel_id: Optional[int],
+    message_id: Optional[int],
+    status: str,
+    latency_ms: Optional[int],
+    source_url: Optional[str],
+    title: Optional[str],
+    content: Optional[str],
+    embed: Optional[discord.Embed]
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO notification_history(
+                guild_id, host_id, event_type, event_key,
+                channel_id, message_id, status, latency_ms,
+                source_url, title, content, embed_json, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            int(guild_id),
+            int(host_id) if host_id is not None else None,
+            event_type[:80],
+            event_key[:300] if event_key else None,
+            int(channel_id) if channel_id else None,
+            int(message_id) if message_id else None,
+            status[:40],
+            int(latency_ms) if latency_ms is not None else None,
+            source_url[:1000] if source_url else None,
+            title[:250] if title else None,
+            content[:2000] if content else None,
+            json.dumps(embed.to_dict(), ensure_ascii=False) if embed else None,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def notification_stats(guild_id: int) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency
+            FROM notification_history
+            WHERE guild_id=?
+        """, (int(guild_id),)).fetchone()
+
+        top = conn.execute("""
+            SELECT host_id, COUNT(*) AS total
+            FROM notification_history
+            WHERE guild_id=? AND status='sent'
+            GROUP BY host_id
+            ORDER BY total DESC
+            LIMIT 1
+        """, (int(guild_id),)).fetchone()
+
+    return {
+        "total": int(row["total"] or 0),
+        "sent": int(row["sent"] or 0),
+        "failed": int(row["failed"] or 0),
+        "queued": int(row["queued"] or 0),
+        "avg_latency": int(row["avg_latency"] or 0),
+        "top_host": (
+            f"#{top['host_id']} ({top['total']} notif)"
+            if top else "-"
+        ),
+    }
+
+
+def recent_notifications(guild_id: int, limit: int = 25):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM notification_history
+            WHERE guild_id=?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (
+            int(guild_id),
+            max(1, min(100, int(limit)))
+        )).fetchall()
+
+
+def get_notification_record(record_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM notification_history WHERE id=?",
+            (int(record_id),)
+        ).fetchone()
+
+
+def record_api_call(service: str, endpoint: str):
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO api_usage(day, service, endpoint, calls)
+            VALUES(?,?,?,1)
+            ON CONFLICT(day, service, endpoint)
+            DO UPDATE SET calls=calls+1
+        """, (
+            day,
+            service[:40],
+            endpoint[:80]
+        ))
+        conn.commit()
+
+
+def api_usage_today():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT service, endpoint, calls
+            FROM api_usage
+            WHERE day=?
+            ORDER BY service, endpoint
+        """, (day,)).fetchall()
+
+
+def host_delivery_channels(host) -> list[int]:
+    primary, _ = notification_target(host)
+    result = []
+
+    if primary:
+        result.append(int(primary))
+
+    if "extra_channel_ids" in host.keys():
+        for channel_id in parse_id_csv(host["extra_channel_ids"]):
+            if channel_id not in result:
+                result.append(channel_id)
+
+    return result[:10]
+
+
+def host_mention_roles(host) -> list[int]:
+    _, primary_role = notification_target(host)
+    result = []
+
+    if primary_role:
+        result.append(int(primary_role))
+
+    if "extra_role_ids" in host.keys():
+        for role_id in parse_id_csv(host["extra_role_ids"]):
+            if role_id not in result:
+                result.append(role_id)
+
+    return result[:10]
+
+
+def apply_host_embed_branding(host, embed: discord.Embed):
+    if "embed_title" in host.keys() and host["embed_title"]:
+        embed.title = str(host["embed_title"])[:256]
+
+    if "embed_footer" in host.keys() and host["embed_footer"]:
+        embed.set_footer(text=str(host["embed_footer"])[:2048])
+
+    if "embed_color" in host.keys() and host["embed_color"]:
+        try:
+            embed.color = discord.Color(int(host["embed_color"]))
+        except Exception:
+            pass
+
+
+def queue_quiet_notification(
+    host,
+    embed: discord.Embed,
+    content: Optional[str],
+    event_type: str,
+    event_key: Optional[str],
+    source_url: Optional[str]
+):
+    release_after = quiet_release_timestamp(host)
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO pending_notifications(
+                guild_id, host_id, event_type, event_key,
+                content, embed_json, source_url,
+                release_after, created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (
+            int(host["guild_id"]),
+            int(host["id"]),
+            event_type[:80],
+            event_key[:300] if event_key else None,
+            content[:2000] if content else None,
+            json.dumps(embed.to_dict(), ensure_ascii=False),
+            source_url[:1000] if source_url else None,
+            release_after,
+            int(time.time())
+        ))
+        conn.commit()
+
+    runtime_metrics["notifications_queued"] += 1
+
+    record_notification_history(
+        guild_id=int(host["guild_id"]),
+        host_id=int(host["id"]),
+        event_type=event_type,
+        event_key=event_key,
+        channel_id=None,
+        message_id=None,
+        status="queued",
+        latency_ms=None,
+        source_url=source_url,
+        title=embed.title,
+        content=content,
+        embed=embed
+    )
+
+
+async def _deliver_notification_now(
+    host,
+    embed: discord.Embed,
+    content_override: Optional[str],
+    *,
+    event_type: str,
+    event_key: Optional[str],
+    source_url: Optional[str]
+) -> bool:
+    apply_host_embed_branding(host, embed)
+
+    role_ids = host_mention_roles(host)
+    content_parts = [f"<@&{rid}>" for rid in role_ids]
+
+    allow_everyone = bool(
+        host["mention_everyone"]
+        if "mention_everyone" in host.keys()
+        else 0
+    )
+
+    if allow_everyone:
+        content_parts.append("@everyone")
 
     if content_override:
         content_parts.append(content_override)
 
     content = "\n".join(content_parts) if content_parts else None
+    success_any = False
+    start_ts = time.perf_counter()
+
+    # Optional webhook replaces the primary-channel delivery. Extra channels still receive normal sends.
+    webhook_url = (
+        str(host["webhook_url"]).strip()
+        if "webhook_url" in host.keys() and host["webhook_url"]
+        else ""
+    )
+
+    channels = host_delivery_channels(host)
+    primary_channel = channels[0] if channels else None
+
+    if webhook_url and http is not None and not http.closed:
+        try:
+            webhook = discord.Webhook.from_url(
+                webhook_url,
+                session=http
+            )
+            async with notification_send_semaphore:
+                await webhook.send(
+                    content=content,
+                    embed=embed,
+                    username="Hi Notifku",
+                    allowed_mentions=discord.AllowedMentions(
+                        roles=True,
+                        users=False,
+                        everyone=allow_everyone
+                    ),
+                    wait=True
+                )
+                if NOTIFICATION_MIN_DELAY_MS:
+                    await asyncio.sleep(NOTIFICATION_MIN_DELAY_MS / 1000)
+            success_any = True
+            runtime_metrics["notifications_sent"] += 1
+            latency = int((time.perf_counter() - start_ts) * 1000)
+            record_notification_history(
+                guild_id=int(host["guild_id"]),
+                host_id=int(host["id"]),
+                event_type=event_type,
+                event_key=event_key,
+                channel_id=None,
+                message_id=None,
+                status="sent",
+                latency_ms=latency,
+                source_url=source_url,
+                title=embed.title,
+                content=content,
+                embed=embed
+            )
+        except Exception:
+            runtime_metrics["notifications_failed"] += 1
+            log.exception("Webhook notification gagal host_id=%s", host["id"])
+
+        if primary_channel in channels:
+            channels = channels[1:]
+
+    for channel_id in channels:
+        channel = await resolve_channel(channel_id)
+
+        if not channel:
+            runtime_metrics["notifications_failed"] += 1
+            record_notification_history(
+                guild_id=int(host["guild_id"]),
+                host_id=int(host["id"]),
+                event_type=event_type,
+                event_key=event_key,
+                channel_id=channel_id,
+                message_id=None,
+                status="failed",
+                latency_ms=None,
+                source_url=source_url,
+                title=embed.title,
+                content=content,
+                embed=embed
+            )
+            continue
+
+        try:
+            async with notification_send_semaphore:
+                message = await channel.send(
+                    content=content,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        roles=True,
+                        users=False,
+                        everyone=allow_everyone
+                    )
+                )
+                if NOTIFICATION_MIN_DELAY_MS:
+                    await asyncio.sleep(NOTIFICATION_MIN_DELAY_MS / 1000)
+
+            success_any = True
+            runtime_metrics["notifications_sent"] += 1
+            latency = int((time.perf_counter() - start_ts) * 1000)
+            record_notification_history(
+                guild_id=int(host["guild_id"]),
+                host_id=int(host["id"]),
+                event_type=event_type,
+                event_key=event_key,
+                channel_id=channel_id,
+                message_id=int(message.id),
+                status="sent",
+                latency_ms=latency,
+                source_url=source_url,
+                title=embed.title,
+                content=content,
+                embed=embed
+            )
+        except Exception:
+            runtime_metrics["notifications_failed"] += 1
+            log.exception(
+                "Delivery gagal host_id=%s channel_id=%s",
+                host["id"],
+                channel_id
+            )
+            record_notification_history(
+                guild_id=int(host["guild_id"]),
+                host_id=int(host["id"]),
+                event_type=event_type,
+                event_key=event_key,
+                channel_id=channel_id,
+                message_id=None,
+                status="failed",
+                latency_ms=None,
+                source_url=source_url,
+                title=embed.title,
+                content=content,
+                embed=embed
+            )
+
+    return success_any
+
+
+async def resend_notification_record(record_id: int) -> bool:
+    row = get_notification_record(record_id)
+
+    if not row or not row["channel_id"] or not row["embed_json"]:
+        return False
+
+    channel = await resolve_channel(int(row["channel_id"]))
+    if not channel:
+        return False
 
     try:
+        embed = discord.Embed.from_dict(
+            json.loads(row["embed_json"])
+        )
         await channel.send(
-            content=content,
+            content=row["content"],
             embed=embed,
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
@@ -3445,12 +4191,322 @@ async def send_notification(
             )
         )
         return True
-    except discord.Forbidden:
-        log.error("Forbidden kirim ke channel=%s", channel_id)
+    except Exception:
+        log.exception("Resend notification gagal id=%s", record_id)
         return False
-    except discord.HTTPException as exc:
-        log.error("Discord HTTP error: %s", exc)
-        return False
+
+
+def create_config_snapshot(guild_id: int, reason: str = "manual") -> int:
+    payload = export_guild_backup(int(guild_id))
+
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            INSERT INTO config_snapshots(
+                guild_id, created_at, reason, payload
+            )
+            VALUES(?,?,?,?)
+        """, (
+            int(guild_id),
+            int(time.time()),
+            reason[:200],
+            json.dumps(payload, ensure_ascii=False)
+        ))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def latest_config_snapshot(guild_id: int):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM config_snapshots
+            WHERE guild_id=?
+            ORDER BY id DESC
+            LIMIT 1
+        """, (int(guild_id),)).fetchone()
+
+
+def clone_notifier_config(source_guild_id: int, target_guild_id: int):
+    source_cfg = get_config(source_guild_id)
+    source_settings = get_guild_settings(source_guild_id)
+    source_hosts = get_hosts(source_guild_id)
+
+    ensure_guild(target_guild_id)
+    create_config_snapshot(target_guild_id, "before clone")
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE guild_config
+            SET youtube_channel_id=?, tiktok_channel_id=?,
+                mention_role_id=?, log_channel_id=?
+            WHERE guild_id=?
+        """, (
+            source_cfg["youtube_channel_id"],
+            source_cfg["tiktok_channel_id"],
+            source_cfg["mention_role_id"],
+            source_cfg["log_channel_id"],
+            int(target_guild_id)
+        ))
+
+        conn.execute("""
+            UPDATE guild_settings
+            SET timezone=?, language=?, feature_flags=?
+            WHERE guild_id=?
+        """, (
+            source_settings["timezone"],
+            source_settings["language"],
+            source_settings["feature_flags"],
+            int(target_guild_id)
+        ))
+        conn.commit()
+
+    for host in source_hosts:
+        try:
+            add_host(
+                target_guild_id,
+                host["platform"],
+                host["target"],
+                host["display_name"],
+                host["extra"]
+            )
+        except ValueError:
+            break
+
+        with closing(db()) as conn:
+            row = conn.execute("""
+                SELECT id FROM hosts
+                WHERE guild_id=? AND platform=? AND target=?
+            """, (
+                int(target_guild_id),
+                host["platform"],
+                host["target"]
+            )).fetchone()
+
+            if row:
+                conn.execute("""
+                    UPDATE hosts SET
+                        channel_id=?, role_id=?,
+                        extra_channel_ids=?, extra_role_ids=?,
+                        check_interval=?, notify_live_end=?,
+                        custom_live_message=?, custom_post_message=?,
+                        custom_end_message=?, schedule_days=?,
+                        quiet_start=?, quiet_end=?, timezone=?,
+                        language=?, webhook_url=?, mention_everyone=?,
+                        embed_title=?, embed_footer=?, embed_color=?,
+                        auto_pause_threshold=?
+                    WHERE id=?
+                """, (
+                    host["channel_id"],
+                    host["role_id"],
+                    host["extra_channel_ids"],
+                    host["extra_role_ids"],
+                    host["check_interval"],
+                    host["notify_live_end"],
+                    host["custom_live_message"],
+                    host["custom_post_message"],
+                    host["custom_end_message"],
+                    host["schedule_days"],
+                    host["quiet_start"],
+                    host["quiet_end"],
+                    host["timezone"],
+                    host["language"],
+                    host["webhook_url"],
+                    host["mention_everyone"],
+                    host["embed_title"],
+                    host["embed_footer"],
+                    host["embed_color"],
+                    host["auto_pause_threshold"],
+                    row["id"]
+                ))
+                conn.commit()
+
+
+def host_csv_bytes(guild_id: int) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "platform", "target", "display_name", "enabled",
+        "check_interval", "channel_id", "role_id",
+        "extra_channel_ids", "extra_role_ids",
+        "schedule_days", "quiet_start", "quiet_end",
+        "timezone", "language"
+    ])
+
+    for host in get_hosts(guild_id):
+        writer.writerow([
+            host["platform"],
+            host["target"],
+            host["display_name"] or "",
+            host["enabled"],
+            host["check_interval"],
+            host["channel_id"] or "",
+            host["role_id"] or "",
+            host["extra_channel_ids"] or "",
+            host["extra_role_ids"] or "",
+            host["schedule_days"] or "",
+            host["quiet_start"] or "",
+            host["quiet_end"] or "",
+            host["timezone"] or "",
+            host["language"] or "",
+        ])
+
+    return output.getvalue().encode("utf-8-sig")
+
+
+def diagnostics_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🩺 Diagnostics • {guild.name}",
+        color=discord.Color.green()
+    )
+
+    hosts = get_hosts(guild.id)
+    problems = []
+    checked = set()
+
+    for host in hosts:
+        for channel_id in host_delivery_channels(host):
+            if channel_id in checked:
+                continue
+            checked.add(channel_id)
+
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                problems.append(f"❌ Channel `{channel_id}` tidak ditemukan")
+                continue
+
+            perms = channel.permissions_for(guild.me)
+            missing = []
+
+            if not perms.view_channel:
+                missing.append("View")
+            if not perms.send_messages:
+                missing.append("Send")
+            if not perms.embed_links:
+                missing.append("Embed")
+
+            if missing:
+                problems.append(
+                    f"⚠️ <#{channel_id}>: " + ", ".join(missing)
+                )
+
+    embed.add_field(
+        name="Server",
+        value=(
+            f"Host **{len(hosts)}** • "
+            f"Plan **{get_guild_settings(guild.id)['plan'].upper()}**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Permission",
+        value=(
+            "\n".join(problems[:20])
+            if problems
+            else "✅ Channel yang dikonfigurasi siap digunakan."
+        ),
+        inline=False
+    )
+
+    flags = feature_flags_for_guild(guild.id)
+    embed.add_field(
+        name="Feature Flags",
+        value=" • ".join(
+            f"{'✅' if enabled else '⛔'} {name}"
+            for name, enabled in flags.items()
+        ),
+        inline=False
+    )
+
+    return embed
+
+
+def notifier_stats_embed(guild_id: int) -> discord.Embed:
+    stats = notification_stats(guild_id)
+    usage = api_usage_today()
+
+    embed = discord.Embed(
+        title="📈 Statistik Notifikasi",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Delivery",
+        value=(
+            f"✅ **{stats['sent']}** terkirim\n"
+            f"❌ **{stats['failed']}** gagal\n"
+            f"⏳ **{stats['queued']}** pernah antre"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Latency",
+        value=f"Rata-rata **{stats['avg_latency']} ms**",
+        inline=True
+    )
+    embed.add_field(
+        name="Host Teraktif",
+        value=stats["top_host"],
+        inline=True
+    )
+
+    usage_text = "\n".join(
+        f"{row['service']} `{row['endpoint']}`: **{row['calls']} call**"
+        for row in usage[:12]
+    ) or "Belum ada panggilan API hari ini."
+
+    embed.add_field(
+        name="API Usage Hari Ini",
+        value=usage_text,
+        inline=False
+    )
+    embed.set_footer(
+        text="API usage adalah jumlah request lokal, bukan unit quota resmi Google."
+    )
+    return embed
+
+
+async def send_notification(
+    host,
+    embed: discord.Embed,
+    content_override: Optional[str] = None,
+    *,
+    event_type: str = "notification",
+    event_key: Optional[str] = None,
+    source_url: Optional[str] = None,
+    dedupe: bool = True
+):
+    if dedupe and event_key:
+        if not reserve_notification_event(
+            int(host["id"]),
+            event_key,
+            event_type
+        ):
+            log.info(
+                "Duplicate event ditahan host_id=%s event_key=%s",
+                host["id"],
+                event_key
+            )
+            return True
+
+    if host_quiet_now(host):
+        queue_quiet_notification(
+            host,
+            embed,
+            content_override,
+            event_type,
+            event_key,
+            source_url
+        )
+        return True
+
+    return await _deliver_notification_now(
+        host,
+        embed,
+        content_override,
+        event_type=event_type,
+        event_key=event_key,
+        source_url=source_url
+    )
 
 
 async def send_activity_to_discord(
@@ -3503,6 +4559,8 @@ async def log_action(
 # ============================================================
 
 async def yt_api(endpoint: str, params: dict):
+    record_api_call("youtube", endpoint)
+
     if not YOUTUBE_API_KEY:
         raise RuntimeError("YOUTUBE_API_KEY belum diisi.")
 
@@ -3668,7 +4726,14 @@ async def check_youtube_live(host):
             platform="YouTube"
         )
 
-        await send_notification(host, embed, custom)
+        await send_notification(
+            host,
+            embed,
+            custom,
+            event_type="youtube_live",
+            event_key=f"youtube:live:{channel_id}:{video_id}",
+            source_url=url
+        )
 
     update_live_state(
         host["guild_id"],
@@ -3677,6 +4742,151 @@ async def check_youtube_live(host):
         True,
         video_id
     )
+
+
+
+def _tiktok_live_fallback_sync(username: str):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 15,
+    }
+
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                f"https://www.tiktok.com/@{username}/live",
+                download=False
+            )
+    except Exception:
+        return None
+
+    if not info:
+        return None
+
+    is_live = bool(
+        info.get("is_live")
+        or info.get("live_status") == "is_live"
+    )
+
+    if not is_live:
+        return None
+
+    return {
+        "id": str(info.get("id") or username),
+        "title": info.get("title") or f"@{username} LIVE",
+        "url": info.get("webpage_url")
+        or f"https://www.tiktok.com/@{username}/live"
+    }
+
+
+async def check_tiktok_live_fallback(host):
+    username = host["target"].lstrip("@")
+    record_api_call("tiktok", "yt-dlp-live-fallback")
+
+    data = await asyncio.wait_for(
+        asyncio.to_thread(
+            _tiktok_live_fallback_sync,
+            username
+        ),
+        timeout=30
+    )
+
+    return data
+
+
+def _youtube_live_fallback_sync(channel_id: str):
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 15,
+    }
+
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/channel/{channel_id}/live",
+                download=False
+            )
+    except Exception:
+        return None
+
+    if not info:
+        return None
+
+    if not (
+        info.get("is_live")
+        or info.get("live_status") == "is_live"
+    ):
+        return None
+
+    return {
+        "id": str(info.get("id") or channel_id),
+        "title": info.get("title") or "YouTube LIVE",
+        "url": info.get("webpage_url")
+        or f"https://www.youtube.com/channel/{channel_id}/live"
+    }
+
+
+async def check_youtube_live_fallback(host):
+    record_api_call("youtube", "yt-dlp-live-fallback")
+
+    data = await asyncio.wait_for(
+        asyncio.to_thread(
+            _youtube_live_fallback_sync,
+            host["target"]
+        ),
+        timeout=30
+    )
+
+    if not data:
+        return False
+
+    previous = get_live_state(
+        host["guild_id"],
+        "youtube",
+        host["target"]
+    )
+
+    if previous and previous["is_live"] and previous["live_key"] == data["id"]:
+        return True
+
+    embed = discord.Embed(
+        title="🔴 YouTube LIVE",
+        description=f"**{host['display_name'] or host['target']}** sedang live!",
+        url=data["url"],
+        color=discord.Color.red()
+    )
+    embed.add_field(
+        name="Judul",
+        value=data["title"][:1024],
+        inline=False
+    )
+
+    await send_notification(
+        host,
+        embed,
+        render_template(
+            host["custom_live_message"],
+            creator=host["display_name"] or host["target"],
+            url=data["url"],
+            platform="YouTube"
+        ),
+        event_type="youtube_live",
+        event_key=f"youtube:live:{host['target']}:{data['id']}",
+        source_url=data["url"]
+    )
+
+    update_live_state(
+        host["guild_id"],
+        "youtube",
+        host["target"],
+        True,
+        data["id"]
+    )
+    return True
 
 
 # ============================================================
@@ -3693,13 +4903,16 @@ async def check_tiktok_live(host):
 
     client = TikTokLiveClient(unique_id=f"@{username}")
 
+    record_api_call("tiktok", "TikTokLiveClient.is_live")
+
     try:
         live = await asyncio.wait_for(
             client.is_live(),
             timeout=25
         )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"Timeout TikTok LIVE @{username}")
+    except Exception:
+        fallback = await check_tiktok_live_fallback(host)
+        live = bool(fallback)
 
     if live:
         if not previous or not previous["is_live"]:
@@ -3719,7 +4932,14 @@ async def check_tiktok_live(host):
                 platform="TikTok"
             )
 
-            await send_notification(host, embed, custom)
+            await send_notification(
+                host,
+                embed,
+                custom,
+                event_type="tiktok_live",
+                event_key=f"tiktok:live:{username}:{int(time.time() // 60)}",
+                source_url=url
+            )
 
         update_live_state(
             host["guild_id"],
@@ -3882,7 +5102,14 @@ async def check_tiktok_post(host):
         platform="TikTok"
     )
 
-    await send_notification(host, embed, custom)
+    await send_notification(
+        host,
+        embed,
+        custom,
+        event_type="tiktok_post",
+        event_key=f"tiktok:post:{username}:{latest['id']}",
+        source_url=latest["url"]
+    )
 
     update_tiktok_post_state(
         host["guild_id"],
@@ -4107,7 +5334,10 @@ async def monitor_loop():
     due_hosts = [
         host for host in get_enabled_hosts()
         if host_due(host, now)
+        and host_schedule_allowed(host, now)
     ]
+
+    runtime_metrics["checker_runs"] += len(due_hosts)
 
     semaphore = asyncio.Semaphore(MONITOR_CONCURRENCY)
 
@@ -4134,19 +5364,35 @@ async def monitor_loop():
 
             try:
                 if host["platform"] == "youtube":
-                    await check_youtube_live(host)
+                    if feature_enabled(guild.id, "youtube_live"):
+                        try:
+                            await check_youtube_live(host)
+                        except Exception:
+                            fallback_ok = await check_youtube_live_fallback(host)
+                            if not fallback_ok:
+                                raise
                     set_host_health(host["id"], success=True)
 
                 elif host["platform"] == "tiktok":
                     errors = []
 
+                    jobs = []
+                    labels = []
+
+                    if feature_enabled(guild.id, "tiktok_live"):
+                        jobs.append(check_tiktok_live(host))
+                        labels.append("LIVE")
+
+                    if feature_enabled(guild.id, "tiktok_post"):
+                        jobs.append(check_tiktok_post(host))
+                        labels.append("POST")
+
                     results = await asyncio.gather(
-                        check_tiktok_live(host),
-                        check_tiktok_post(host),
+                        *jobs,
                         return_exceptions=True
                     )
 
-                    for label, result in zip(("LIVE", "POST"), results):
+                    for label, result in zip(labels, results):
                         if isinstance(result, Exception):
                             errors.append(f"{label}: {result}")
 
@@ -4165,6 +5411,7 @@ async def monitor_loop():
                         )
 
             except Exception as exc:
+                runtime_metrics["checker_errors"] += 1
                 set_host_health(
                     host["id"],
                     str(exc)
@@ -4189,6 +5436,103 @@ async def monitor_loop():
 async def before_monitor():
     await bot.wait_until_ready()
 
+
+
+
+@tasks.loop(minutes=1)
+async def pending_notification_loop():
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT *
+            FROM pending_notifications
+            WHERE release_after<=?
+            ORDER BY id ASC
+            LIMIT 50
+        """, (now,)).fetchall()
+
+    for row in rows:
+        host = get_host(int(row["host_id"]))
+
+        if not host or not host["enabled"]:
+            with closing(db()) as conn:
+                conn.execute(
+                    "DELETE FROM pending_notifications WHERE id=?",
+                    (row["id"],)
+                )
+                conn.commit()
+            continue
+
+        try:
+            embed = discord.Embed.from_dict(
+                json.loads(row["embed_json"])
+            )
+            await _deliver_notification_now(
+                host,
+                embed,
+                row["content"],
+                event_type=row["event_type"] or "queued",
+                event_key=row["event_key"],
+                source_url=row["source_url"]
+            )
+        finally:
+            with closing(db()) as conn:
+                conn.execute(
+                    "DELETE FROM pending_notifications WHERE id=?",
+                    (row["id"],)
+                )
+                conn.commit()
+
+
+@pending_notification_loop.before_loop
+async def before_pending_notification_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=10)
+async def event_cleanup_loop():
+    cutoff = int(time.time()) - EVENT_RETENTION_DAYS * 86400
+
+    with closing(db()) as conn:
+        conn.execute(
+            "DELETE FROM notification_events WHERE created_at<?",
+            (cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM notification_history WHERE created_at<?",
+            (cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM api_usage WHERE day<?",
+            (
+                datetime.fromtimestamp(
+                    cutoff,
+                    tz=timezone.utc
+                ).strftime("%Y-%m-%d"),
+            )
+        )
+        conn.commit()
+
+
+@event_cleanup_loop.before_loop
+async def before_event_cleanup_loop():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(seconds=30)
+async def loop_lag_metrics():
+    start = time.perf_counter()
+    await asyncio.sleep(0)
+    runtime_metrics["last_loop_lag_ms"] = round(
+        (time.perf_counter() - start) * 1000,
+        2
+    )
+
+
+@loop_lag_metrics.before_loop
+async def before_loop_lag_metrics():
+    await bot.wait_until_ready()
 
 
 # ============================================================
@@ -4372,6 +5716,21 @@ def restore_guild_backup(data: dict, target_guild_id: int):
         settings.get("access_state", "allowed")
     )
 
+    set_guild_notifier_settings(
+        target_guild_id,
+        timezone_name=settings.get("timezone") or "Asia/Jakarta",
+        language=settings.get("language") or "id",
+        maintenance_mode=bool(settings.get("maintenance_mode", 0))
+    )
+
+    if settings.get("feature_flags"):
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
+                (settings.get("feature_flags"), target_guild_id)
+            )
+            conn.commit()
+
     restored = 0
 
     for raw in hosts:
@@ -4422,13 +5781,39 @@ def restore_guild_backup(data: dict, target_guild_id: int):
                         custom_live_message=?,
                         custom_post_message=?,
                         custom_end_message=?,
-                        enabled=?
+                        enabled=?,
+                        extra_channel_ids=?,
+                        extra_role_ids=?,
+                        schedule_days=?,
+                        quiet_start=?,
+                        quiet_end=?,
+                        timezone=?,
+                        language=?,
+                        webhook_url=?,
+                        mention_everyone=?,
+                        embed_title=?,
+                        embed_footer=?,
+                        embed_color=?,
+                        auto_pause_threshold=?
                     WHERE id=?
                 """, (
                     raw.get("custom_live_message"),
                     raw.get("custom_post_message"),
                     raw.get("custom_end_message"),
                     1 if raw.get("enabled", 1) else 0,
+                    raw.get("extra_channel_ids"),
+                    raw.get("extra_role_ids"),
+                    raw.get("schedule_days") or "0,1,2,3,4,5,6",
+                    raw.get("quiet_start"),
+                    raw.get("quiet_end"),
+                    raw.get("timezone"),
+                    raw.get("language"),
+                    raw.get("webhook_url"),
+                    1 if raw.get("mention_everyone") else 0,
+                    raw.get("embed_title"),
+                    raw.get("embed_footer"),
+                    raw.get("embed_color"),
+                    raw.get("auto_pause_threshold"),
                     host_id
                 ))
                 conn.commit()
@@ -6150,6 +7535,14 @@ class UserServerMenuView(discord.ui.View):
         price: int
     ):
         guild = bot.get_guild(self.guild_id)
+
+        settings_now = get_guild_settings(self.guild_id)
+        if settings_now["maintenance_mode"]:
+            await safe_reply(
+                interaction,
+                "🛠️ Request Premium sedang maintenance. Coba lagi setelah maintenance selesai."
+            )
+            return
 
         if guild is None:
             await safe_reply(
@@ -8266,6 +9659,878 @@ class PlanServerManageView(discord.ui.View):
 
 
 
+
+class HostDeliveryModal(discord.ui.Modal):
+    extra_channels = discord.ui.TextInput(
+        label="Channel Tambahan (ID, koma)",
+        required=False,
+        max_length=800
+    )
+    extra_roles = discord.ui.TextInput(
+        label="Role Tambahan (ID, koma)",
+        required=False,
+        max_length=800
+    )
+    everyone = discord.ui.TextInput(
+        label="Mention @everyone? yes/no",
+        required=False,
+        max_length=10
+    )
+    webhook_url = discord.ui.TextInput(
+        label="Webhook URL (opsional)",
+        required=False,
+        max_length=1000
+    )
+
+    def __init__(self, host_id: int):
+        self.host_id = int(host_id)
+        host = get_host(self.host_id)
+        super().__init__(title="Delivery Host", timeout=300)
+
+        if host:
+            self.extra_channels.default = host["extra_channel_ids"] or ""
+            self.extra_roles.default = host["extra_role_ids"] or ""
+            self.everyone.default = "yes" if host["mention_everyone"] else "no"
+            self.webhook_url.default = host["webhook_url"] or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        channels = ",".join(
+            str(x) for x in parse_id_csv(self.extra_channels.value)
+        )
+        roles = ",".join(
+            str(x) for x in parse_id_csv(self.extra_roles.value)
+        )
+        everyone = self.everyone.value.strip().lower() in {
+            "yes", "y", "1", "true", "on"
+        }
+
+        webhook = self.webhook_url.value.strip()
+        if webhook and not webhook.startswith(
+            ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")
+        ):
+            await safe_reply(interaction, "❌ Webhook URL Discord tidak valid.")
+            return
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET extra_channel_ids=?, extra_role_ids=?,
+                    mention_everyone=?, webhook_url=?
+                WHERE id=?
+            """, (
+                channels or None,
+                roles or None,
+                1 if everyone else 0,
+                webhook or None,
+                self.host_id
+            ))
+            conn.commit()
+
+        await safe_reply(interaction, "✅ Delivery host diperbarui.")
+
+
+class HostScheduleModal(discord.ui.Modal):
+    timezone_name = discord.ui.TextInput(
+        label="Timezone",
+        placeholder="Asia/Jakarta",
+        max_length=64
+    )
+    schedule_days = discord.ui.TextInput(
+        label="Hari Aktif 0=Senin ... 6=Minggu",
+        placeholder="0,1,2,3,4,5,6",
+        max_length=30
+    )
+    quiet_start = discord.ui.TextInput(
+        label="Quiet Start HH:MM",
+        placeholder="23:00",
+        required=False,
+        max_length=5
+    )
+    quiet_end = discord.ui.TextInput(
+        label="Quiet End HH:MM",
+        placeholder="06:00",
+        required=False,
+        max_length=5
+    )
+
+    def __init__(self, host_id: int):
+        self.host_id = int(host_id)
+        host = get_host(self.host_id)
+        super().__init__(title="Jadwal Host", timeout=300)
+
+        if host:
+            self.timezone_name.default = host["timezone"] or "Asia/Jakarta"
+            self.schedule_days.default = host["schedule_days"] or "0,1,2,3,4,5,6"
+            self.quiet_start.default = host["quiet_start"] or ""
+            self.quiet_end.default = host["quiet_end"] or ""
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            ZoneInfo(self.timezone_name.value.strip())
+        except Exception:
+            await safe_reply(interaction, "❌ Timezone tidak valid.")
+            return
+
+        days = []
+        for raw in self.schedule_days.value.split(","):
+            raw = raw.strip()
+            if raw.isdigit() and 0 <= int(raw) <= 6:
+                days.append(str(int(raw)))
+
+        if not days:
+            await safe_reply(interaction, "❌ Hari aktif tidak valid.")
+            return
+
+        for value in (self.quiet_start.value.strip(), self.quiet_end.value.strip()):
+            if value and not _parse_hhmm(value):
+                await safe_reply(interaction, "❌ Format quiet hours harus HH:MM.")
+                return
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET timezone=?, schedule_days=?,
+                    quiet_start=?, quiet_end=?
+                WHERE id=?
+            """, (
+                self.timezone_name.value.strip(),
+                ",".join(sorted(set(days))),
+                self.quiet_start.value.strip() or None,
+                self.quiet_end.value.strip() or None,
+                self.host_id
+            ))
+            conn.commit()
+
+        await safe_reply(interaction, "✅ Jadwal host diperbarui.")
+
+
+class HostBrandingModal(discord.ui.Modal):
+    title = discord.ui.TextInput(
+        label="Judul Embed Override",
+        required=False,
+        max_length=256
+    )
+    footer = discord.ui.TextInput(
+        label="Footer Embed",
+        required=False,
+        max_length=500
+    )
+    color = discord.ui.TextInput(
+        label="Warna HEX",
+        placeholder="#5865F2",
+        required=False,
+        max_length=10
+    )
+    language = discord.ui.TextInput(
+        label="Bahasa id/en",
+        placeholder="id",
+        required=False,
+        max_length=5
+    )
+
+    def __init__(self, host_id: int):
+        self.host_id = int(host_id)
+        host = get_host(self.host_id)
+        super().__init__(title="Branding Host", timeout=300)
+
+        if host:
+            self.title.default = host["embed_title"] or ""
+            self.footer.default = host["embed_footer"] or ""
+            self.color.default = (
+                f"#{int(host['embed_color']):06X}"
+                if host["embed_color"] else ""
+            )
+            self.language.default = host["language"] or "id"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color_value = None
+        raw_color = self.color.value.strip().lstrip("#")
+
+        if raw_color:
+            try:
+                color_value = int(raw_color, 16)
+                if not 0 <= color_value <= 0xFFFFFF:
+                    raise ValueError
+            except ValueError:
+                await safe_reply(interaction, "❌ Warna HEX tidak valid.")
+                return
+
+        language = self.language.value.strip().lower() or "id"
+        if language not in {"id", "en"}:
+            language = "id"
+
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET embed_title=?, embed_footer=?,
+                    embed_color=?, language=?
+                WHERE id=?
+            """, (
+                self.title.value.strip() or None,
+                self.footer.value.strip() or None,
+                color_value,
+                language,
+                self.host_id
+            ))
+            conn.commit()
+
+        await safe_reply(interaction, "✅ Branding host diperbarui.")
+
+
+class HostAdvancedView(discord.ui.View):
+    def __init__(self, guild_id: int, host_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.host_id = int(host_id)
+
+    @discord.ui.button(label="Delivery", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
+    async def delivery(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            HostDeliveryModal(self.host_id)
+        )
+
+    @discord.ui.button(label="Jadwal", emoji="🕒", style=discord.ButtonStyle.secondary, row=0)
+    async def schedule(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            HostScheduleModal(self.host_id)
+        )
+
+    @discord.ui.button(label="Branding", emoji="🎨", style=discord.ButtonStyle.secondary, row=0)
+    async def branding(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            HostBrandingModal(self.host_id)
+        )
+
+    @discord.ui.button(label="Recheck", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    async def recheck(self, interaction: discord.Interaction, button: discord.ui.Button):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await defer_if_needed(interaction)
+
+        try:
+            if host["platform"] == "youtube":
+                try:
+                    await check_youtube_live(host)
+                except Exception:
+                    await check_youtube_live_fallback(host)
+            else:
+                await check_tiktok_live(host)
+                await check_tiktok_post(host)
+
+            set_host_health(host["id"], success=True)
+            await interaction.followup.send(
+                "✅ Recheck selesai.",
+                ephemeral=True
+            )
+        except Exception as exc:
+            set_host_health(host["id"], str(exc))
+            await interaction.followup.send(
+                f"❌ Recheck gagal: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Preview", emoji="👁️", style=discord.ButtonStyle.secondary, row=1)
+    async def preview(self, interaction: discord.Interaction, button: discord.ui.Button):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        url = (
+            f"https://www.tiktok.com/@{host['target'].lstrip('@')}/live"
+            if host["platform"] == "tiktok"
+            else f"https://www.youtube.com/channel/{host['target']}/live"
+        )
+
+        embed = discord.Embed(
+            title="🔔 Preview Notifikasi",
+            description=f"Contoh notifikasi untuk `{host['target']}`",
+            url=url,
+            color=discord.Color.blue()
+        )
+        apply_host_embed_branding(host, embed)
+
+        await safe_reply(
+            interaction,
+            render_template(
+                host["custom_live_message"],
+                creator=host["display_name"] or host["target"],
+                url=url,
+                platform=host["platform"].title()
+            ) or "Preview pesan default.",
+            embed=embed
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_embed(host),
+            view=HostCardView(self.guild_id, self.host_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+class FeatureFlagsModal(discord.ui.Modal):
+    features = discord.ui.TextInput(
+        label="Fitur aktif (pisahkan koma)",
+        placeholder="tiktok_live,tiktok_post,youtube_live,live_end",
+        style=discord.TextStyle.paragraph,
+        max_length=300
+    )
+
+    def __init__(self, guild_id: int):
+        self.guild_id = int(guild_id)
+        flags = feature_flags_for_guild(self.guild_id)
+        super().__init__(title="Feature Flags", timeout=300)
+        self.features.default = ",".join(
+            key for key, enabled in flags.items()
+            if enabled
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        set_feature_flags(
+            self.guild_id,
+            self.features.value.split(",")
+        )
+        await safe_reply(interaction, "✅ Feature flags diperbarui.")
+
+
+class ServerNotifierSettingsModal(discord.ui.Modal):
+    timezone_name = discord.ui.TextInput(
+        label="Timezone Server",
+        placeholder="Asia/Jakarta",
+        max_length=64
+    )
+    language = discord.ui.TextInput(
+        label="Bahasa id/en",
+        placeholder="id",
+        max_length=5
+    )
+
+    def __init__(self, guild_id: int):
+        self.guild_id = int(guild_id)
+        settings = get_guild_settings(self.guild_id)
+        super().__init__(title="Pengaturan Notifier", timeout=300)
+        self.timezone_name.default = settings["timezone"] or "Asia/Jakarta"
+        self.language.default = settings["language"] or "id"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            set_guild_notifier_settings(
+                self.guild_id,
+                timezone_name=self.timezone_name.value.strip(),
+                language=self.language.value.strip()
+            )
+        except ValueError as exc:
+            await safe_reply(interaction, f"❌ {exc}")
+            return
+
+        await safe_reply(interaction, "✅ Pengaturan notifier diperbarui.")
+
+
+class CloneConfigModal(discord.ui.Modal):
+    target_guild_id = discord.ui.TextInput(
+        label="Target Server ID",
+        placeholder="123456789...",
+        max_length=25
+    )
+
+    def __init__(self, source_guild_id: int):
+        self.source_guild_id = int(source_guild_id)
+        super().__init__(title="Clone Config", timeout=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.target_guild_id.value.strip()
+
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ Server ID harus angka.")
+            return
+
+        target = bot.get_guild(int(raw))
+        if not target:
+            await safe_reply(interaction, "❌ Target server tidak ditemukan.")
+            return
+
+        clone_notifier_config(
+            self.source_guild_id,
+            target.id
+        )
+        await safe_reply(
+            interaction,
+            f"✅ Config notifier dicopy ke **{target.name}**."
+        )
+
+
+class HostCSVImportModal(discord.ui.Modal):
+    rows = discord.ui.TextInput(
+        label="CSV: platform,target",
+        placeholder="tiktok,username\nyoutube,UCxxxx",
+        style=discord.TextStyle.paragraph,
+        max_length=4000
+    )
+
+    def __init__(self, guild_id: int):
+        self.guild_id = int(guild_id)
+        super().__init__(title="Import Host CSV", timeout=600)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        create_config_snapshot(
+            self.guild_id,
+            "before CSV import"
+        )
+
+        added = 0
+        errors = 0
+
+        for line in self.rows.value.splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("platform,"):
+                continue
+
+            parts = [x.strip() for x in line.split(",")]
+            if len(parts) < 2:
+                errors += 1
+                continue
+
+            platform, target = parts[0].lower(), parts[1]
+
+            if platform not in {"tiktok", "youtube"} or not target:
+                errors += 1
+                continue
+
+            try:
+                add_host(
+                    self.guild_id,
+                    platform,
+                    target.lstrip("@") if platform == "tiktok" else target
+                )
+                added += 1
+            except Exception:
+                errors += 1
+
+        await safe_reply(
+            interaction,
+            f"✅ Import selesai: **{added} berhasil**, **{errors} gagal**."
+        )
+
+
+class NotificationHistorySelect(discord.ui.Select):
+    def __init__(self, guild_id: int):
+        self.guild_id = int(guild_id)
+        rows = recent_notifications(self.guild_id, 25)
+
+        options = [
+            discord.SelectOption(
+                label=f"#{row['id']} • {row['event_type']} • {row['status']}"[:100],
+                value=str(row["id"]),
+                description=(
+                    f"Host #{row['host_id']} • "
+                    f"{datetime.fromtimestamp(row['created_at']).strftime('%d/%m %H:%M')}"
+                )[:100]
+            )
+            for row in rows
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Belum ada history",
+                    value="0"
+                )
+            ]
+
+        super().__init__(
+            placeholder="Pilih notifikasi...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        record_id = int(self.values[0])
+        if not record_id:
+            await safe_reply(interaction, "Belum ada history.")
+            return
+
+        row = get_notification_record(record_id)
+
+        embed = discord.Embed(
+            title=f"🧾 Notification #{record_id}",
+            description=(
+                f"Status **{row['status']}**\n"
+                f"Event **{row['event_type']}**\n"
+                f"Host **#{row['host_id']}**\n"
+                f"Latency **{row['latency_ms'] or 0} ms**"
+            ),
+            color=discord.Color.blue()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=NotificationHistoryDetailView(
+                self.guild_id,
+                record_id
+            )
+        )
+
+
+class NotificationHistoryView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.add_item(NotificationHistorySelect(self.guild_id))
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = bot.get_guild(self.guild_id)
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"🔔 Notifier • {guild.name if guild else self.guild_id}",
+                color=discord.Color.blue()
+            ),
+            view=NotifierToolsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+class NotificationHistoryDetailView(discord.ui.View):
+    def __init__(self, guild_id: int, record_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.record_id = int(record_id)
+
+    @discord.ui.button(label="Kirim Ulang", emoji="🔁", style=discord.ButtonStyle.primary)
+    async def resend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ok = await resend_notification_record(self.record_id)
+        await safe_reply(
+            interaction,
+            "✅ Notifikasi dikirim ulang." if ok else "❌ Gagal mengirim ulang."
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧾 Notification History",
+                color=discord.Color.blue()
+            ),
+            view=NotificationHistoryView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+class BulkNotifierView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+
+    async def _set_all(self, enabled: bool):
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE hosts SET enabled=? WHERE guild_id=?",
+                (1 if enabled else 0, self.guild_id)
+            )
+            conn.commit()
+
+    @discord.ui.button(label="Resume Semua", emoji="▶️", style=discord.ButtonStyle.success, row=0)
+    async def resume_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(True)
+        await safe_reply(interaction, "✅ Semua host diaktifkan.")
+
+    @discord.ui.button(label="Pause Semua", emoji="⏸️", style=discord.ButtonStyle.danger, row=0)
+    async def pause_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_all(False)
+        await safe_reply(interaction, "✅ Semua host dipause.")
+
+    @discord.ui.button(label="Reset Error", emoji="♻️", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_errors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE hosts
+                SET last_error=NULL, error_count=0, cooldown_until=NULL
+                WHERE guild_id=?
+            """, (self.guild_id,))
+            conn.commit()
+        await safe_reply(interaction, "✅ Semua error host direset.")
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="🔔 Notifier Tools"),
+            view=NotifierToolsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+class NotifierToolsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+
+    @discord.ui.button(label="Diagnostics", emoji="🩺", style=discord.ButtonStyle.primary, row=0)
+    async def diagnostics(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return
+        await interaction.response.edit_message(
+            embed=diagnostics_embed(guild),
+            view=NotifierToolsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Statistik", emoji="📈", style=discord.ButtonStyle.secondary, row=0)
+    async def stats(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=notifier_stats_embed(self.guild_id),
+            view=NotifierToolsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="History", emoji="🧾", style=discord.ButtonStyle.secondary, row=0)
+    async def history(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧾 Notification History",
+                color=discord.Color.blue()
+            ),
+            view=NotificationHistoryView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Bulk", emoji="📦", style=discord.ButtonStyle.secondary, row=0)
+    async def bulk(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="📦 Bulk Action",
+                description="Pause/resume/reset semua host.",
+                color=discord.Color.blue()
+            ),
+            view=BulkNotifierView(self.guild_id)
+        )
+
+    @discord.ui.button(label="CSV", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
+    async def csv_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        data = host_csv_bytes(self.guild_id)
+        await interaction.response.send_message(
+            content="📄 Export host CSV. Untuk import tekan tombol **Import CSV**.",
+            file=discord.File(
+                io.BytesIO(data),
+                filename=f"hosts-{self.guild_id}.csv"
+            ),
+            view=CSVImportButtonView(self.guild_id),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Clone", emoji="🧬", style=discord.ButtonStyle.secondary, row=1)
+    async def clone(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            CloneConfigModal(self.guild_id)
+        )
+
+    @discord.ui.button(label="Settings", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=server_notifier_settings_embed(self.guild_id),
+            view=ServerNotifierSettingsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Snapshot", emoji="📸", style=discord.ButtonStyle.secondary, row=1)
+    async def snapshot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        snapshot_id = create_config_snapshot(
+            self.guild_id,
+            "manual"
+        )
+        await safe_reply(
+            interaction,
+            f"✅ Snapshot **#{snapshot_id}** dibuat."
+        )
+
+    @discord.ui.button(label="Rollback", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
+    async def rollback(self, interaction: discord.Interaction, button: discord.ui.Button):
+        row = latest_config_snapshot(self.guild_id)
+
+        if not row:
+            await safe_reply(interaction, "Belum ada snapshot.")
+            return
+
+        data = json.loads(row["payload"])
+        restore_guild_backup(
+            data,
+            self.guild_id
+        )
+        await safe_reply(
+            interaction,
+            f"✅ Rollback snapshot **#{row['id']}** selesai."
+        )
+
+    @discord.ui.button(label="Changelog", emoji="🆕", style=discord.ButtonStyle.secondary, row=2)
+    async def changelog(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await safe_reply(
+            interaction,
+            (
+                "**Notifier Pro 2026.10**\n"
+                "Multi-channel/role • quiet hours • history/resend • "
+                "fallback checker • diagnostics • CSV • clone • rollback • "
+                "feature flags • maintenance • queue protection."
+            )
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=3)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return
+        await interaction.response.edit_message(
+            embed=server_embed(guild),
+            view=ServerOwnerView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=3)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
+class CSVImportButtonView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=600)
+        self.guild_id = int(guild_id)
+
+    @discord.ui.button(label="Import CSV", emoji="📥", style=discord.ButtonStyle.primary)
+    async def import_csv(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            HostCSVImportModal(self.guild_id)
+        )
+
+
+def server_notifier_settings_embed(guild_id: int):
+    settings = get_guild_settings(guild_id)
+    flags = feature_flags_for_guild(guild_id)
+
+    embed = discord.Embed(
+        title="⚙️ Notifier Settings",
+        description=(
+            f"Timezone **{settings['timezone'] or 'Asia/Jakarta'}**\n"
+            f"Bahasa **{settings['language'] or 'id'}**\n"
+            f"Maintenance **{'ON' if settings['maintenance_mode'] else 'OFF'}**"
+        ),
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Feature Flags",
+        value="\n".join(
+            f"{'✅' if value else '⛔'} {key}"
+            for key, value in flags.items()
+        ),
+        inline=False
+    )
+    return embed
+
+
+class ServerNotifierSettingsView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+
+    @discord.ui.button(label="Timezone/Bahasa", emoji="🌐", style=discord.ButtonStyle.secondary, row=0)
+    async def locale(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            ServerNotifierSettingsModal(self.guild_id)
+        )
+
+    @discord.ui.button(label="Feature Flags", emoji="🚩", style=discord.ButtonStyle.secondary, row=0)
+    async def flags(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            FeatureFlagsModal(self.guild_id)
+        )
+
+    @discord.ui.button(label="Maintenance", emoji="🛠️", style=discord.ButtonStyle.danger, row=0)
+    async def maintenance(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = get_guild_settings(self.guild_id)
+        enabled = not bool(settings["maintenance_mode"])
+
+        set_guild_notifier_settings(
+            self.guild_id,
+            maintenance_mode=enabled
+        )
+
+        guild = bot.get_guild(self.guild_id)
+        text = (
+            "🛠️ Hi Notifku sedang **maintenance konfigurasi**. "
+            "Monitoring host tetap berjalan."
+            if enabled
+            else "✅ Maintenance Hi Notifku selesai."
+        )
+
+        if guild:
+            cfg = get_config(guild.id)
+            channel = await resolve_channel(
+                cfg["log_channel_id"] or (
+                    guild.system_channel.id if guild.system_channel else None
+                )
+            )
+            if channel:
+                try:
+                    await channel.send(text)
+                except Exception:
+                    pass
+
+        await interaction.response.edit_message(
+            embed=server_notifier_settings_embed(self.guild_id),
+            view=ServerNotifierSettingsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="🔔 Notifier Tools"),
+            view=NotifierToolsView(self.guild_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView()
+        )
+
+
 class ServerOwnerView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=900)
@@ -8341,6 +10606,26 @@ class ServerOwnerView(discord.ui.View):
                 color=discord.Color.blue()
             ),
             view=WizardView(guild.id)
+        )
+
+    @discord.ui.button(
+        label="Notif",
+        emoji="🔔",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def notifier_tools(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"🔔 Notifier • {guild.name}",
+                description="Diagnostics, statistik, history, bulk, CSV, clone, dan settings.",
+                color=discord.Color.blue()
+            ),
+            view=NotifierToolsView(guild.id)
         )
 
     @discord.ui.button(
@@ -8873,6 +11158,7 @@ class HostCardView(discord.ui.View):
             ("Pause / Resume", "⏯️", discord.ButtonStyle.secondary, 3, self.toggle),
             ("Clear Pesan", "🧹", discord.ButtonStyle.secondary, 3, self.clear_messages),
             ("Hapus", "🗑️", discord.ButtonStyle.danger, 3, self.delete),
+            ("Lanjutan", "🛠️", discord.ButtonStyle.primary, 4, self.advanced),
             ("Kembali", "⬅️", discord.ButtonStyle.secondary, 4, self.back),
             ("Menu Awal", "🏠", discord.ButtonStyle.secondary, 4, self.home),
         ]
@@ -9113,6 +11399,26 @@ class HostCardView(discord.ui.View):
             await interaction.message.delete()
         except Exception:
             pass
+
+    async def advanced(self, interaction):
+        host = await self.valid_host(interaction)
+        if not host:
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"🛠️ Lanjutan • #{self.host_id}",
+                description=(
+                    "Multi-channel/role, webhook, jadwal, quiet hours, "
+                    "branding, preview, dan manual recheck."
+                ),
+                color=discord.Color.blue()
+            ),
+            view=HostAdvancedView(
+                self.guild_id,
+                self.host_id
+            )
+        )
 
     async def back(self, interaction):
         guild = bot.get_guild(self.guild_id)
@@ -9809,6 +12115,15 @@ async def on_ready():
     if not db_maintenance_loop.is_running():
         db_maintenance_loop.start()
 
+    if not pending_notification_loop.is_running():
+        pending_notification_loop.start()
+
+    if not event_cleanup_loop.is_running():
+        event_cleanup_loop.start()
+
+    if not loop_lag_metrics.is_running():
+        loop_lag_metrics.start()
+
 
 # ============================================================
 # MAIN
@@ -9832,16 +12147,3 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-    @discord.ui.button(
-        label="Menu Awal",
-        emoji="🏠",
-        style=discord.ButtonStyle.secondary,
-        row=1
-    )
-    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
-        pending_restore_previews.pop(self.actor_id, None)
-        await interaction.response.edit_message(
-            content=None,
-            embed=owner_home_embed(),
-            view=OwnerHomeView()
-        )
