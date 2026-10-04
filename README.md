@@ -43,7 +43,7 @@ DB_PATH=/data/live_notifier.db
 REQUIRED_GUILD_ID=...
 REQUIRED_GUILD_INVITE=https://discord.gg/...
 
-FREE_HOST_LIMIT=5
+FREE_HOST_LIMIT=3
 PREMIUM_HOST_LIMIT=100
 ```
 
@@ -89,7 +89,7 @@ Default:
 Bisa diubah melalui Railway:
 
 ```env
-FREE_HOST_LIMIT=5
+FREE_HOST_LIMIT=3
 PREMIUM_HOST_LIMIT=100
 ```
 
@@ -479,7 +479,7 @@ Backup otomatis dibuat berkala.
 Railway variables opsional:
 
 ```env
-AUTO_BACKUP_HOURS=12
+AUTO_BACKUP_HOURS=48
 AUTO_BACKUP_KEEP=7
 AUTO_BACKUP_DIR=/data/backups
 MONITOR_CONCURRENCY=5
@@ -927,7 +927,7 @@ Kegagalan DM satu owner tidak menggagalkan backup lokal maupun pengiriman ke own
 Contoh:
 
 ```env
-AUTO_BACKUP_HOURS=12
+AUTO_BACKUP_HOURS=48
 AUTO_BACKUP_KEEP=7
 AUTO_BACKUP_DIR=/data/backups
 BACKUP_CHANNEL_ID=0
@@ -1004,3 +1004,85 @@ Host Manager tidak dapat:
 - menghapus host;
 - assign/revoke manager;
 - melihat host yang tidak ditugaskan kepadanya.
+
+## FREE Server Owner — Tambah Host Sendiri
+
+Server owner sekarang dapat menambah host tanpa membuka `/owner`:
+
+```text
+DM bot
+→ /menu
+→ pilih server milik sendiri
+→ 📡 Kelola Host
+→ ➕ Tambah Host
+```
+
+Berlaku untuk:
+- FREE: maksimal sesuai `FREE_HOST_LIMIT` (default 3)
+- PREMIUM: maksimal sesuai `PREMIUM_HOST_LIMIT` (default 100)
+
+Saat menambah host, server owner mengisi:
+- platform;
+- username / Channel ID / URL;
+- ID channel Discord tujuan;
+- ID role mention opsional.
+
+Server owner hanya dapat melihat, pause/resume, recheck, dan menghapus host pada server yang benar-benar dimilikinya. Fitur ini terpisah dari Global Owner `/owner` dan juga terpisah dari `🎙️ Host Saya` milik Host Manager.
+
+## Host Manager — Lihat Semua Host Server
+
+Host Manager membuka host yang ditugaskan terlebih dahulu, lalu memilih:
+
+```text
+DM bot
+→ /menu
+→ 🎙️ Host Saya
+→ pilih host
+→ 🌐 Semua Host Server
+```
+
+Aturan akses:
+- host yang ditugaskan langsung kepada user dapat dikelola sesuai permission;
+- host lain pada server yang sama dapat dilihat dalam mode **read-only**;
+- read-only menampilkan platform, target, status, channel, role, last check, dan error;
+- Host Manager tidak dapat mengedit, pause, test, recheck, menghapus, atau mengubah host lain;
+- fitur ini tetap terpisah dari `/owner`.
+
+
+### Isolasi per server
+
+Menu `🌐 Semua Host Server` selalu menggunakan `guild_id` dari host yang sedang dibuka. Host dari server lain tidak digabung dan tidak ditampilkan pada daftar yang sama, meskipun user kebetulan menjadi Host Manager di beberapa server.
+
+## /menu Host Manager v2
+
+`/menu` sekarang role-aware dan Host Manager tetap terisolasi dari `/owner`.
+
+Alur Host Manager:
+```text
+/menu
+→ 🎙️ Host Saya
+→ pilih server
+→ pilih host
+→ Quick Action
+```
+
+Peningkatan:
+- pemilih server agar host antar-server tidak tercampur;
+- pagination 25 host per halaman;
+- pencarian host;
+- favorit/pin host;
+- Health: Healthy / Warning / Error / Paused;
+- permission indicator;
+- Notifikasi Terakhir;
+- Error Center / Masalah Host;
+- Aktivitas Saya;
+- Bantuan Host dan onboarding;
+- template preset + reset default;
+- timezone alias WIB/WITA/WIT;
+- konfirmasi Pause/Resume;
+- request akses untuk host read-only;
+- owner server dapat approve/deny request tanpa masuk `/owner`;
+- warning error ke Host Manager;
+- warning H-3 sebelum akses Host Manager berakhir.
+
+Global Owner tetap menggunakan `/owner`. Host Manager tidak memperoleh akses ke payment, premium admin, backup, restore, revenue, owner management, atau konfigurasi global.

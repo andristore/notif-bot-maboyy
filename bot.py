@@ -51,12 +51,12 @@ OWNER_IDS = {
 REQUIRED_GUILD_ID = int(os.getenv("REQUIRED_GUILD_ID", "0") or 0)
 REQUIRED_GUILD_INVITE = os.getenv("REQUIRED_GUILD_INVITE", "").strip()
 
-FREE_HOST_LIMIT = max(1, int(os.getenv("FREE_HOST_LIMIT", "5")))
+FREE_HOST_LIMIT = max(1, int(os.getenv("FREE_HOST_LIMIT", "3")))
 PREMIUM_HOST_LIMIT = max(FREE_HOST_LIMIT, int(os.getenv("PREMIUM_HOST_LIMIT", "100")))
 PREMIUM_WARNING_DAYS = max(1, int(os.getenv("PREMIUM_WARNING_DAYS", "3")))
 
 MONITOR_CONCURRENCY = max(1, min(20, int(os.getenv("MONITOR_CONCURRENCY", "5"))))
-AUTO_BACKUP_HOURS = max(1, int(os.getenv("AUTO_BACKUP_HOURS", "12")))
+AUTO_BACKUP_HOURS = max(1, int(os.getenv("AUTO_BACKUP_HOURS", "48")))
 AUTO_BACKUP_KEEP = max(1, min(30, int(os.getenv("AUTO_BACKUP_KEEP", "7"))))
 
 INVOICE_EXPIRE_MINUTES = max(10, int(os.getenv("INVOICE_EXPIRE_MINUTES", "60")))
@@ -899,6 +899,45 @@ def migrate_database():
                 )
             """)
 
+
+        if not table_exists(conn, "host_manager_preferences"):
+            conn.execute("""
+                CREATE TABLE host_manager_preferences (
+                    host_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    onboarding_seen INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY(host_id, user_id)
+                )
+            """)
+
+        if not table_exists(conn, "host_access_requests"):
+            conn.execute("""
+                CREATE TABLE host_access_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    host_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at INTEGER NOT NULL,
+                    processed_by INTEGER,
+                    processed_at INTEGER,
+                    UNIQUE(host_id, user_id, status)
+                )
+            """)
+
+        if not table_exists(conn, "host_manager_warnings"):
+            conn.execute("""
+                CREATE TABLE host_manager_warnings (
+                    host_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    warning_key TEXT NOT NULL,
+                    sent_at INTEGER NOT NULL,
+                    PRIMARY KEY(host_id, user_id, warning_key)
+                )
+            """)
+
         if not table_exists(conn, "user_blacklist"):
             conn.execute("""
                 CREATE TABLE user_blacklist (
@@ -1278,6 +1317,43 @@ def host_manager_rows(user_id: int):
         )).fetchall()
 
 
+
+def host_manager_guild_ids(user_id: int) -> list[int]:
+    rows = host_manager_rows(user_id)
+    guild_ids = []
+
+    for row in rows:
+        guild_id = int(row["guild_id"])
+        if guild_id not in guild_ids:
+            guild_ids.append(guild_id)
+
+    return guild_ids
+
+
+def host_manager_has_guild_access(
+    user_id: int,
+    guild_id: int
+) -> bool:
+    return int(guild_id) in host_manager_guild_ids(user_id)
+
+
+def host_manager_visible_hosts(
+    user_id: int,
+    guild_id: int
+):
+    if not host_manager_has_guild_access(
+        user_id,
+        guild_id
+    ):
+        return []
+
+    return get_hosts(int(guild_id))
+
+
+def host_is_assigned_to_manager(user_id: int, host_id: int) -> bool:
+    return host_manager_access(user_id, host_id) is not None
+
+
 def host_manager_access(user_id: int, host_id: int):
     now = int(time.time())
     with closing(db()) as conn:
@@ -1307,6 +1383,375 @@ def host_manager_has_permission(
         return False
 
     return bool(row[column])
+
+
+
+def host_manager_pref(
+    user_id: int,
+    host_id: int
+):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM host_manager_preferences
+            WHERE user_id=? AND host_id=?
+        """, (
+            int(user_id),
+            int(host_id)
+        )).fetchone()
+
+
+def set_host_manager_favorite(
+    user_id: int,
+    host_id: int,
+    favorite: bool
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO host_manager_preferences(
+                host_id, user_id, favorite, onboarding_seen, updated_at
+            )
+            VALUES(?,?,?,0,?)
+            ON CONFLICT(host_id, user_id)
+            DO UPDATE SET
+                favorite=excluded.favorite,
+                updated_at=excluded.updated_at
+        """, (
+            int(host_id),
+            int(user_id),
+            1 if favorite else 0,
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def mark_host_manager_onboarding(
+    user_id: int,
+    host_id: int
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO host_manager_preferences(
+                host_id, user_id, favorite, onboarding_seen, updated_at
+            )
+            VALUES(?,?,0,1,?)
+            ON CONFLICT(host_id, user_id)
+            DO UPDATE SET
+                onboarding_seen=1,
+                updated_at=excluded.updated_at
+        """, (
+            int(host_id),
+            int(user_id),
+            int(time.time())
+        ))
+        conn.commit()
+
+
+def host_manager_needs_onboarding(user_id: int) -> bool:
+    rows = host_manager_rows(user_id)
+    if not rows:
+        return False
+
+    for row in rows:
+        pref = host_manager_pref(
+            user_id,
+            int(row["host_id"])
+        )
+        if not pref or not pref["onboarding_seen"]:
+            return True
+
+    return False
+
+
+def host_health_label(host) -> tuple[str, str]:
+    if not host["enabled"]:
+        return "⏸️", "Paused"
+
+    errors = int(host["error_count"] or 0)
+
+    if host["last_error"] and errors >= ERROR_ALERT_THRESHOLD:
+        return "🔴", "Error"
+
+    if host["last_error"] or errors > 0:
+        return "🟡", "Warning"
+
+    return "🟢", "Healthy"
+
+
+def host_manager_guilds(user_id: int):
+    guild_ids = host_manager_guild_ids(user_id)
+    result = []
+
+    for guild_id in guild_ids:
+        guild = bot.get_guild(int(guild_id))
+        if guild:
+            result.append(guild)
+
+    return result
+
+
+def host_manager_hosts_for_guild(
+    user_id: int,
+    guild_id: int
+):
+    rows = host_manager_visible_hosts(
+        user_id,
+        guild_id
+    )
+
+    def sort_key(host):
+        pref = host_manager_pref(
+            user_id,
+            int(host["id"])
+        )
+        favorite = int(pref["favorite"]) if pref else 0
+        assigned = 1 if host_manager_access(
+            user_id,
+            int(host["id"])
+        ) else 0
+
+        return (
+            -favorite,
+            -assigned,
+            str(host["platform"]),
+            int(host["id"])
+        )
+
+    return sorted(rows, key=sort_key)
+
+
+def host_manager_latest_notifications(
+    user_id: int,
+    guild_id: Optional[int] = None,
+    limit: int = 10
+):
+    managed_ids = [
+        int(row["host_id"])
+        for row in host_manager_rows(user_id)
+        if guild_id is None or int(row["guild_id"]) == int(guild_id)
+    ]
+
+    if not managed_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in managed_ids)
+    params = list(managed_ids)
+    sql = f"""
+        SELECT nh.*, h.platform, h.target, h.display_name
+        FROM notification_history nh
+        LEFT JOIN hosts h ON h.id=nh.host_id
+        WHERE nh.host_id IN ({placeholders})
+    """
+
+    if guild_id is not None:
+        sql += " AND nh.guild_id=?"
+        params.append(int(guild_id))
+
+    sql += " ORDER BY nh.id DESC LIMIT ?"
+    params.append(max(1, min(25, int(limit))))
+
+    with closing(db()) as conn:
+        return conn.execute(
+            sql,
+            tuple(params)
+        ).fetchall()
+
+
+def host_manager_problem_hosts(
+    user_id: int,
+    guild_id: Optional[int] = None
+):
+    rows = (
+        host_manager_hosts_for_guild(user_id, guild_id)
+        if guild_id is not None
+        else [
+            get_host(int(row["host_id"]))
+            for row in host_manager_rows(user_id)
+        ]
+    )
+
+    return [
+        row
+        for row in rows
+        if row and (
+            not row["enabled"]
+            or row["last_error"]
+            or int(row["error_count"] or 0) > 0
+        )
+    ]
+
+
+def host_manager_activity_rows(
+    user_id: int,
+    limit: int = 10
+):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT hma.*, h.platform, h.target, h.display_name, h.guild_id
+            FROM host_manager_activity hma
+            LEFT JOIN hosts h ON h.id=hma.host_id
+            WHERE hma.user_id=?
+            ORDER BY hma.id DESC
+            LIMIT ?
+        """, (
+            int(user_id),
+            max(1, min(25, int(limit)))
+        )).fetchall()
+
+
+def create_host_access_request(
+    user_id: int,
+    host_id: int
+) -> int:
+    host = get_host(host_id)
+    if not host:
+        raise ValueError("Host tidak ditemukan.")
+
+    if not host_manager_has_guild_access(
+        user_id,
+        int(host["guild_id"])
+    ):
+        raise ValueError("Kamu tidak memiliki akses ke server host ini.")
+
+    if host_manager_access(user_id, host_id):
+        raise ValueError("Kamu sudah memiliki akses kelola host ini.")
+
+    with closing(db()) as conn:
+        existing = conn.execute("""
+            SELECT id
+            FROM host_access_requests
+            WHERE host_id=? AND user_id=? AND status='pending'
+        """, (
+            int(host_id),
+            int(user_id)
+        )).fetchone()
+
+        if existing:
+            return int(existing["id"])
+
+        cur = conn.execute("""
+            INSERT INTO host_access_requests(
+                guild_id, host_id, user_id, status, created_at
+            )
+            VALUES(?,?,?,'pending',?)
+        """, (
+            int(host["guild_id"]),
+            int(host_id),
+            int(user_id),
+            int(time.time())
+        ))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_host_access_request(request_id: int):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM host_access_requests
+            WHERE id=?
+        """, (int(request_id),)).fetchone()
+
+
+def process_host_access_request(
+    request_id: int,
+    *,
+    approved: bool,
+    actor_id: int
+):
+    row = get_host_access_request(request_id)
+    if not row or row["status"] != "pending":
+        return False
+
+    if approved:
+        assign_host_manager(
+            int(row["host_id"]),
+            int(row["user_id"]),
+            assigned_by=int(actor_id),
+            permissions=set(HOST_MANAGER_PERMISSION_COLUMNS)
+        )
+
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE host_access_requests
+            SET status=?,
+                processed_by=?,
+                processed_at=?
+            WHERE id=? AND status='pending'
+        """, (
+            "approved" if approved else "denied",
+            int(actor_id),
+            int(time.time()),
+            int(request_id)
+        ))
+        conn.commit()
+
+    return True
+
+
+def host_manager_permission_text(
+    user_id: int,
+    host_id: int
+) -> str:
+    access = host_manager_access(user_id, host_id)
+
+    if not access:
+        return "👁️ Read-only"
+
+    labels = {
+        "edit_messages": "Edit pesan",
+        "schedule": "Jadwal",
+        "pause": "Pause",
+        "recheck": "Recheck",
+        "history": "History",
+        "test": "Test",
+    }
+
+    lines = []
+    for key, column in HOST_MANAGER_PERMISSION_COLUMNS.items():
+        mark = "✅" if access[column] else "❌"
+        lines.append(f"{mark} {labels.get(key, key)}")
+
+    return "\n".join(lines)
+
+
+HOST_TEMPLATE_PRESETS = {
+    "live_simple": "🔴 {creator} sedang LIVE di {platform}!\\n{url}",
+    "live_hype": "🎉 {creator} lagi LIVE sekarang! Jangan ketinggalan 🔥\\n{url}",
+    "post_simple": "🆕 Ada konten baru dari {creator} di {platform}.\\n{url}",
+    "end_simple": "⚫ LIVE {creator} sudah selesai.",
+}
+
+
+def apply_host_template_preset(
+    host_id: int,
+    preset: str
+):
+    if preset == "reset":
+        clear_host_messages(host_id)
+        return
+
+    value = HOST_TEMPLATE_PRESETS.get(preset)
+    if not value:
+        raise ValueError("Preset tidak ditemukan.")
+
+    with closing(db()) as conn:
+        if preset.startswith("post_"):
+            conn.execute(
+                "UPDATE hosts SET custom_post_message=? WHERE id=?",
+                (value, int(host_id))
+            )
+        elif preset.startswith("end_"):
+            conn.execute(
+                "UPDATE hosts SET custom_end_message=? WHERE id=?",
+                (value, int(host_id))
+            )
+        else:
+            conn.execute(
+                "UPDATE hosts SET custom_live_message=? WHERE id=?",
+                (value, int(host_id))
+            )
+        conn.commit()
 
 
 def assign_host_manager(
@@ -1541,6 +1986,18 @@ def delete_host(host_id: int):
             "DELETE FROM host_manager_activity WHERE host_id=?",
             (host_id,)
         )
+        conn.execute(
+            "DELETE FROM host_manager_preferences WHERE host_id=?",
+            (host_id,)
+        )
+        conn.execute(
+            "DELETE FROM host_access_requests WHERE host_id=?",
+            (host_id,)
+        )
+        conn.execute(
+            "DELETE FROM host_manager_warnings WHERE host_id=?",
+            (host_id,)
+        )
 
         conn.commit()
 
@@ -1677,6 +2134,33 @@ async def send_host_error_alert(host):
         try:
             user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
             await user.send(embed=embed)
+        except Exception:
+            pass
+
+    # Host Manager assigned to this host also receives a focused warning.
+    for manager in list_host_managers(int(host["id"])):
+        now = int(time.time())
+        if manager["expires_at"] and int(manager["expires_at"]) <= now:
+            continue
+
+        try:
+            user = bot.get_user(int(manager["user_id"])) or await bot.fetch_user(
+                int(manager["user_id"])
+            )
+            await user.send(
+                embed=discord.Embed(
+                    title="⚠️ Host Kamu Bermasalah",
+                    description=(
+                        f"**{platform_display_name(host['platform'])} • "
+                        f"{host['display_name'] or host['target']}**\n"
+                        f"Error: `{str(host['last_error'] or '-')[:700]}`\n"
+                        f"Jumlah error: **{host['error_count']}**\n\n"
+                        "Buka `/menu → Host Saya` lalu gunakan **Recheck** "
+                        "jika permission-mu mengizinkan."
+                    ),
+                    color=discord.Color.orange()
+                )
+            )
         except Exception:
             pass
 
@@ -6095,6 +6579,85 @@ def host_due(host, now: int) -> bool:
     return now - last >= interval
 
 
+@tasks.loop(hours=12)
+async def host_manager_expiry_warning_loop():
+    now = int(time.time())
+    h3 = now + 3 * 86400
+
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT hm.*, h.platform, h.target, h.display_name
+            FROM host_managers hm
+            JOIN hosts h ON h.id=hm.host_id
+            WHERE hm.expires_at IS NOT NULL
+              AND hm.expires_at>?
+              AND hm.expires_at<=?
+        """, (
+            now,
+            h3
+        )).fetchall()
+
+    for row in rows:
+        warning_key = f"expiry_h3:{int(row['expires_at'])}"
+
+        with closing(db()) as conn:
+            sent = conn.execute("""
+                SELECT 1
+                FROM host_manager_warnings
+                WHERE host_id=? AND user_id=? AND warning_key=?
+            """, (
+                int(row["host_id"]),
+                int(row["user_id"]),
+                warning_key
+            )).fetchone()
+
+        if sent:
+            continue
+
+        try:
+            user = bot.get_user(int(row["user_id"])) or await bot.fetch_user(
+                int(row["user_id"])
+            )
+            await user.send(
+                embed=discord.Embed(
+                    title="⏳ Akses Host Akan Berakhir",
+                    description=(
+                        f"Host: **{platform_display_name(row['platform'])} • "
+                        f"{row['display_name'] or row['target']}**\\n"
+                        f"Berakhir: <t:{int(row['expires_at'])}:F> "
+                        f"(<t:{int(row['expires_at'])}:R>)"
+                    ),
+                    color=discord.Color.orange()
+                )
+            )
+
+            with closing(db()) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO host_manager_warnings(
+                        host_id, user_id, warning_key, sent_at
+                    )
+                    VALUES(?,?,?,?)
+                """, (
+                    int(row["host_id"]),
+                    int(row["user_id"]),
+                    warning_key,
+                    int(time.time())
+                ))
+                conn.commit()
+
+        except Exception:
+            log.exception(
+                "Gagal kirim warning expiry Host Manager user_id=%s host_id=%s",
+                row["user_id"],
+                row["host_id"]
+            )
+
+
+@host_manager_expiry_warning_loop.before_loop
+async def before_host_manager_expiry_warning_loop():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=BASE_MONITOR_TICK)
 async def monitor_loop():
     now = int(time.time())
@@ -8119,9 +8682,12 @@ def user_server_embed(guild: discord.Guild):
         value="⭐ PREMIUM" if plan == "premium" else "🆓 FREE",
         inline=True
     )
+    current_hosts = len(get_hosts(guild.id))
+    host_limit = host_limit_for_guild(guild.id)
+
     embed.add_field(
-        name="Batas Host",
-        value=str(host_limit_for_guild(guild.id)),
+        name="Host",
+        value=f"{current_hosts}/{host_limit}",
         inline=True
     )
 
@@ -8168,7 +8734,10 @@ def user_server_embed(guild: discord.Guild):
         )
 
     embed.set_footer(
-        text="Pengaturan lengkap hanya melalui DM Global Owner."
+        text=(
+            "Kelola host server sendiri melalui tombol Kelola Host. "
+            "Panel Global Owner tetap terpisah."
+        )
     )
     return embed
 
@@ -8341,47 +8910,59 @@ def dm_menu_home_embed(user_id: int):
     guilds = user_owned_guilds(user_id)
     managed_hosts = host_manager_rows(user_id)
 
+    roles = []
+    if guilds:
+        roles.append("🏢 Server Owner")
+    if managed_hosts:
+        roles.append("🎙️ Host Manager")
+    if is_global_owner(user_id):
+        roles.append("🛡️ Global Owner")
+
     embed = discord.Embed(
-        title="📩 Hi Notifku",
+        title="📩 Hi Notifku • Menu Pengguna",
         description=(
-            "Pilih server yang ingin dikelola atau buka **🎙️ Host Saya** "
-            "jika kamu ditugaskan sebagai Host Manager."
+            "Dashboard menyesuaikan peran akunmu. "
+            "Panel **Global Owner tetap terpisah di `/owner`**."
         ),
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="Server",
+        name="Peran Terdeteksi",
+        value="\n".join(roles) if roles else "Pengguna",
+        inline=False
+    )
+    embed.add_field(
+        name="Server Milikmu",
         value=str(len(guilds)),
         inline=True
     )
     embed.add_field(
-        name="Mode",
-        value="DM",
-        inline=True
-    )
-    embed.add_field(
-        name="Host Saya",
+        name="Host Dikelola",
         value=str(len(managed_hosts)),
         inline=True
     )
-    embed.set_footer(text="/menu • Hi Notifku")
-    return embed
 
-    @discord.ui.button(
-        label="Menu Awal",
-        emoji="🏠",
-        style=discord.ButtonStyle.secondary,
-        row=1
+    problems = host_manager_problem_hosts(user_id)
+    embed.add_field(
+        name="Host Bermasalah",
+        value=str(len(problems)),
+        inline=True
     )
-    async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
-            return
 
-        await interaction.response.edit_message(
-            embed=dm_menu_home_embed(self.user_id),
-            view=DMUserGuildPickerView(self.user_id, 0)
+    if managed_hosts:
+        embed.add_field(
+            name="Akses Host",
+            value=(
+                "Gunakan **🎙️ Host Saya** → pilih server → pilih host. "
+                "Host server yang bukan tugasmu tetap read-only."
+            ),
+            inline=False
         )
+
+    embed.set_footer(
+        text="/menu • User/Host dashboard • /owner tetap terpisah"
+    )
+    return embed
 
 
 class UserServerMenuView(discord.ui.View):
@@ -8418,6 +8999,15 @@ class UserServerMenuView(discord.ui.View):
             button.callback = package_callback
             self.add_item(button)
 
+        host_button = discord.ui.Button(
+            label="Kelola Host",
+            emoji="📡",
+            style=discord.ButtonStyle.primary,
+            row=3
+        )
+        host_button.callback = self.manage_hosts
+        self.add_item(host_button)
+
         back = discord.ui.Button(
             label="Kembali",
             emoji="⬅️",
@@ -8435,6 +9025,27 @@ class UserServerMenuView(discord.ui.View):
         )
         home.callback = self.home
         self.add_item(home)
+
+    async def manage_hosts(self, interaction: discord.Interaction):
+        guild = bot.get_guild(self.guild_id)
+
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya owner server yang dapat mengelola host server ini."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                guild.id,
+                interaction.user.id
+            )
+        )
 
     async def back(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
@@ -8534,28 +9145,808 @@ class UserServerMenuView(discord.ui.View):
 
 
 
+def user_server_hosts_embed(guild: discord.Guild):
+    hosts = get_hosts(guild.id)
+    settings = get_guild_settings(guild.id)
+    limit = host_limit_for_guild(guild.id)
+    plan = str(settings["plan"] or "free").upper()
+
+    embed = discord.Embed(
+        title=f"📡 Host Server • {guild.name}",
+        description=(
+            "Kelola host milik servermu sendiri.\n"
+            "Fitur ini tersedia untuk **FREE dan PREMIUM** dan "
+            "tidak memberikan akses ke panel Global Owner."
+        ),
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Plan",
+        value=f"{'⭐' if plan == 'PREMIUM' else '🆓'} {plan}",
+        inline=True
+    )
+    embed.add_field(
+        name="Pemakaian Host",
+        value=f"**{len(hosts)}/{limit}**",
+        inline=True
+    )
+    embed.add_field(
+        name="Platform",
+        value="YouTube • TikTok • Twitch • Kick • Instagram • Facebook",
+        inline=False
+    )
+    embed.set_footer(
+        text="Server Owner Self-Service • terpisah dari /owner"
+    )
+    return embed
+
+
+def get_host_for_server_owner(
+    guild_id: int,
+    host_id: int,
+    user_id: int
+):
+    guild = bot.get_guild(int(guild_id))
+    if (
+        guild is None
+        or int(guild.owner_id) != int(user_id)
+    ):
+        return None
+
+    host = get_host(int(host_id))
+    if (
+        not host
+        or int(host["guild_id"]) != int(guild_id)
+    ):
+        return None
+
+    return host
+
+
+class UserAddHostModal(discord.ui.Modal):
+    platform = discord.ui.TextInput(
+        label="Platform",
+        placeholder="youtube/tiktok/twitch/kick/instagram/facebook",
+        max_length=20
+    )
+    target = discord.ui.TextInput(
+        label="Username / Channel ID / URL",
+        placeholder="Contoh: username atau UCxxxx / URL Facebook",
+        max_length=300
+    )
+    channel_id_input = discord.ui.TextInput(
+        label="Channel Discord tujuan",
+        placeholder="ID channel Discord",
+        max_length=25
+    )
+    role_id_input = discord.ui.TextInput(
+        label="Role mention (opsional)",
+        placeholder="ID role Discord, boleh kosong",
+        required=False,
+        max_length=25
+    )
+
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(
+            title="Tambah Host Server",
+            timeout=300
+        )
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Form ini bukan milikmu."
+            )
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya owner server yang dapat menambah host."
+            )
+            return
+
+        current = len(get_hosts(self.guild_id))
+        limit = host_limit_for_guild(self.guild_id)
+        if current >= limit:
+            settings = get_guild_settings(self.guild_id)
+            if settings["plan"] == "premium":
+                msg = f"❌ Batas host PREMIUM tercapai (**{current}/{limit}**)."
+            else:
+                msg = (
+                    f"❌ Batas host FREE tercapai (**{current}/{limit}**).\n"
+                    "Upgrade Premium jika membutuhkan lebih banyak host."
+                )
+            await safe_reply(interaction, msg)
+            return
+
+        platform = self.platform.value.strip().lower()
+        target_raw = self.target.value.strip()
+
+        if platform not in SUPPORTED_PLATFORMS:
+            await safe_reply(
+                interaction,
+                (
+                    "❌ Platform tidak didukung.\n"
+                    "Gunakan `youtube`, `tiktok`, `twitch`, `kick`, "
+                    "`instagram`, atau `facebook`."
+                )
+            )
+            return
+
+        channel_raw = self.channel_id_input.value.strip()
+        if not channel_raw.isdigit():
+            await safe_reply(
+                interaction,
+                "❌ Channel Discord harus berupa ID angka."
+            )
+            return
+
+        channel = guild.get_channel(int(channel_raw))
+        if not isinstance(
+            channel,
+            (discord.TextChannel, discord.Thread)
+        ):
+            await safe_reply(
+                interaction,
+                "❌ Channel tujuan tidak ditemukan di server tersebut."
+            )
+            return
+
+        me = guild.me
+        if isinstance(channel, discord.TextChannel) and me:
+            perms = channel.permissions_for(me)
+            if not (
+                perms.view_channel
+                and perms.send_messages
+                and perms.embed_links
+            ):
+                await safe_reply(
+                    interaction,
+                    (
+                        "❌ Bot belum punya izin **View Channel + "
+                        "Send Messages + Embed Links** di channel tersebut."
+                    )
+                )
+                return
+
+        role_id = None
+        role_raw = self.role_id_input.value.strip()
+        if role_raw:
+            if not role_raw.isdigit():
+                await safe_reply(
+                    interaction,
+                    "❌ Role Discord harus berupa ID angka."
+                )
+                return
+            role = guild.get_role(int(role_raw))
+            if role is None:
+                await safe_reply(
+                    interaction,
+                    "❌ Role tidak ditemukan di server tersebut."
+                )
+                return
+            role_id = int(role_raw)
+
+        target = normalize_social_target(
+            platform,
+            target_raw
+        )
+        if not target:
+            await safe_reply(
+                interaction,
+                "❌ Username/target tidak valid."
+            )
+            return
+
+        await defer_if_needed(interaction)
+
+        try:
+            display_name = (
+                f"@{target}"
+                if not target.startswith(("http://", "https://"))
+                else target
+            )
+            extra = None
+
+            if platform == "youtube":
+                display_name, extra = await resolve_youtube_channel(target)
+
+            add_host(
+                self.guild_id,
+                platform,
+                target,
+                display_name,
+                extra
+            )
+
+            with closing(db()) as conn:
+                row = conn.execute("""
+                    SELECT id
+                    FROM hosts
+                    WHERE guild_id=? AND platform=? AND target=?
+                """, (
+                    self.guild_id,
+                    platform,
+                    target
+                )).fetchone()
+
+            if not row:
+                raise RuntimeError("Host berhasil diproses tetapi ID host tidak ditemukan.")
+
+            set_host_channel(
+                int(row["id"]),
+                int(channel_raw)
+            )
+            set_host_role(
+                int(row["id"]),
+                role_id
+            )
+
+            await log_action(
+                self.guild_id,
+                interaction.user.id,
+                "Server Owner Tambah Host",
+                (
+                    f"{platform_display_name(platform)} {target} "
+                    f"channel={channel_raw}"
+                )
+            )
+
+            refreshed_count = len(get_hosts(self.guild_id))
+            await interaction.followup.send(
+                (
+                    f"✅ {platform_icon(platform)} **{platform_display_name(platform)}** "
+                    f"`{display_name}` berhasil ditambahkan.\n"
+                    f"📣 Channel: <#{channel_raw}>\n"
+                    f"📊 Host: **{refreshed_count}/{limit}**"
+                ),
+                ephemeral=True
+            )
+
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Gagal menambahkan host: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+
+class UserServerHostSelect(discord.ui.Select):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int
+    ):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        hosts = get_hosts(self.guild_id)
+
+        options = []
+        for host in hosts[:25]:
+            label = host["display_name"] or host["target"]
+            state = "Aktif" if host["enabled"] else "Pause"
+            options.append(
+                discord.SelectOption(
+                    label=f"{platform_display_name(host['platform'])} • {label}"[:100],
+                    description=f"{state} • Host ID {host['id']}"[:100],
+                    value=str(host["id"]),
+                    emoji=platform_icon(host["platform"])
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Belum ada host",
+                    description="Tekan Tambah Host untuk membuat host pertama.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih host server",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Menu ini bukan milikmu."
+            )
+            return
+
+        host_id = int(self.values[0])
+        if not host_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Belum ada host. Tekan **Tambah Host**."
+            )
+            return
+
+        host = get_host_for_server_owner(
+            self.guild_id,
+            host_id,
+            interaction.user.id
+        )
+        if not host:
+            await safe_reply(
+                interaction,
+                "🔒 Host tidak ditemukan atau bukan milik servermu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_host_detail_embed(host),
+            view=UserServerHostCardView(
+                self.guild_id,
+                self.user_id,
+                host_id
+            )
+        )
+
+
+def user_server_host_detail_embed(host):
+    status = "🟢 Aktif" if host["enabled"] else "⏸️ Pause"
+    channel = (
+        f"<#{host['channel_id']}>"
+        if host["channel_id"]
+        else "Belum diatur"
+    )
+    role = (
+        f"<@&{host['role_id']}>"
+        if host["role_id"]
+        else "Tidak ada"
+    )
+
+    embed = discord.Embed(
+        title=(
+            f"{platform_icon(host['platform'])} "
+            f"{platform_display_name(host['platform'])} • "
+            f"{host['display_name'] or host['target']}"
+        ),
+        description=(
+            f"{status}\n"
+            f"Target: `{host['target']}`"
+        ),
+        color=(
+            discord.Color.green()
+            if host["enabled"]
+            else discord.Color.orange()
+        )
+    )
+    embed.add_field(
+        name="Channel",
+        value=channel,
+        inline=True
+    )
+    embed.add_field(
+        name="Role",
+        value=role,
+        inline=True
+    )
+    embed.add_field(
+        name="Monitor",
+        value=(
+            f"Last: {fmt_time(host['last_check'])}\n"
+            f"Error: **{host['error_count'] or 0}**"
+        ),
+        inline=False
+    )
+    if host["last_error"]:
+        embed.add_field(
+            name="Error Terakhir",
+            value=str(host["last_error"])[:800],
+            inline=False
+        )
+    embed.set_footer(
+        text=(
+            f"Server Owner Self-Service • Host ID {host['id']} • "
+            "tanpa akses /owner"
+        )
+    )
+    return embed
+
+
+class UserServerHostsView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int
+    ):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.add_item(
+            UserServerHostSelect(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    async def valid_owner(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Menu ini bukan milikmu."
+            )
+            return None
+
+        guild = bot.get_guild(self.guild_id)
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya owner server yang dapat memakai menu ini."
+            )
+            return None
+
+        return guild
+
+    @discord.ui.button(
+        label="Tambah Host",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+        row=1
+    )
+    async def add_host_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+
+        current = len(get_hosts(self.guild_id))
+        limit = host_limit_for_guild(self.guild_id)
+
+        if current >= limit:
+            settings = get_guild_settings(self.guild_id)
+            await safe_reply(
+                interaction,
+                (
+                    f"❌ Batas host {'PREMIUM' if settings['plan']=='premium' else 'FREE'} "
+                    f"sudah tercapai (**{current}/{limit}**)."
+                )
+            )
+            return
+
+        await interaction.response.send_modal(
+            UserAddHostModal(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_embed(guild),
+            view=UserServerMenuView(self.guild_id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def home(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Menu ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(
+                self.user_id,
+                0
+            )
+        )
+
+
+class UserServerHostCardView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        host_id: int
+    ):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+    async def valid(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Menu ini bukan milikmu."
+            )
+            return None
+
+        host = get_host_for_server_owner(
+            self.guild_id,
+            self.host_id,
+            interaction.user.id
+        )
+        if not host:
+            await safe_reply(
+                interaction,
+                "🔒 Host tidak ditemukan atau bukan milik servermu."
+            )
+            return None
+        return host
+
+    @discord.ui.button(
+        label="Pause / Resume",
+        emoji="⏯️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def toggle(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        toggle_host(self.host_id)
+        refreshed = get_host(self.host_id)
+
+        await log_action(
+            self.guild_id,
+            interaction.user.id,
+            "Server Owner Pause/Resume Host",
+            f"host_id={self.host_id} enabled={bool(refreshed['enabled'])}"
+        )
+
+        await interaction.response.edit_message(
+            embed=user_server_host_detail_embed(refreshed),
+            view=UserServerHostCardView(
+                self.guild_id,
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Recheck",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def recheck(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        key = f"server_owner_recheck:{self.host_id}"
+        if action_rate_limited(
+            interaction.user.id,
+            key
+        ):
+            await safe_reply(
+                interaction,
+                "⏳ Recheck terlalu cepat. Coba lagi beberapa detik."
+            )
+            return
+
+        await defer_if_needed(interaction)
+
+        try:
+            await host_manager_recheck(host)
+            await interaction.followup.send(
+                "✅ Recheck host selesai.",
+                ephemeral=True
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Recheck gagal: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(
+        label="Hapus Host",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        row=0
+    )
+    async def delete(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        label = host["display_name"] or host["target"]
+        delete_host(self.host_id)
+
+        await log_action(
+            self.guild_id,
+            interaction.user.id,
+            "Server Owner Hapus Host",
+            f"{platform_display_name(host['platform'])} {label}"
+        )
+
+        guild = bot.get_guild(self.guild_id)
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Menu ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=DMUserGuildPickerView(
+                self.user_id,
+                0
+            )
+        )
+
+
+
 def host_manager_home_embed(user_id: int):
     rows = host_manager_rows(user_id)
+    guilds = host_manager_guilds(user_id)
+    problems = host_manager_problem_hosts(user_id)
+    latest = host_manager_latest_notifications(user_id, limit=5)
+    first_time = host_manager_needs_onboarding(user_id)
+
+    description = (
+        "Panel khusus **Host Manager**. Pilih server terlebih dahulu agar "
+        "host dari server berbeda tidak pernah tercampur."
+    )
+
+    if first_time:
+        description += (
+            "\n\n👋 **Pertama kali?** Pilih server → pilih host. "
+            "Gunakan Quick Action untuk Preview, Recheck, Pesan, Jadwal, dan History."
+        )
 
     embed = discord.Embed(
         title="🎙️ Host Saya",
-        description=(
-            "Panel ini khusus **Host Manager** dan terpisah dari panel Owner.\n"
-            "Kamu hanya dapat mengelola host yang ditugaskan kepadamu."
-        ),
+        description=description,
         color=discord.Color.blurple()
     )
     embed.add_field(
-        name="Host yang Dikelola",
+        name="Server",
+        value=str(len(guilds)),
+        inline=True
+    )
+    embed.add_field(
+        name="Host Dikelola",
         value=str(len(rows)),
         inline=True
     )
     embed.add_field(
-        name="Akses Owner",
-        value="Tidak ada",
+        name="Masalah",
+        value=str(len(problems)),
         inline=True
     )
-    embed.set_footer(text="Host Panel • /menu")
+    embed.add_field(
+        name="Notif Terakhir",
+        value=str(len(latest)),
+        inline=True
+    )
+    embed.add_field(
+        name="Akses Owner",
+        value="❌ Tidak ada",
+        inline=True
+    )
+    embed.set_footer(
+        text="Host Panel • terpisah total dari /owner"
+    )
     return embed
 
 
@@ -8587,10 +9978,1315 @@ def host_manager_detail_embed(host, user_id: int):
         value=", ".join(permissions) if permissions else "Read-only",
         inline=False
     )
+    health_icon, health_text = host_health_label(host)
+    embed.add_field(
+        name="Health",
+        value=f"{health_icon} **{health_text}**",
+        inline=True
+    )
+    embed.add_field(
+        name="Permission",
+        value=host_manager_permission_text(user_id, host["id"]),
+        inline=False
+    )
+
     embed.set_footer(
         text=f"Host Panel terisolasi • Host ID {host['id']} • Tidak ada akses Owner"
     )
     return embed
+
+
+def host_manager_all_hosts_embed(
+    user_id: int,
+    guild_id: int
+):
+    rows = host_manager_visible_hosts(
+        user_id,
+        guild_id
+    )
+    assigned_ids = {
+        int(row["host_id"])
+        for row in host_manager_rows(user_id)
+        if int(row["guild_id"]) == int(guild_id)
+    }
+
+    guild = bot.get_guild(int(guild_id))
+    guild_name = guild.name if guild else f"Server {guild_id}"
+
+    embed = discord.Embed(
+        title=f"🌐 Semua Host • {guild_name}",
+        description=(
+            "Daftar ini hanya menampilkan host dari **server ini**.\n"
+            "Host yang tidak ditugaskan kepadamu tetap bersifat **read-only**."
+        ),
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="Total Host Server",
+        value=str(len(rows)),
+        inline=True
+    )
+    embed.add_field(
+        name="Bisa Dikelola",
+        value=str(sum(1 for row in rows if int(row["id"]) in assigned_ids)),
+        inline=True
+    )
+    embed.add_field(
+        name="Read-only",
+        value=str(sum(1 for row in rows if int(row["id"]) not in assigned_ids)),
+        inline=True
+    )
+
+    embed.set_footer(
+        text="Host Panel • hanya server ini • tidak menampilkan server lain"
+    )
+    return embed
+
+
+class HostManagerAllHostsSelect(discord.ui.Select):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int
+    ):
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+        rows = host_manager_visible_hosts(
+            self.user_id,
+            self.guild_id
+        )
+
+        assigned_ids = {
+            int(row["host_id"])
+            for row in host_manager_rows(self.user_id)
+            if int(row["guild_id"]) == self.guild_id
+        }
+
+        options = []
+
+        for row in rows[:25]:
+            label = (
+                row["display_name"]
+                or row["target"]
+                or f"Host {row['id']}"
+            )
+            access_label = (
+                "Kelola"
+                if int(row["id"]) in assigned_ids
+                else "Read-only"
+            )
+
+            options.append(
+                discord.SelectOption(
+                    label=(
+                        f"{platform_display_name(row['platform'])} • {label}"
+                    )[:100],
+                    description=(
+                        f"{access_label} • Host ID {row['id']}"
+                    )[:100],
+                    value=str(row["id"]),
+                    emoji=platform_icon(row["platform"])
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Belum ada host",
+                    description="Tidak ada host pada server ini.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih host dari server ini",
+            options=options,
+            row=0
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses ke server ini sudah tidak tersedia."
+            )
+            return
+
+        host_id = int(self.values[0])
+
+        if not host_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Tidak ada host pada server ini."
+            )
+            return
+
+        host = get_host(host_id)
+
+        if (
+            not host
+            or int(host["guild_id"]) != self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Host tersebut bukan bagian dari server ini."
+            )
+            return
+
+        if host_is_assigned_to_manager(
+            self.user_id,
+            host_id
+        ):
+            await interaction.response.edit_message(
+                embed=host_manager_detail_embed(
+                    host,
+                    self.user_id
+                ),
+                view=HostManagerDetailView(
+                    self.user_id,
+                    host_id
+                )
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_readonly_detail_embed(
+                host,
+                self.user_id
+            ),
+            view=HostManagerReadonlyHostView(
+                self.user_id,
+                host_id,
+                self.guild_id
+            )
+        )
+
+
+def host_manager_readonly_detail_embed(
+    host,
+    user_id: int
+):
+    guild = bot.get_guild(int(host["guild_id"]))
+    guild_name = (
+        guild.name
+        if guild
+        else f"Server {host['guild_id']}"
+    )
+
+    channel_text = (
+        f"<#{host['channel_id']}>"
+        if host["channel_id"]
+        else "Default / belum diatur"
+    )
+
+    role_text = (
+        f"<@&{host['role_id']}>"
+        if host["role_id"]
+        else "Tidak ada"
+    )
+
+    embed = discord.Embed(
+        title=(
+            f"👁️ Read-only • "
+            f"{platform_icon(host['platform'])} "
+            f"{platform_display_name(host['platform'])}"
+        ),
+        description=(
+            f"**{host['display_name'] or host['target']}**\n"
+            f"Server: **{guild_name}**\n"
+            f"Target: `{host['target']}`"
+        ),
+        color=discord.Color.greyple()
+    )
+
+    embed.add_field(
+        name="Status",
+        value=(
+            "🟢 Aktif"
+            if host["enabled"]
+            else "⏸️ Pause"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="Channel",
+        value=channel_text,
+        inline=True
+    )
+
+    embed.add_field(
+        name="Role",
+        value=role_text,
+        inline=True
+    )
+
+    embed.add_field(
+        name="Monitor",
+        value=(
+            f"Last check: {fmt_time(host['last_check'])}\n"
+            f"Error: **{host['error_count'] or 0}**"
+        ),
+        inline=False
+    )
+
+    if host["last_error"]:
+        embed.add_field(
+            name="Error Terakhir",
+            value=str(host["last_error"])[:800],
+            inline=False
+        )
+
+    embed.add_field(
+        name="Hak Akses",
+        value=(
+            "👁️ **Read-only**\n"
+            "Kamu dapat melihat host ini karena host berada di server "
+            "tempat kamu menjadi Host Manager."
+        ),
+        inline=False
+    )
+
+    embed.set_footer(
+        text=(
+            f"Host ID {host['id']} • Read-only • "
+            "hanya server yang sama"
+        )
+    )
+
+    return embed
+
+
+class HostManagerReadonlyHostView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        host_id: int,
+        guild_id: int
+    ):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+        self.guild_id = int(guild_id)
+
+    async def valid(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return None
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses ke server ini sudah tidak tersedia."
+            )
+            return None
+
+        host = get_host(self.host_id)
+
+        if (
+            not host
+            or int(host["guild_id"]) != self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Host tersebut bukan bagian dari server ini."
+            )
+            return None
+
+        return host
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_readonly_detail_embed(
+                host,
+                self.user_id
+            ),
+            view=HostManagerReadonlyHostView(
+                self.user_id,
+                self.host_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Minta Akses",
+        emoji="📨",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def request_access(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        try:
+            request_id = create_host_access_request(
+                self.user_id,
+                self.host_id
+            )
+        except Exception as exc:
+            await safe_reply(
+                interaction,
+                f"❌ {exc}"
+            )
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        sent = False
+
+        if guild:
+            try:
+                owner = guild.owner or await bot.fetch_user(
+                    int(guild.owner_id)
+                )
+                await owner.send(
+                    content=(
+                        f"📨 **Request Akses Host #{self.host_id}**\n"
+                        f"User: <@{self.user_id}>\n"
+                        f"Server: **{guild.name}**\n"
+                        f"Host: **{platform_display_name(host['platform'])} • "
+                        f"{host['display_name'] or host['target']}**"
+                    ),
+                    view=HostAccessRequestDecisionView(
+                        request_id,
+                        self.guild_id
+                    )
+                )
+                sent = True
+            except Exception:
+                pass
+
+        await safe_reply(
+            interaction,
+            (
+                f"✅ Request akses **#{request_id}** dikirim ke owner server."
+                if sent
+                else (
+                    f"✅ Request akses **#{request_id}** tersimpan, "
+                    "tetapi DM ke owner server gagal."
+                )
+            )
+        )
+
+    @discord.ui.button(
+        label="Semua Host Server",
+        emoji="🌐",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def all_hosts(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses ke server ini sudah tidak tersedia."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_all_hosts_embed(
+                self.user_id,
+                self.guild_id
+            ),
+            view=HostManagerAllHostsView(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="🎙️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def my_hosts(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(
+                self.user_id
+            ),
+            view=HostManagerHomeView(
+                self.user_id
+            )
+        )
+
+
+class HostManagerAllHostsView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int
+    ):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+        self.add_item(
+            HostManagerAllHostsSelect(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="🎙️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def my_hosts(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(
+                self.user_id
+            ),
+            view=HostManagerHomeView(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Menu Pengguna",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def user_home(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(
+                self.user_id
+            ),
+            view=DMUserGuildPickerView(
+                self.user_id,
+                0
+            )
+        )
+
+
+def host_manager_guild_embed(
+    user_id: int,
+    guild_id: int
+):
+    guild = bot.get_guild(int(guild_id))
+    hosts = host_manager_hosts_for_guild(
+        user_id,
+        guild_id
+    )
+    managed = [
+        host
+        for host in hosts
+        if host_manager_access(
+            user_id,
+            int(host["id"])
+        )
+    ]
+    problems = host_manager_problem_hosts(
+        user_id,
+        guild_id
+    )
+
+    embed = discord.Embed(
+        title=f"🏢 Host Server • {guild.name if guild else guild_id}",
+        description=(
+            "Daftar ini hanya untuk **server ini**. "
+            "Host yang bukan tugasmu dapat dilihat sebagai read-only."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Semua Host",
+        value=str(len(hosts)),
+        inline=True
+    )
+    embed.add_field(
+        name="Bisa Dikelola",
+        value=str(len(managed)),
+        inline=True
+    )
+    embed.add_field(
+        name="Bermasalah",
+        value=str(len(problems)),
+        inline=True
+    )
+    embed.set_footer(
+        text="Host Manager • server-scoped"
+    )
+    return embed
+
+
+class HostManagerGuildSelect(discord.ui.Select):
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
+        guilds = host_manager_guilds(self.user_id)
+
+        options = []
+        for guild in guilds[:25]:
+            managed = sum(
+                1
+                for row in host_manager_rows(self.user_id)
+                if int(row["guild_id"]) == int(guild.id)
+            )
+            options.append(
+                discord.SelectOption(
+                    label=guild.name[:100],
+                    description=f"{managed} host dikelola • Server ID {guild.id}"[:100],
+                    value=str(guild.id),
+                    emoji="🏢"
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Belum ada server Host",
+                    description="Belum ada host yang ditugaskan.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih server Host Manager",
+            options=options,
+            row=0
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        guild_id = int(self.values[0])
+
+        if not guild_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Belum ada server yang dapat dikelola."
+            )
+            return
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses server sudah tidak tersedia."
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_guild_embed(
+                self.user_id,
+                guild_id
+            ),
+            view=HostManagerGuildDashboardView(
+                self.user_id,
+                guild_id,
+                0
+            )
+        )
+
+
+class HostManagerScopedHostSelect(discord.ui.Select):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0,
+        host_ids: Optional[list[int]] = None
+    ):
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+
+        rows = host_manager_hosts_for_guild(
+            self.user_id,
+            self.guild_id
+        )
+
+        if host_ids is not None:
+            allowed_ids = {int(x) for x in host_ids}
+            rows = [
+                row
+                for row in rows
+                if int(row["id"]) in allowed_ids
+            ]
+
+        self.total = len(rows)
+        start = self.page * 25
+        current = rows[start:start + 25]
+
+        options = []
+        for host in current:
+            assigned = bool(
+                host_manager_access(
+                    self.user_id,
+                    int(host["id"])
+                )
+            )
+            pref = host_manager_pref(
+                self.user_id,
+                int(host["id"])
+            )
+            favorite = bool(
+                pref and pref["favorite"]
+            )
+            health_icon, health_text = host_health_label(host)
+            label = host["display_name"] or host["target"]
+
+            options.append(
+                discord.SelectOption(
+                    label=(
+                        f"{'⭐ ' if favorite else ''}"
+                        f"{platform_display_name(host['platform'])} • {label}"
+                    )[:100],
+                    description=(
+                        f"{health_icon} {health_text} • "
+                        f"{'Kelola' if assigned else 'Read-only'} • "
+                        f"Host {host['id']}"
+                    )[:100],
+                    value=str(host["id"]),
+                    emoji=platform_icon(host["platform"])
+                )
+            )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Tidak ada host",
+                    description="Tidak ada hasil pada halaman ini.",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            )
+
+        super().__init__(
+            placeholder=f"Pilih host • Halaman {self.page + 1}",
+            options=options,
+            row=0
+        )
+
+    async def callback(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(
+                interaction,
+                "❌ Panel ini bukan milikmu."
+            )
+            return
+
+        host_id = int(self.values[0])
+        if not host_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Tidak ada host pada halaman ini."
+            )
+            return
+
+        host = get_host(host_id)
+
+        if (
+            not host
+            or int(host["guild_id"]) != self.guild_id
+            or not host_manager_has_guild_access(
+                self.user_id,
+                self.guild_id
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Host bukan bagian dari server aktif."
+            )
+            return
+
+        if host_manager_access(
+            self.user_id,
+            host_id
+        ):
+            mark_host_manager_onboarding(
+                self.user_id,
+                host_id
+            )
+            await interaction.response.edit_message(
+                embed=host_manager_detail_embed(
+                    host,
+                    self.user_id
+                ),
+                view=HostManagerDetailView(
+                    self.user_id,
+                    host_id
+                )
+            )
+        else:
+            await interaction.response.edit_message(
+                embed=host_manager_readonly_detail_embed(
+                    host,
+                    self.user_id
+                ),
+                view=HostManagerReadonlyHostView(
+                    self.user_id,
+                    host_id,
+                    self.guild_id
+                )
+            )
+
+
+class HostSearchModal(discord.ui.Modal):
+    query = discord.ui.TextInput(
+        label="Cari Host",
+        placeholder="Username, nama, platform, atau ID host",
+        max_length=100
+    )
+
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int
+    ):
+        super().__init__(
+            title="Cari Host Server",
+            timeout=300
+        )
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction
+    ):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_has_guild_access(
+                self.user_id,
+                self.guild_id
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses ditolak."
+            )
+            return
+
+        q = self.query.value.strip().lower()
+        rows = host_manager_hosts_for_guild(
+            self.user_id,
+            self.guild_id
+        )
+
+        matches = [
+            row
+            for row in rows
+            if (
+                q in str(row["id"])
+                or q in str(row["platform"]).lower()
+                or q in str(row["target"]).lower()
+                or q in str(row["display_name"] or "").lower()
+            )
+        ]
+
+        if not matches:
+            await safe_reply(
+                interaction,
+                f"🔎 Tidak ada host cocok dengan `{q}`."
+            )
+            return
+
+        ids = [
+            int(row["id"])
+            for row in matches[:25]
+        ]
+
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🔎 Hasil Pencarian Host",
+                description=(
+                    f"Ditemukan **{len(matches)}** host. "
+                    "Menampilkan maksimal 25 hasil pertama."
+                ),
+                color=discord.Color.blurple()
+            ),
+            view=HostSearchResultsView(
+                self.user_id,
+                self.guild_id,
+                ids
+            ),
+            ephemeral=True
+        )
+
+
+class HostSearchResultsView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        host_ids: list[int]
+    ):
+        super().__init__(timeout=600)
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.add_item(
+            HostManagerScopedHostSelect(
+                self.user_id,
+                self.guild_id,
+                0,
+                host_ids
+            )
+        )
+
+
+def host_manager_latest_embed(
+    user_id: int,
+    guild_id: Optional[int] = None
+):
+    rows = host_manager_latest_notifications(
+        user_id,
+        guild_id,
+        10
+    )
+
+    lines = []
+    for row in rows:
+        icon = (
+            "✅"
+            if row["status"] == "sent"
+            else "⏳"
+            if row["status"] == "queued"
+            else "❌"
+        )
+        creator = (
+            row["display_name"]
+            or row["target"]
+            or f"Host {row['host_id']}"
+        )
+        lines.append(
+            f"{icon} <t:{row['created_at']}:R> • "
+            f"**{creator}** • `{row['event_type'] or 'notif'}`"
+        )
+
+    embed = discord.Embed(
+        title="🔔 Notifikasi Terakhir",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "Belum ada riwayat notifikasi."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(
+        text="Hanya notifikasi host yang kamu kelola"
+    )
+    return embed
+
+
+def host_manager_problems_embed(
+    user_id: int,
+    guild_id: Optional[int] = None
+):
+    rows = host_manager_problem_hosts(
+        user_id,
+        guild_id
+    )
+
+    lines = []
+    for host in rows[:20]:
+        icon, health = host_health_label(host)
+        label = host["display_name"] or host["target"]
+        reason = (
+            str(host["last_error"])[:90]
+            if host["last_error"]
+            else "Host sedang pause"
+        )
+        lines.append(
+            f"{icon} **{platform_display_name(host['platform'])} • {label}** "
+            f"— {health}\n↳ {reason}"
+        )
+
+    embed = discord.Embed(
+        title="⚠️ Host Bermasalah",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "✅ Tidak ada host bermasalah."
+        ),
+        color=(
+            discord.Color.orange()
+            if rows
+            else discord.Color.green()
+        )
+    )
+    embed.set_footer(
+        text="Error Center • gunakan Recheck pada host yang kamu kelola"
+    )
+    return embed
+
+
+def host_manager_activity_embed(user_id: int):
+    rows = host_manager_activity_rows(
+        user_id,
+        10
+    )
+
+    lines = []
+    for row in rows:
+        creator = (
+            row["display_name"]
+            or row["target"]
+            or f"Host {row['host_id']}"
+        )
+        lines.append(
+            f"• <t:{row['created_at']}:R> • **{creator}**\n"
+            f"  `{row['action']}`"
+        )
+
+    return discord.Embed(
+        title="🧾 Aktivitas Saya",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "Belum ada aktivitas Host Manager."
+        ),
+        color=discord.Color.blurple()
+    )
+
+
+def host_manager_help_embed():
+    return discord.Embed(
+        title="❓ Bantuan Host Manager",
+        description=(
+            "**Alur tercepat**\n"
+            "`/menu → Host Saya → pilih server → pilih host`\n\n"
+            "**Status health**\n"
+            "🟢 Healthy • 🟡 Warning • 🔴 Error • ⏸️ Paused\n\n"
+            "**Permission**\n"
+            "Tombol yang memerlukan izin akan tetap diverifikasi saat dipakai.\n\n"
+            "**Host read-only**\n"
+            "Kamu boleh melihat host lain di server yang sama, tetapi tidak dapat "
+            "mengubahnya. Gunakan **Minta Akses** bila diperlukan.\n\n"
+            "**Owner**\n"
+            "Host Manager tidak memiliki akses `/owner`, pembayaran, backup, "
+            "premium admin, atau konfigurasi Global Owner."
+        ),
+        color=discord.Color.blurple()
+    )
+
+
+class SimpleBackToHostHomeView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=600)
+        self.user_id = int(user_id)
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="🎙️",
+        style=discord.ButtonStyle.secondary
+    )
+    async def back(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(
+                self.user_id
+            ),
+            view=HostManagerHomeView(
+                self.user_id
+            )
+        )
+
+
+class HostManagerGuildDashboardView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0
+    ):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+
+        self.add_item(
+            HostManagerScopedHostSelect(
+                self.user_id,
+                self.guild_id,
+                self.page
+            )
+        )
+
+    async def valid(
+        self,
+        interaction: discord.Interaction
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return False
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses server sudah tidak tersedia."
+            )
+            return False
+
+        return True
+
+    @discord.ui.button(
+        label="Sebelumnya",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def previous(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_guild_embed(
+                self.user_id,
+                self.guild_id
+            ),
+            view=HostManagerGuildDashboardView(
+                self.user_id,
+                self.guild_id,
+                max(0, self.page - 1)
+            )
+        )
+
+    @discord.ui.button(
+        label="Berikutnya",
+        emoji="➡️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def next_page(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        total = len(
+            host_manager_hosts_for_guild(
+                self.user_id,
+                self.guild_id
+            )
+        )
+        max_page = max(0, (total - 1) // 25)
+
+        await interaction.response.edit_message(
+            embed=host_manager_guild_embed(
+                self.user_id,
+                self.guild_id
+            ),
+            view=HostManagerGuildDashboardView(
+                self.user_id,
+                self.guild_id,
+                min(max_page, self.page + 1)
+            )
+        )
+
+    @discord.ui.button(
+        label="Cari",
+        emoji="🔎",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def search(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.send_modal(
+            HostSearchModal(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Notif Terakhir",
+        emoji="🔔",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def latest(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_latest_embed(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Masalah Host",
+        emoji="⚠️",
+        style=discord.ButtonStyle.danger,
+        row=2
+    )
+    async def problems(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_problems_embed(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Host Saya",
+        emoji="🎙️",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def host_home(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_manager_home_embed(
+                self.user_id
+            ),
+            view=HostManagerHomeView(
+                self.user_id
+            )
+        )
+
 
 
 class HostManagerSelect(discord.ui.Select):
@@ -8673,13 +11369,107 @@ class HostManagerHomeView(discord.ui.View):
     def __init__(self, user_id: int):
         super().__init__(timeout=900)
         self.user_id = int(user_id)
-        self.add_item(HostManagerSelect(self.user_id))
+        self.add_item(
+            HostManagerGuildSelect(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Notif Terakhir",
+        emoji="🔔",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def latest(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_latest_embed(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Masalah Host",
+        emoji="⚠️",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
+    async def problems(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_problems_embed(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Aktivitas Saya",
+        emoji="🧾",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def activity(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_activity_embed(
+                self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Bantuan Host",
+        emoji="❓",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def help_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_help_embed()
+        )
 
     @discord.ui.button(
         label="Menu Pengguna",
-        emoji="⬅️",
+        emoji="🏠",
         style=discord.ButtonStyle.secondary,
-        row=1
+        row=2
     )
     async def back_user_menu(
         self,
@@ -8692,7 +11482,10 @@ class HostManagerHomeView(discord.ui.View):
 
         await interaction.response.edit_message(
             embed=dm_menu_home_embed(self.user_id),
-            view=DMUserGuildPickerView(self.user_id, 0)
+            view=DMUserGuildPickerView(
+                self.user_id,
+                0
+            )
         )
 
 
@@ -8791,7 +11584,7 @@ class HostManagerScheduleModal(discord.ui.Modal):
     )
     timezone_input = discord.ui.TextInput(
         label="Timezone",
-        placeholder="Asia/Jakarta",
+        placeholder="WIB / WITA / WIT",
         max_length=60
     )
 
@@ -8854,7 +11647,14 @@ class HostManagerScheduleModal(discord.ui.Modal):
             )
             return
 
-        tz = self.timezone_input.value.strip() or "Asia/Jakarta"
+        tz_raw = self.timezone_input.value.strip() or "WIB"
+        tz_alias = {
+            "WIB": "Asia/Jakarta",
+            "WITA": "Asia/Makassar",
+            "WIT": "Asia/Jayapura",
+        }
+        tz = tz_alias.get(tz_raw.upper(), tz_raw)
+
         try:
             ZoneInfo(tz)
         except Exception:
@@ -9180,24 +11980,82 @@ class HostManagerDetailView(discord.ui.View):
         if not host:
             return
 
-        enabled = toggle_host(self.host_id)
-
-        log_host_manager_action(
-            self.host_id,
-            interaction.user.id,
-            "pause_resume",
-            f"enabled={enabled}"
-        )
-
-        refreshed = get_host(self.host_id)
-        await interaction.response.edit_message(
-            embed=host_manager_detail_embed(
-                refreshed,
-                self.user_id
+        action = "mengaktifkan" if not host["enabled"] else "pause"
+        await safe_reply(
+            interaction,
+            (
+                f"⚠️ Konfirmasi {action} host "
+                f"**{host['display_name'] or host['target']}**?"
             ),
-            view=HostManagerDetailView(
+            view=HostPauseConfirmView(
                 self.user_id,
                 self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Template",
+        emoji="🧩",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def template(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction, "edit_messages"):
+            return
+
+        await safe_reply(
+            interaction,
+            "🧩 Pilih preset atau reset ke default.",
+            view=HostTemplatePresetView(
+                self.user_id,
+                self.host_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Pin / Favorit",
+        emoji="⭐",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def favorite(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        pref = host_manager_pref(
+            self.user_id,
+            self.host_id
+        )
+        current = bool(
+            pref and pref["favorite"]
+        )
+        set_host_manager_favorite(
+            self.user_id,
+            self.host_id,
+            not current
+        )
+        log_host_manager_action(
+            self.host_id,
+            self.user_id,
+            "favorite",
+            f"favorite={not current}"
+        )
+
+        await safe_reply(
+            interaction,
+            (
+                "⭐ Host dipin ke bagian atas daftar."
+                if not current
+                else "✅ Pin host dilepas."
             )
         )
 
@@ -9284,6 +12142,38 @@ class HostManagerDetailView(discord.ui.View):
         )
 
     @discord.ui.button(
+        label="Semua Host Server",
+        emoji="🌐",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def all_server_hosts(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        host = await self.valid(interaction)
+        if not host:
+            return
+
+        guild_id = int(host["guild_id"])
+
+        await interaction.response.edit_message(
+            embed=host_manager_all_hosts_embed(
+                self.user_id,
+                guild_id
+            ),
+            view=HostManagerAllHostsView(
+                self.user_id,
+                guild_id
+            )
+        )
+
+    @discord.ui.button(
         label="Host Saya",
         emoji="⬅️",
         style=discord.ButtonStyle.secondary,
@@ -9326,6 +12216,263 @@ class HostManagerDetailView(discord.ui.View):
             embed=dm_menu_home_embed(self.user_id),
             view=DMUserGuildPickerView(self.user_id, 0)
         )
+
+
+class HostTemplatePresetView(discord.ui.View):
+    def __init__(self, user_id: int, host_id: int):
+        super().__init__(timeout=600)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+    async def apply(
+        self,
+        interaction: discord.Interaction,
+        preset: str
+    ):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_has_permission(
+                self.user_id,
+                self.host_id,
+                "edit_messages"
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Kamu tidak punya izin mengubah template."
+            )
+            return
+
+        apply_host_template_preset(
+            self.host_id,
+            preset
+        )
+
+        log_host_manager_action(
+            self.host_id,
+            self.user_id,
+            "template_preset",
+            preset
+        )
+
+        await safe_reply(
+            interaction,
+            "✅ Template notifikasi diperbarui."
+        )
+
+    @discord.ui.button(
+        label="LIVE Simple",
+        emoji="🔴",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def live_simple(self, interaction, button):
+        await self.apply(interaction, "live_simple")
+
+    @discord.ui.button(
+        label="LIVE Hype",
+        emoji="🎉",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def live_hype(self, interaction, button):
+        await self.apply(interaction, "live_hype")
+
+    @discord.ui.button(
+        label="Post Simple",
+        emoji="🆕",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def post_simple(self, interaction, button):
+        await self.apply(interaction, "post_simple")
+
+    @discord.ui.button(
+        label="Live End",
+        emoji="⚫",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def end_simple(self, interaction, button):
+        await self.apply(interaction, "end_simple")
+
+    @discord.ui.button(
+        label="Reset Default",
+        emoji="♻️",
+        style=discord.ButtonStyle.danger,
+        row=2
+    )
+    async def reset(self, interaction, button):
+        await self.apply(interaction, "reset")
+
+
+class HostPauseConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: int,
+        host_id: int
+    ):
+        super().__init__(timeout=120)
+        self.user_id = int(user_id)
+        self.host_id = int(host_id)
+
+    @discord.ui.button(
+        label="Ya, Ubah Status",
+        emoji="✅",
+        style=discord.ButtonStyle.danger
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if (
+            interaction.user.id != self.user_id
+            or not host_manager_has_permission(
+                self.user_id,
+                self.host_id,
+                "pause"
+            )
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses ditolak."
+            )
+            return
+
+        enabled = toggle_host(self.host_id)
+        log_host_manager_action(
+            self.host_id,
+            self.user_id,
+            "pause_resume",
+            f"enabled={enabled}"
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                "✅ Host sekarang **AKTIF**."
+                if enabled
+                else "⏸️ Host sekarang **PAUSE**."
+            ),
+            embed=None,
+            view=None
+        )
+
+    @discord.ui.button(
+        label="Batal",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+
+        await interaction.response.edit_message(
+            content="Dibatalkan.",
+            embed=None,
+            view=None
+        )
+
+
+class HostAccessRequestDecisionView(discord.ui.View):
+    def __init__(
+        self,
+        request_id: int,
+        guild_id: int
+    ):
+        super().__init__(timeout=86400)
+        self.request_id = int(request_id)
+        self.guild_id = int(guild_id)
+
+    async def valid_owner(
+        self,
+        interaction: discord.Interaction
+    ):
+        guild = bot.get_guild(self.guild_id)
+        if (
+            guild is None
+            or int(guild.owner_id) != int(interaction.user.id)
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya owner server terkait yang dapat memproses request ini."
+            )
+            return None
+        return guild
+
+    async def finish(
+        self,
+        interaction: discord.Interaction,
+        approved: bool
+    ):
+        if not await self.valid_owner(interaction):
+            return
+
+        row = get_host_access_request(
+            self.request_id
+        )
+        if not row or row["status"] != "pending":
+            await safe_reply(
+                interaction,
+                "ℹ️ Request ini sudah diproses."
+            )
+            return
+
+        ok = process_host_access_request(
+            self.request_id,
+            approved=approved,
+            actor_id=interaction.user.id
+        )
+
+        if not ok:
+            await safe_reply(
+                interaction,
+                "❌ Request gagal diproses."
+            )
+            return
+
+        try:
+            user = bot.get_user(int(row["user_id"])) or await bot.fetch_user(
+                int(row["user_id"])
+            )
+            await user.send(
+                f"{'✅' if approved else '❌'} Request akses Host #{row['host_id']} "
+                f"{'disetujui' if approved else 'ditolak'} oleh owner server."
+            )
+        except Exception:
+            pass
+
+        await interaction.response.edit_message(
+            content=(
+                "✅ Request disetujui."
+                if approved
+                else "❌ Request ditolak."
+            ),
+            embed=None,
+            view=None
+        )
+
+    @discord.ui.button(
+        label="Setujui",
+        emoji="✅",
+        style=discord.ButtonStyle.success
+    )
+    async def approve(self, interaction, button):
+        await self.finish(interaction, True)
+
+    @discord.ui.button(
+        label="Tolak",
+        emoji="❌",
+        style=discord.ButtonStyle.danger
+    )
+    async def deny(self, interaction, button):
+        await self.finish(interaction, False)
+
 
 
 class AssignHostManagerModal(discord.ui.Modal):
@@ -14104,6 +17251,9 @@ async def on_ready():
 
     if not monitor_loop.is_running():
         monitor_loop.start()
+
+    if not host_manager_expiry_warning_loop.is_running():
+        host_manager_expiry_warning_loop.start()
 
     if not premium_expiry_loop.is_running():
         premium_expiry_loop.start()
