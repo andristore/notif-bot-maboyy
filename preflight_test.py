@@ -20,9 +20,31 @@ dupes = {k:v for k,v in defs.items() if len(v) > 1}
 if dupes:
     fail(f"duplicate top-level definitions: {dupes}")
 
+# Internal base classes must be defined before subclasses.
+class_lines = {
+    node.name: node.lineno
+    for node in tree.body
+    if isinstance(node, ast.ClassDef)
+}
+for node in tree.body:
+    if not isinstance(node, ast.ClassDef):
+        continue
+    for base in node.bases:
+        if isinstance(base, ast.Name) and base.id in class_lines:
+            if class_lines[base.id] >= node.lineno:
+                fail(
+                    f"class-order error: {node.name} uses {base.id} "
+                    f"before it is defined"
+                )
+
 text = BOT.read_text(encoding="utf-8")
 env_keys = set(re.findall(r'os\.getenv\(\s*["\']([A-Z0-9_]+)["\']', text))
-env_keys.discard("PORT")  # Railway injects this automatically.
+for injected in {
+    "PORT",
+    "RAILWAY_GIT_COMMIT_SHA",
+    "RAILWAY_DEPLOYMENT_ID",
+}:
+    env_keys.discard(injected)
 env_text = (ROOT / "railway-variables.env").read_text(encoding="utf-8")
 listed = set(re.findall(r'^([A-Z0-9_]+)=', env_text, flags=re.M))
 missing = sorted(env_keys - listed)

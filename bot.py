@@ -24290,6 +24290,39 @@ class PaymentTestModal(discord.ui.Modal):
         )
 
 
+class OwnerBasicBackView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_global_owner(interaction)
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧰 Owner Operations",
+                description="Pilih pusat operasi Global Owner.",
+                color=discord.Color.blurple()
+            ),
+            view=OwnerOpsHomeView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=4)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
 class PaymentCenterView(OwnerBasicBackView):
     @discord.ui.button(label="Health", emoji="🩺", style=discord.ButtonStyle.secondary, row=0)
     async def health(self, interaction, button):
@@ -24988,39 +25021,6 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerHomeView(self.viewer_id)
         )
 
-
-class OwnerBasicBackView(discord.ui.View):
-    def __init__(self, viewer_id: int):
-        super().__init__(timeout=900)
-        self.viewer_id = int(viewer_id)
-
-    async def valid(self, interaction):
-        if int(interaction.user.id) != self.viewer_id:
-            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
-            return False
-        return await require_global_owner(interaction)
-
-    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=4)
-    async def back(self, interaction, button):
-        if not await self.valid(interaction):
-            return
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="🧰 Owner Operations",
-                description="Pilih pusat operasi Global Owner.",
-                color=discord.Color.blurple()
-            ),
-            view=OwnerOpsHomeView(self.viewer_id)
-        )
-
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=4)
-    async def home(self, interaction, button):
-        if not await self.valid(interaction):
-            return
-        await interaction.response.edit_message(
-            embed=owner_home_embed(),
-            view=OwnerHomeView(self.viewer_id)
-        )
 
 
 class OwnerSelfTestView(OwnerBasicBackView):
