@@ -4539,6 +4539,36 @@ async def require_global_owner(interaction: discord.Interaction) -> bool:
     return False
 
 
+async def require_owner_level(
+    interaction: discord.Interaction,
+    minimum: str = "read_only"
+) -> bool:
+    if not is_global_owner(interaction.user.id):
+        await safe_reply(
+            interaction,
+            (
+                "🔒 Fitur ini hanya untuk **Global Owner Bot**.\n"
+                "Pemilik Server dan Host Manager tidak memiliki akses."
+            )
+        )
+        return False
+
+    if not owner_has_level(
+        interaction.user.id,
+        minimum
+    ):
+        await safe_reply(
+            interaction,
+            (
+                f"🔒 Role Global Owner-mu (**{owner_role(interaction.user.id)}**) "
+                f"belum memenuhi akses **{minimum}**."
+            )
+        )
+        return False
+
+    return True
+
+
 def is_server_owner(
     user_id: int,
     guild_id: int
@@ -7562,24 +7592,295 @@ def restore_guild_backup(data: dict, target_guild_id: int):
 def fmt_time(ts: Optional[int]) -> str:
     return f"<t:{int(ts)}:R>" if ts else "Belum pernah"
 
+def global_access_stats() -> dict:
+    server_owner_ids = {
+        int(guild.owner_id)
+        for guild in bot.guilds
+        if guild.owner_id
+    }
+
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        host_manager_users = conn.execute("""
+            SELECT COUNT(DISTINCT user_id) AS total
+            FROM host_managers
+            WHERE expires_at IS NULL OR expires_at>?
+        """, (now,)).fetchone()
+
+        server_manager_users = conn.execute("""
+            SELECT COUNT(DISTINCT user_id) AS total
+            FROM server_host_managers
+            WHERE enabled=1
+              AND (expires_at IS NULL OR expires_at>?)
+        """, (now,)).fetchone()
+
+        pending_access = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM server_host_access_requests
+            WHERE status='pending'
+        """).fetchone()
+
+        pending_hosts = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM host_creation_requests
+            WHERE status='pending'
+        """).fetchone()
+
+        blacklist = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM user_blacklist
+        """).fetchone()
+
+    return {
+        "global_owners": len(OWNER_IDS | db_owner_ids()),
+        "primary_owners": len(OWNER_IDS),
+        "server_owners": len(server_owner_ids),
+        "host_managers": int(host_manager_users["total"] or 0),
+        "server_host_managers": int(server_manager_users["total"] or 0),
+        "pending_access": int(pending_access["total"] or 0),
+        "pending_hosts": int(pending_hosts["total"] or 0),
+        "blacklisted": int(blacklist["total"] or 0),
+    }
+
+
+def global_owner_access_embed(viewer_id: int):
+    stats = global_access_stats()
+    role = owner_role(viewer_id)
+
+    embed = discord.Embed(
+        title="🛡️ Security & Access • Global Owner",
+        description=(
+            "Pusat kontrol akses bot. **Pemilik Server** dan **Host Manager** "
+            "tetap berada di `/menu` dan tidak dapat membuka panel ini."
+        ),
+        color=discord.Color.dark_blue()
+    )
+    embed.add_field(
+        name="Akun Global",
+        value=(
+            f"Primary Owner: **{stats['primary_owners']}**\n"
+            f"Global Owner total: **{stats['global_owners']}**\n"
+            f"Role kamu: **{role}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Akun Non-Global",
+        value=(
+            f"Pemilik Server: **{stats['server_owners']}**\n"
+            f"Host Manager: **{stats['host_managers']}**\n"
+            f"Manager tingkat server: **{stats['server_host_managers']}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Request Pending",
+        value=(
+            f"Akses Manager: **{stats['pending_access']}**\n"
+            f"Host Baru: **{stats['pending_hosts']}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Batas Akses",
+        value=(
+            "🛡️ **Global Owner Bot** → `/owner`, lintas server sesuai role owner.\n"
+            "👑 **Pemilik Server** → `/menu`, hanya server miliknya.\n"
+            "🎙️ **Host Manager** → `/menu`, hanya server/host yang disetujui.\n"
+            "✅ Approval Host Manager/host baru tetap milik **Pemilik Server**."
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Blacklist",
+        value=f"User dibatasi: **{stats['blacklisted']}**",
+        inline=True
+    )
+    embed.set_footer(
+        text="Global Owner Bot • panel terisolasi dari /menu"
+    )
+    return embed
+
+
+def global_request_audit_embed():
+    stats = global_access_stats()
+
+    with closing(db()) as conn:
+        access_rows = conn.execute("""
+            SELECT *
+            FROM server_host_access_requests
+            WHERE status='pending'
+            ORDER BY id DESC
+            LIMIT 10
+        """).fetchall()
+
+        host_rows = conn.execute("""
+            SELECT *
+            FROM host_creation_requests
+            WHERE status='pending'
+            ORDER BY id DESC
+            LIMIT 10
+        """).fetchall()
+
+    lines = []
+
+    for row in access_rows:
+        guild = bot.get_guild(int(row["guild_id"]))
+        lines.append(
+            f"🎙️ **Akses #{row['id']}** • "
+            f"{guild.name if guild else row['guild_id']} • "
+            f"<@{row['user_id']}>"
+        )
+
+    for row in host_rows:
+        guild = bot.get_guild(int(row["guild_id"]))
+        lines.append(
+            f"➕ **Host #{row['id']}** • "
+            f"{guild.name if guild else row['guild_id']} • "
+            f"`{row['platform']}:{row['target']}`"
+        )
+
+    embed = discord.Embed(
+        title="📨 Audit Request Global",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "✅ Tidak ada request server yang pending."
+        ),
+        color=discord.Color.orange()
+    )
+    embed.add_field(
+        name="Total",
+        value=(
+            f"Akses Manager **{stats['pending_access']}** • "
+            f"Host Baru **{stats['pending_hosts']}**"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Mode",
+        value=(
+            "👁️ **Read-only audit.** Global Owner dapat memantau, tetapi "
+            "persetujuan tetap wajib dilakukan oleh **Pemilik Server**."
+        ),
+        inline=False
+    )
+    return embed
+
+
+def owner_backup_status_embed():
+    last_at = last_successful_auto_backup_at()
+    due = None
+
+    if last_at:
+        due = int(last_at) + int(AUTO_BACKUP_HOURS * 3600)
+
+    embed = discord.Embed(
+        title="🗄️ Backup Status",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Interval",
+        value=f"**{AUTO_BACKUP_HOURS} jam**",
+        inline=True
+    )
+    embed.add_field(
+        name="Backup Terakhir",
+        value=(
+            f"<t:{last_at}:F>\n<t:{last_at}:R>"
+            if last_at
+            else "Belum ada"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Backup Berikutnya",
+        value=(
+            f"<t:{due}:F>\n<t:{due}:R>"
+            if due
+            else "Menunggu backup pertama"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Storage",
+        value=f"`{AUTO_BACKUP_DIR}`",
+        inline=False
+    )
+    embed.add_field(
+        name="Proteksi Redeploy",
+        value=(
+            "✅ Jadwal membaca backup terakhir dari database/storage. "
+            "Redeploy tidak seharusnya mengirim backup ulang sebelum jatuh tempo."
+        ),
+        inline=False
+    )
+    return embed
+
+
+
 
 def owner_home_embed():
     free_count = len(guilds_by_plan("free"))
     premium_count = len(guilds_by_plan("premium"))
+    stats = global_access_stats()
+
+    hosts = []
+    for guild in bot.guilds:
+        try:
+            hosts.extend(get_hosts(guild.id))
+        except Exception:
+            pass
+
+    errors = sum(
+        1
+        for host in hosts
+        if host["last_error"]
+    )
 
     embed = discord.Embed(
-        title="🔐 Hi Notifku • Owner",
-        description="Kelola server, Premium, pembayaran, dan monitor.",
+        title="🛡️ Hi Notifku • Global Owner Bot",
+        description=(
+            "Panel administrasi global. **Pemilik Server dan Host Manager "
+            "tidak memiliki akses ke panel ini.**"
+        ),
         color=discord.Color.blue()
     )
     embed.add_field(
-        name="Ringkasan",
+        name="Server",
         value=(
-            f"Server **{len(bot.guilds)}** • "
-            f"FREE **{free_count}** • "
-            f"PREMIUM **{premium_count}**"
+            f"Total **{len(bot.guilds)}**\n"
+            f"🆓 FREE **{free_count}**\n"
+            f"⭐ PREMIUM **{premium_count}**"
         ),
-        inline=False
+        inline=True
+    )
+    embed.add_field(
+        name="Notifier",
+        value=(
+            f"Host **{len(hosts)}**\n"
+            f"Error **{errors}**\n"
+            f"Ping **{round(bot.latency * 1000)} ms**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Akses",
+        value=(
+            f"Global Owner **{stats['global_owners']}**\n"
+            f"Pemilik Server **{stats['server_owners']}**\n"
+            f"Host Manager **{stats['host_managers']}**"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Request Server",
+        value=(
+            f"Manager **{stats['pending_access']}** • "
+            f"Host Baru **{stats['pending_hosts']}**"
+        ),
+        inline=True
     )
     embed.add_field(
         name="Uptime",
@@ -7587,11 +7888,13 @@ def owner_home_embed():
         inline=True
     )
     embed.add_field(
-        name="Owner",
-        value=str(len(OWNER_IDS | db_owner_ids())),
+        name="Auto Backup",
+        value=f"Setiap **{AUTO_BACKUP_HOURS} jam**",
         inline=True
     )
-    embed.set_footer(text="Semua pengaturan melalui DM bot.")
+    embed.set_footer(
+        text="/owner • Global Owner Bot only • semua pengaturan melalui DM"
+    )
     return embed
 
 
@@ -10229,8 +10532,9 @@ class MenuRoleChoiceView(discord.ui.View):
             embed=server_owner_menu_home_embed(
                 self.user_id
             ),
-            view=MenuRoleChoiceView(
-                self.user_id
+            view=DMUserGuildPickerView(
+                self.user_id,
+                0
             )
         )
 
@@ -10556,35 +10860,44 @@ def server_owner_requests_embed(
 
 
 class ServerOwnerPendingAccessSelect(discord.ui.Select):
-    def __init__(self, user_id: int, guild_id: int):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0
+    ):
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
 
         rows = pending_server_access_requests(
             self.guild_id
         )
+        start = self.page * 25
+        current = rows[start:start + 25]
+
         options = [
             discord.SelectOption(
                 label=f"Request #{row['id']} • User {row['user_id']}"[:100],
-                description=f"<@{row['user_id']}> • pending"[:100],
+                description=f"pending • <@{row['user_id']}>"[:100],
                 value=str(row["id"]),
                 emoji="🎙️"
             )
-            for row in rows[:25]
+            for row in current
         ]
 
         if not options:
             options.append(
                 discord.SelectOption(
                     label="Tidak ada request akses",
-                    description="Tidak ada request Host Manager pending.",
+                    description="Tidak ada request pada halaman ini.",
                     value="0",
                     emoji="✅"
                 )
             )
 
         super().__init__(
-            placeholder="Pilih request akses Host Manager",
+            placeholder=f"Request akses • Halaman {self.page + 1}",
             options=options,
             row=0
         )
@@ -10605,7 +10918,7 @@ class ServerOwnerPendingAccessSelect(discord.ui.Select):
         if not request_id:
             await safe_reply(
                 interaction,
-                "✅ Tidak ada request akses yang pending."
+                "ℹ️ Tidak ada request akses pada halaman ini."
             )
             return
 
@@ -10636,38 +10949,47 @@ class ServerOwnerPendingAccessSelect(discord.ui.Select):
 
 
 class ServerOwnerPendingHostSelect(discord.ui.Select):
-    def __init__(self, user_id: int, guild_id: int):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0
+    ):
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
 
         rows = pending_host_creation_requests(
             self.guild_id
         )
+        start = self.page * 25
+        current = rows[start:start + 25]
+
         options = [
             discord.SelectOption(
                 label=(
                     f"#{row['id']} • "
                     f"{platform_display_name(row['platform'])} • {row['target']}"
                 )[:100],
-                description=f"Requester {row['requester_id']}"[:100],
+                description=f"Requester {row['requester_id']} • pending"[:100],
                 value=str(row["id"]),
                 emoji=platform_icon(row["platform"])
             )
-            for row in rows[:25]
+            for row in current
         ]
 
         if not options:
             options.append(
                 discord.SelectOption(
                     label="Tidak ada request host",
-                    description="Tidak ada host baru yang menunggu approval.",
+                    description="Tidak ada request pada halaman ini.",
                     value="0",
                     emoji="✅"
                 )
             )
 
         super().__init__(
-            placeholder="Pilih request host baru",
+            placeholder=f"Request host baru • Halaman {self.page + 1}",
             options=options,
             row=0
         )
@@ -10688,7 +11010,7 @@ class ServerOwnerPendingHostSelect(discord.ui.Select):
         if not request_id:
             await safe_reply(
                 interaction,
-                "✅ Tidak ada request host yang pending."
+                "ℹ️ Tidak ada request host pada halaman ini."
             )
             return
 
@@ -10777,10 +11099,27 @@ class ServerOwnerRequestsView(discord.ui.View):
         )
 
     @discord.ui.button(
+        label="Cari Request",
+        emoji="🔎",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def search_request(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.send_modal(
+            ServerOwnerRequestSearchModal(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
         label="Kembali",
         emoji="⬅️",
         style=discord.ButtonStyle.secondary,
-        row=1
+        row=2
     )
     async def back(self, interaction, button):
         guild = await self.valid(interaction)
@@ -10798,7 +11137,7 @@ class ServerOwnerRequestsView(discord.ui.View):
         label="Menu Awal",
         emoji="🏠",
         style=discord.ButtonStyle.secondary,
-        row=1
+        row=2
     )
     async def home(self, interaction, button):
         if int(interaction.user.id) != self.user_id:
@@ -10816,29 +11155,93 @@ class ServerOwnerRequestsView(discord.ui.View):
 
 
 class ServerOwnerAccessRequestsListView(discord.ui.View):
-    def __init__(self, user_id: int, guild_id: int):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0
+    ):
         super().__init__(timeout=900)
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+
         self.add_item(
             ServerOwnerPendingAccessSelect(
                 self.user_id,
+                self.guild_id,
+                self.page
+            )
+        )
+
+    async def valid(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return False
+        return bool(
+            await require_server_owner(
+                interaction,
                 self.guild_id
             )
         )
 
     @discord.ui.button(
-        label="Kembali ke Request",
+        label="Sebelumnya",
         emoji="⬅️",
         style=discord.ButtonStyle.secondary,
         row=1
     )
-    async def back(self, interaction, button):
-        guild = await require_server_owner(
-            interaction,
-            self.guild_id
+    async def previous(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=server_owner_requests_embed(
+                self.guild_id
+            ),
+            view=ServerOwnerAccessRequestsListView(
+                self.user_id,
+                self.guild_id,
+                max(0, self.page - 1)
+            )
         )
-        if not guild or int(interaction.user.id) != self.user_id:
+
+    @discord.ui.button(
+        label="Berikutnya",
+        emoji="➡️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def next_page(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        total = len(
+            pending_server_access_requests(
+                self.guild_id
+            )
+        )
+        max_page = max(0, (total - 1) // 25)
+
+        await interaction.response.edit_message(
+            embed=server_owner_requests_embed(
+                self.guild_id
+            ),
+            view=ServerOwnerAccessRequestsListView(
+                self.user_id,
+                self.guild_id,
+                min(max_page, self.page + 1)
+            )
+        )
+
+    @discord.ui.button(
+        label="Kembali ke Request",
+        emoji="↩️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
             return
 
         await interaction.response.edit_message(
@@ -10853,29 +11256,93 @@ class ServerOwnerAccessRequestsListView(discord.ui.View):
 
 
 class ServerOwnerHostRequestsListView(discord.ui.View):
-    def __init__(self, user_id: int, guild_id: int):
+    def __init__(
+        self,
+        user_id: int,
+        guild_id: int,
+        page: int = 0
+    ):
         super().__init__(timeout=900)
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+
         self.add_item(
             ServerOwnerPendingHostSelect(
                 self.user_id,
+                self.guild_id,
+                self.page
+            )
+        )
+
+    async def valid(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return False
+        return bool(
+            await require_server_owner(
+                interaction,
                 self.guild_id
             )
         )
 
     @discord.ui.button(
-        label="Kembali ke Request",
+        label="Sebelumnya",
         emoji="⬅️",
         style=discord.ButtonStyle.secondary,
         row=1
     )
-    async def back(self, interaction, button):
-        guild = await require_server_owner(
-            interaction,
-            self.guild_id
+    async def previous(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=server_owner_requests_embed(
+                self.guild_id
+            ),
+            view=ServerOwnerHostRequestsListView(
+                self.user_id,
+                self.guild_id,
+                max(0, self.page - 1)
+            )
         )
-        if not guild or int(interaction.user.id) != self.user_id:
+
+    @discord.ui.button(
+        label="Berikutnya",
+        emoji="➡️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def next_page(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        total = len(
+            pending_host_creation_requests(
+                self.guild_id
+            )
+        )
+        max_page = max(0, (total - 1) // 25)
+
+        await interaction.response.edit_message(
+            embed=server_owner_requests_embed(
+                self.guild_id
+            ),
+            view=ServerOwnerHostRequestsListView(
+                self.user_id,
+                self.guild_id,
+                min(max_page, self.page + 1)
+            )
+        )
+
+    @discord.ui.button(
+        label="Kembali ke Request",
+        emoji="↩️",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
             return
 
         await interaction.response.edit_message(
@@ -10887,6 +11354,84 @@ class ServerOwnerHostRequestsListView(discord.ui.View):
                 self.guild_id
             )
         )
+
+
+class ServerOwnerRequestSearchModal(discord.ui.Modal):
+    query = discord.ui.TextInput(
+        label="Cari Request",
+        placeholder="ID request, user ID, username target, atau platform",
+        max_length=120
+    )
+
+    def __init__(self, user_id: int, guild_id: int):
+        super().__init__(
+            title="Cari Request Server",
+            timeout=300
+        )
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "❌ Form ini bukan milikmu.")
+            return
+
+        guild = await require_server_owner(
+            interaction,
+            self.guild_id
+        )
+        if not guild:
+            return
+
+        q = self.query.value.strip().lower()
+
+        access_rows = [
+            row
+            for row in pending_server_access_requests(self.guild_id)
+            if (
+                q in str(row["id"]).lower()
+                or q in str(row["user_id"]).lower()
+            )
+        ]
+
+        host_rows = [
+            row
+            for row in pending_host_creation_requests(self.guild_id)
+            if (
+                q in str(row["id"]).lower()
+                or q in str(row["requester_id"]).lower()
+                or q in str(row["platform"]).lower()
+                or q in str(row["target"]).lower()
+            )
+        ]
+
+        lines = []
+
+        for row in access_rows[:10]:
+            lines.append(
+                f"🎙️ **Akses #{row['id']}** • User `{row['user_id']}`"
+            )
+
+        for row in host_rows[:10]:
+            lines.append(
+                f"➕ **Host #{row['id']}** • "
+                f"{platform_display_name(row['platform'])} • `{row['target']}`"
+            )
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=discord.Embed(
+                title="🔎 Hasil Pencarian Request",
+                description=(
+                    "\n".join(lines)
+                    if lines
+                    else f"Tidak ditemukan request pending untuk `{q}`."
+                ),
+                color=discord.Color.blurple()
+            )
+        )
+
 
 
 class ServerOwnerDeleteHostConfirmView(discord.ui.View):
@@ -12982,6 +13527,74 @@ class HostSearchResultsView(discord.ui.View):
         )
 
 
+def host_manager_server_access_embed(
+    user_id: int,
+    guild_id: int
+):
+    guild = bot.get_guild(int(guild_id))
+    server_access = server_host_manager_access(
+        user_id,
+        guild_id
+    )
+
+    rows = [
+        row
+        for row in host_manager_rows(user_id)
+        if int(row["guild_id"]) == int(guild_id)
+    ]
+
+    lines = []
+    for row in rows[:20]:
+        perms = []
+        for key, column in HOST_MANAGER_PERMISSION_COLUMNS.items():
+            if row[column]:
+                perms.append(key.replace("_", " "))
+
+        lines.append(
+            f"• **{platform_display_name(row['platform'])} • "
+            f"{row['display_name'] or row['target']}**\n"
+            f"  {', '.join(perms) if perms else 'read-only'}"
+        )
+
+    embed = discord.Embed(
+        title=f"🔐 Akses Saya • {guild.name if guild else guild_id}",
+        description=(
+            "Ringkasan hak aksesmu pada server ini."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="Akses Tingkat Server",
+        value=(
+            "✅ Aktif"
+            if server_access
+            else "ℹ️ Hanya assignment host"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Host Assigned",
+        value=str(len(rows)),
+        inline=True
+    )
+    embed.add_field(
+        name="Hak Host",
+        value=(
+            "\n".join(lines)
+            if lines
+            else (
+                "Belum ada host assigned. Kamu masih dapat mengajukan host baru "
+                "jika akses tingkat server aktif."
+            )
+        ),
+        inline=False
+    )
+    embed.set_footer(
+        text="Host Manager tidak memiliki akses /owner atau administrasi global"
+    )
+    return embed
+
+
 def host_manager_latest_embed(
     user_id: int,
     guild_id: Optional[int] = None
@@ -13712,6 +14325,121 @@ def host_manager_pending_requests_embed(
     )
 
 
+class HostManagerCancelRequestSelect(discord.ui.Select):
+    def __init__(self, user_id: int, guild_id: int):
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+
+        rows = pending_host_creation_requests(
+            self.guild_id,
+            requester_id=self.user_id
+        )
+
+        options = [
+            discord.SelectOption(
+                label=(
+                    f"#{row['id']} • {platform_display_name(row['platform'])} "
+                    f"• {row['target']}"
+                )[:100],
+                description="PENDING • pilih untuk membatalkan"[:100],
+                value=str(row["id"]),
+                emoji="🕓"
+            )
+            for row in rows[:25]
+        ]
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Tidak ada request pending",
+                    description="Tidak ada request yang bisa dibatalkan.",
+                    value="0",
+                    emoji="✅"
+                )
+            )
+
+        super().__init__(
+            placeholder="Pilih request yang ingin dibatalkan",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "❌ Menu ini bukan milikmu.")
+            return
+
+        if not host_manager_has_guild_access(
+            self.user_id,
+            self.guild_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Akses Host Manager server sudah tidak aktif."
+            )
+            return
+
+        request_id = int(self.values[0])
+        if not request_id:
+            await safe_reply(
+                interaction,
+                "ℹ️ Tidak ada request pending."
+            )
+            return
+
+        row = get_host_creation_request(
+            request_id
+        )
+        if (
+            not row
+            or row["status"] != "pending"
+            or int(row["guild_id"]) != self.guild_id
+            or int(row["requester_id"]) != self.user_id
+        ):
+            await safe_reply(
+                interaction,
+                "ℹ️ Request sudah diproses atau bukan milikmu."
+            )
+            return
+
+        if action_rate_limited(
+            self.user_id,
+            f"cancel_host_request:{request_id}"
+        ):
+            await safe_reply(
+                interaction,
+                "⏳ Request sedang diproses."
+            )
+            return
+
+        finish_host_creation_request(
+            request_id,
+            status="cancelled",
+            actor_id=self.user_id,
+            reason="Dibatalkan oleh Host Manager."
+        )
+
+        await interaction.response.edit_message(
+            content=f"✅ Request host **#{request_id}** dibatalkan.",
+            embed=None,
+            view=None
+        )
+
+
+class HostManagerCancelRequestsView(discord.ui.View):
+    def __init__(self, user_id: int, guild_id: int):
+        super().__init__(timeout=600)
+        self.user_id = int(user_id)
+        self.guild_id = int(guild_id)
+        self.add_item(
+            HostManagerCancelRequestSelect(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+
+
 class HostManagerGuildDashboardView(discord.ui.View):
     def __init__(
         self,
@@ -13918,6 +14646,52 @@ class HostManagerGuildDashboardView(discord.ui.View):
             interaction,
             "",
             embed=host_manager_pending_requests_embed(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Akses Saya",
+        emoji="🔐",
+        style=discord.ButtonStyle.secondary,
+        row=4
+    )
+    async def my_access(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await safe_reply(
+            interaction,
+            "",
+            embed=host_manager_server_access_embed(
+                self.user_id,
+                self.guild_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Batalkan Request",
+        emoji="🛑",
+        style=discord.ButtonStyle.secondary,
+        row=4
+    )
+    async def cancel_request(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await safe_reply(
+            interaction,
+            "Pilih request host yang masih **PENDING** untuk dibatalkan.",
+            view=HostManagerCancelRequestsView(
                 self.user_id,
                 self.guild_id
             )
@@ -16624,14 +17398,214 @@ class OwnerDashboardView(discord.ui.View):
         )
 
 
-class OwnerHomeView(discord.ui.View):
-    def __init__(self):
+class OwnerAccessCenterView(discord.ui.View):
+    def __init__(self, viewer_id: int):
         super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(
+        self,
+        interaction: discord.Interaction,
+        minimum: str = "read_only"
+    ) -> bool:
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(
+                interaction,
+                "🔒 Panel Global Owner ini bukan milikmu."
+            )
+            return False
+
+        return await require_owner_level(
+            interaction,
+            minimum
+        )
+
+    @discord.ui.button(
+        label="Refresh Akses",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=global_owner_access_embed(
+                self.viewer_id
+            ),
+            view=OwnerAccessCenterView(
+                self.viewer_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Audit Request",
+        emoji="📨",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def requests(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=global_request_audit_embed(),
+            view=OwnerReadOnlyAuditView(
+                self.viewer_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Backup Status",
+        emoji="🗄️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def backup(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_backup_status_embed(),
+            view=OwnerReadOnlyAuditView(
+                self.viewer_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Kelola Global Owner",
+        emoji="🛡️",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
+    async def manage_global_owner(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(
+                interaction,
+                "🔒 Hanya **Primary Global Owner** dari `OWNER_IDS`."
+            )
+            return
+
+        all_owners = OWNER_IDS | db_owner_ids()
+        embed = discord.Embed(
+            title="🛡️ Kelola Global Owner Bot",
+            description=(
+                "\n".join(
+                    f"• <@{uid}> (`{uid}`) • **{owner_role(uid)}**"
+                    for uid in sorted(all_owners)
+                )
+                or "Tidak ada Global Owner."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=OwnerManagementView()
+        )
+
+    @discord.ui.button(
+        label="Menu Owner",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(
+                self.viewer_id
+            )
+        )
+
+
+class OwnerReadOnlyAuditView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    @discord.ui.button(
+        label="Security & Access",
+        emoji="🛡️",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def access(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not await require_global_owner(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=global_owner_access_embed(
+                self.viewer_id
+            ),
+            view=OwnerAccessCenterView(
+                self.viewer_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Menu Owner",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def home(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not await require_global_owner(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(
+                self.viewer_id
+            )
+        )
+
+
+
+
+class OwnerHomeView(discord.ui.View):
+    def __init__(self, viewer_id: Optional[int] = None):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id) if viewer_id else None
         self.add_item(GuildSelect())
+
+    async def valid_owner(
+        self,
+        interaction: discord.Interaction,
+        minimum: str = "read_only"
+    ) -> bool:
+        if (
+            self.viewer_id is not None
+            and int(interaction.user.id) != self.viewer_id
+        ):
+            await safe_reply(
+                interaction,
+                "🔒 Panel Global Owner ini bukan milikmu."
+            )
+            return False
+
+        return await require_owner_level(
+            interaction,
+            minimum
+        )
 
     @discord.ui.button(label="FREE", emoji="🆓", style=discord.ButtonStyle.secondary, row=1)
     async def free_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         guilds = guilds_by_plan("free")
         await interaction.response.edit_message(
@@ -16645,7 +17619,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Premium", emoji="⭐", style=discord.ButtonStyle.secondary, row=1)
     async def premium_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         guilds = guilds_by_plan("premium")
         await interaction.response.edit_message(
@@ -16659,7 +17633,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Plan", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
     async def plan_overview(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
             embed=plan_overview_embed(),
@@ -16668,7 +17642,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Health", emoji="🩺", style=discord.ButtonStyle.secondary, row=2)
     async def health(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
 
         hosts = []
@@ -16697,7 +17671,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Dashboard", emoji="📊", style=discord.ButtonStyle.secondary, row=2)
     async def dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
             embed=owner_dashboard_embed(),
@@ -16706,7 +17680,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Request", emoji="💳", style=discord.ButtonStyle.secondary, row=3)
     async def premium_requests(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         counts = premium_order_counts()
         await interaction.response.edit_message(
@@ -16723,7 +17697,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=3)
     async def premium_history(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
             embed=transaction_history_embed(),
@@ -16742,7 +17716,7 @@ class OwnerHomeView(discord.ui.View):
 
     @discord.ui.button(label="Health Detail", emoji="🛠️", style=discord.ButtonStyle.secondary, row=3)
     async def health_detail(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
             embed=health_detail_embed(),
@@ -16772,9 +17746,32 @@ class OwnerHomeView(discord.ui.View):
             view=OwnerManagementView()
         )
 
+    @discord.ui.button(
+        label="Security",
+        emoji="🔐",
+        style=discord.ButtonStyle.primary,
+        row=4
+    )
+    async def security(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid_owner(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=global_owner_access_embed(
+                interaction.user.id
+            ),
+            view=OwnerAccessCenterView(
+                interaction.user.id
+            )
+        )
+
     @discord.ui.button(label="Server", emoji="🔎", style=discord.ButtonStyle.secondary, row=4)
     async def browse_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await require_global_owner(interaction):
+        if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
             embed=discord.Embed(
@@ -16992,10 +17989,14 @@ class AdvancedSecurityView(discord.ui.View):
 
     @discord.ui.button(label="Blacklist User", emoji="🚫", style=discord.ButtonStyle.danger)
     async def blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_owner_level(interaction, "server_admin"):
+            return
         await interaction.response.send_modal(UserBlacklistModal(False))
 
     @discord.ui.button(label="Hapus Blacklist", emoji="✅", style=discord.ButtonStyle.secondary)
     async def unblacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await require_owner_level(interaction, "server_admin"):
+            return
         await interaction.response.send_modal(UserBlacklistModal(True))
 
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary)
@@ -19465,9 +20466,37 @@ async def menu_command(interaction: discord.Interaction):
 )
 async def owner_command(interaction: discord.Interaction):
     if not is_global_owner(interaction.user.id):
+        owned = user_owned_guilds(
+            interaction.user.id
+        )
+        managed = host_manager_guild_ids(
+            interaction.user.id
+        )
+
+        if owned and managed:
+            route = (
+                "Kamu terdeteksi sebagai **Pemilik Server + Host Manager**.\n"
+                "Gunakan `/menu` lalu pilih peran yang sesuai."
+            )
+        elif owned:
+            route = (
+                "Kamu terdeteksi sebagai **Pemilik Server**.\n"
+                "Gunakan `/menu → 👑 Pemilik Server`."
+            )
+        elif managed:
+            route = (
+                "Kamu terdeteksi sebagai **Host Manager**.\n"
+                "Gunakan `/menu → 🎙️ Host Manager`."
+            )
+        else:
+            route = (
+                "Akunmu bukan Global Owner Bot. Gunakan `/menu` "
+                "untuk fitur pengguna."
+            )
+
         await safe_reply(
             interaction,
-            "🔒 `/owner` hanya untuk **Global Owner Bot Hi Notifku**.\n""Jika kamu adalah **Pemilik Server**, gunakan `/menu` → pilih server milikmu."
+            "🔒 `/owner` khusus **Global Owner Bot Hi Notifku**.\n\n" + route
         )
         return
 
@@ -19479,7 +20508,7 @@ async def owner_command(interaction: discord.Interaction):
 
         await dm.send(
             embed=owner_home_embed(),
-            view=OwnerHomeView()
+            view=OwnerHomeView(interaction.user.id)
         )
 
         await audit_webhook(

@@ -1173,3 +1173,78 @@ Menampilkan server yang benar-benar dimiliki user. Dari sana user dapat mengatur
 Menampilkan dashboard Host Manager dan hanya host/server yang diberikan kepadanya. Jika belum memiliki assignment, menu ini mengarahkan user ke flow permintaan akses kepada Pemilik Server.
 
 `🛡️ Global Owner Bot` tidak ditampilkan sebagai pilihan `/menu`; akses global tetap hanya melalui `/owner`.
+
+## Host Manager Tingkat Server + Approval Host Baru
+
+Persetujuan Host Manager sekarang tidak membutuhkan host yang sudah ada.
+
+Alur akses:
+```text
+User → Minta Akses Host Manager
+→ DM Pemilik Server
+→ ✅ Setujui
+→ user mendapat akses Host Manager tingkat server
+```
+
+Setelah disetujui:
+```text
+/menu
+→ 🎙️ Host Manager
+→ pilih server
+→ ➕ Ajukan Host
+→ isi platform + target + channel + role
+→ PENDING
+→ DM Pemilik Server
+→ ✅ Setujui Host / ❌ Tolak Host
+```
+
+Host baru tidak dimasukkan ke tabel `hosts` dan tidak dipantau notifier sebelum Pemilik Server menyetujuinya. Saat disetujui, limit FREE/PREMIUM diperiksa lagi, channel dan role divalidasi ulang, lalu host dibuat dan requester otomatis diberi assignment untuk host tersebut.
+
+Ini menjaga pemisahan:
+- Host Manager boleh mengajukan;
+- Pemilik Server memegang keputusan;
+- Global Owner Bot tidak diperlukan;
+- `/owner` tetap terpisah.
+
+## /menu Stability Batch 2
+
+Peningkatan:
+- semua tombol Menu Awal kembali ke `MenuRoleChoiceView`;
+- Pemilik Server memiliki `📨 Request` center untuk request Host Manager dan host baru;
+- request tetap dapat diproses dari `/menu` walaupun DM owner lama terlewat;
+- dashboard server menampilkan jumlah request pending;
+- Hapus Host memerlukan konfirmasi;
+- approval/deny kritis memakai anti-double-click;
+- Riwayat Request Host Manager menampilkan PENDING/APPROVED/DENIED/CANCELLED;
+- jalur lama Host Manager tetap dibersihkan agar tidak duplikat.
+
+## /menu Batch 3
+
+- navigasi role diperbaiki: `Pemilik Server` masuk daftar server, `Menu Pengguna` Host Manager kembali ke pemilih peran;
+- Request Center Pemilik Server mempunyai pagination 25 item per halaman;
+- Pemilik Server dapat mencari request berdasarkan ID, user ID, platform, atau target;
+- Host Manager dapat membatalkan request host miliknya selama masih `PENDING`;
+- Host Manager mempunyai panel `🔐 Akses Saya` per server;
+- semua aksi cancel/approve tetap diverifikasi ulang berdasarkan user, guild, dan status request.
+
+## /owner — Global Owner Bot v2
+
+`/owner` sepenuhnya dipisahkan dari `/menu`.
+
+Akses:
+- `🛡️ Global Owner Bot` → `/owner`
+- `👑 Pemilik Server` → `/menu → Pemilik Server`
+- `🎙️ Host Manager` → `/menu → Host Manager`
+
+Pemilik Server dan Host Manager ditolak jika mencoba `/owner`.
+
+Panel Global Owner sekarang memiliki `🔐 Security`:
+- jumlah Primary/Global Owner;
+- jumlah Pemilik Server dan Host Manager;
+- request akses/host baru pending;
+- blacklist count;
+- audit request global read-only;
+- status auto backup;
+- pengelolaan Global Owner hanya untuk Primary Owner.
+
+Global Owner dapat memantau request Host Manager/host baru secara global, tetapi approval request tersebut tetap wajib dilakukan oleh Pemilik Server.
