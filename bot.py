@@ -260,7 +260,33 @@ def bot_status_embed():
 # ============================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    db_path = Path(DB_PATH).expanduser()
+
+    # SQLite cannot create missing parent directories itself.
+    # Make the parent directory first so Railway /data paths work
+    # when the volume is mounted correctly.
+    parent = db_path.parent
+
+    try:
+        if str(parent) not in {"", "."}:
+            parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Gagal membuat folder database: {parent}. "
+            f"Pastikan Railway Volume ter-mount dan DB_PATH benar. "
+            f"Detail: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=30)
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"SQLite tidak dapat membuka database di: {db_path}. "
+            "Jika memakai DB_PATH=/data/live_notifier.db, pastikan Railway Volume "
+            "dipasang ke mount path /data. "
+            f"Detail: {exc}"
+        ) from exc
+
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -12134,6 +12160,9 @@ async def main():
 
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN belum diisi.")
+
+    log.info("DB_PATH aktif: %s", DB_PATH)
+    log.info("DB parent: %s", Path(DB_PATH).expanduser().parent)
 
     migrate_database()
 
