@@ -74,13 +74,30 @@ for name in [
     if not (ROOT / name).exists():
         fail(f"required file missing: {name}")
 
-print("OK: syntax")
-print("OK: no duplicate top-level definitions")
-print("OK: Railway variable parity")
-print("OK: basic secret scan")
-print("OK: required files")
-
 # Runtime tuning reader must be safe before DB migrations finish.
 bot_text = BOT.read_text(encoding="utf-8")
 if 'if not table_exists(conn, "runtime_tuning")' not in bot_text:
     fail("runtime_tuning bootstrap guard missing")
+
+# Regression guards for owner/payment and FREE/Premium flows.
+for required_def in {
+    "transaction_history_embed",
+    "premium_access_effective",
+    "premium_entitlements",
+    "pause_excess_hosts_for_free",
+}:
+    if required_def not in defs:
+        fail(f"required function missing: {required_def}")
+
+if 'return int(premium_entitlements(int(guild_id))["host_limit"])' not in bot_text:
+    fail("host limit is not routed through centralized entitlements")
+
+print("OK: syntax")
+print("OK: no duplicate top-level definitions")
+print("OK: class dependency order")
+print("OK: Railway variable parity")
+print("OK: basic secret scan")
+print("OK: required files")
+print("OK: bootstrap guards")
+print("OK: owner/payment regression guards")
+print("OK: FREE/Premium entitlement guards")

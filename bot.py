@@ -46,7 +46,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.1"
 CURRENT_SCHEMA_VERSION = 23
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
@@ -2033,8 +2033,7 @@ def set_access_state(guild_id: int, state: str):
 
 
 def host_limit_for_guild(guild_id: int) -> int:
-    settings = get_guild_settings(guild_id)
-    return PREMIUM_HOST_LIMIT if settings["plan"] == "premium" else FREE_HOST_LIMIT
+    return int(premium_entitlements(int(guild_id))["host_limit"])
 
 
 def set_default_channel(guild_id: int, platform: str, channel_id: Optional[int]):
@@ -3370,17 +3369,21 @@ def create_rollback_snapshot(
 
 def pause_excess_hosts_for_free(guild_id: int) -> int:
     hosts = list(get_hosts(int(guild_id)))
-    if len(hosts) <= FREE_HOST_LIMIT:
+    active_hosts = [h for h in hosts if bool(h["enabled"])]
+    if len(active_hosts) <= FREE_HOST_LIMIT:
         return 0
 
     paused = 0
     now = int(time.time())
-    keep_ids = {int(h["id"]) for h in hosts[:FREE_HOST_LIMIT]}
+    # Preserve up to FREE_HOST_LIMIT hosts that are actually active.  Disabled
+    # hosts must not consume a keep slot, otherwise downgrade can leave fewer
+    # usable hosts than the FREE allowance.
+    keep_ids = {int(h["id"]) for h in active_hosts[:FREE_HOST_LIMIT]}
 
     with closing(db()) as conn:
-        for host in hosts:
+        for host in active_hosts:
             host_id = int(host["id"])
-            if host_id in keep_ids or not host["enabled"]:
+            if host_id in keep_ids:
                 continue
 
             conn.execute("UPDATE hosts SET enabled=0 WHERE id=?", (host_id,))
@@ -3942,29 +3945,128 @@ def premium_packages_text():
     )
 
 
+PLAN_FEATURE_LABELS = {
+    "priority_polling": "Priority checker",
+    "custom_templates": "Custom pesan",
+    "webhook": "Webhook delivery",
+    "extra_channels": "Multi-channel / multi-role",
+    "advanced_schedule": "Jadwal & quiet hours",
+    "custom_branding": "Custom branding",
+    "manager_presets": "Manager permission preset",
+}
+
+
+def premium_access_effective(guild_id: int, now_ts: Optional[int] = None) -> bool:
+    """Return whether Premium benefits are effective right now.
+
+    This check is deliberately independent from the hourly expiry loop so an
+    expired plan cannot keep Premium entitlements for up to another hour.  A
+    configured grace period remains honored.
+    """
+    settings = get_guild_settings(int(guild_id))
+    if str(settings["plan"] or "free").lower() != "premium":
+        return False
+
+    expires_at = settings["premium_expires_at"]
+    if not expires_at:
+        return True
+
+    now = int(now_ts or time.time())
+    expires_at = int(expires_at)
+    if now <= expires_at:
+        return True
+
+    grace_until = settings["premium_grace_until"]
+    if grace_until:
+        return now < int(grace_until)
+
+    # Before the expiry loop has persisted premium_grace_until, honor the
+    # configured grace directly from the expiry timestamp.
+    if PREMIUM_GRACE_HOURS > 0:
+        return now < (expires_at + PREMIUM_GRACE_HOURS * 3600)
+
+    return False
+
+
 def premium_entitlements(guild_id: int) -> dict:
-    plan = str(get_guild_settings(guild_id)["plan"] or "free")
-    premium = plan == "premium"
+    """Single source of truth for FREE/Premium capabilities.
+
+    Keep every Premium gate routed through this helper so a hidden button, old
+    interaction, or stale configuration cannot bypass the active plan.
+    """
+    settings = get_guild_settings(int(guild_id))
+    stored_plan = str(settings["plan"] or "free").lower()
+    premium = premium_access_effective(int(guild_id))
+    plan = "premium" if premium else "free"
 
     return {
-        "host_limit": host_limit_for_guild(guild_id),
+        "plan": plan,
+        "stored_plan": stored_plan,
+        "premium": premium,
+        "host_limit": PREMIUM_HOST_LIMIT if premium else FREE_HOST_LIMIT,
         "analytics_days": 30 if premium else 7,
         "priority_polling": premium,
         "custom_templates": premium,
         "webhook": premium,
         "extra_channels": premium,
+        "advanced_schedule": premium,
+        "custom_branding": premium,
+        "manager_presets": premium,
     }
+
+
+def premium_feature_enabled(guild_id: int, feature: str) -> bool:
+    return bool(premium_entitlements(int(guild_id)).get(str(feature), False))
+
+
+async def require_premium_feature(
+    interaction: discord.Interaction,
+    guild_id: int,
+    feature: str,
+    label: Optional[str] = None
+) -> bool:
+    if premium_feature_enabled(int(guild_id), feature):
+        return True
+    feature_label = label or PLAN_FEATURE_LABELS.get(feature, feature)
+    await safe_reply(
+        interaction,
+        f"🔒 **{feature_label}** tersedia di Premium. "
+        "Konfigurasi lama tetap tersimpan dan aktif kembali setelah Premium diperpanjang."
+    )
+    return False
+
+
+def premium_host_template(host, field: str) -> Optional[str]:
+    if not premium_feature_enabled(int(host["guild_id"]), "custom_templates"):
+        return None
+    try:
+        return host[field]
+    except Exception:
+        return None
 
 
 def premium_entitlements_text(guild_id: int) -> str:
     e = premium_entitlements(guild_id)
     return (
-        f"Host **{e['host_limit']}** • "
-        f"Analytics **{e['analytics_days']} hari**\n"
+        f"Host **{e['host_limit']}** • Riwayat/analytics **{e['analytics_days']} hari**\n"
         f"{'✅' if e['priority_polling'] else '🔒'} Priority checker • "
-        f"{'✅' if e['webhook'] else '🔒'} Webhook\n"
-        f"{'✅' if e['extra_channels'] else '🔒'} Extra channel • "
-        f"{'✅' if e['custom_templates'] else '🔒'} Custom template"
+        f"{'✅' if e['advanced_schedule'] else '🔒'} Jadwal\n"
+        f"{'✅' if e['custom_templates'] else '🔒'} Custom pesan • "
+        f"{'✅' if e['custom_branding'] else '🔒'} Branding\n"
+        f"{'✅' if e['extra_channels'] else '🔒'} Multi-channel • "
+        f"{'✅' if e['webhook'] else '🔒'} Webhook"
+    )
+
+
+def plan_comparison_text() -> str:
+    return (
+        f"🆓 **FREE** — {FREE_HOST_LIMIT} host, analytics 7 hari, channel/role utama, "
+        "notifikasi standar.\n"
+        f"⭐ **PREMIUM** — hingga {PREMIUM_HOST_LIMIT} host, analytics 30 hari, "
+        "priority checker, custom pesan/branding, jadwal & quiet hours, "
+        "multi-channel/role, dan webhook.\n\n"
+        "Saat Premium berakhir, konfigurasi Premium **tidak dihapus**; fitur dikunci "
+        "dan host di atas limit FREE dipause sampai Premium aktif kembali."
     )
 
 
@@ -4007,6 +4109,11 @@ def premium_plan_summary_embed(guild: discord.Guild):
         value=premium_entitlements_text(guild.id),
         inline=False
     )
+    embed.add_field(
+        name="FREE vs Premium",
+        value=plan_comparison_text()[:1024],
+        inline=False
+    )
     embed.set_footer(text="Pilih paket dari dropdown • invoice dibuat setelah konfirmasi")
     return embed
 
@@ -4040,6 +4147,74 @@ def user_premium_history_embed(user_id: int, guild_id: int):
         description="\n".join(lines) if lines else "Belum ada transaksi Premium.",
         color=discord.Color.gold()
     )
+
+
+def transaction_history_embed(limit: int = 15):
+    """Build the Global Owner transaction-history embed.
+
+    Kept deliberately read-only and tolerant of partially migrated rows so the
+    Riwayat button never fails just because an older invoice is missing newer
+    payment columns.
+    """
+    rows = list_transaction_history(max(1, min(25, int(limit))))
+
+    embed = discord.Embed(
+        title="🧾 Riwayat Transaksi",
+        color=discord.Color.blurple()
+    )
+
+    if not rows:
+        embed.description = "Belum ada transaksi Premium."
+        embed.set_footer(text="Menampilkan transaksi Premium terbaru")
+        return embed
+
+    lines = []
+    for row in rows:
+        keys = set(row.keys())
+        order_id = int(row["id"])
+        ref = row["invoice_ref"] if "invoice_ref" in keys else None
+        if not ref:
+            try:
+                ref = ensure_invoice_ref(order_id)
+            except Exception:
+                ref = f"ORDER-{order_id}"
+
+        status = str(row["status"] or "unknown")
+        try:
+            status_text = order_status_label(status)
+        except Exception:
+            status_text = status.replace("_", " ").title()
+
+        days = int(row["days"] or 0)
+        price = int(row["price"] or 0)
+        expected = (
+            int(row["expected_amount"] or 0)
+            if "expected_amount" in keys else price
+        )
+        received = (
+            int(row["received_amount"] or 0)
+            if "received_amount" in keys else 0
+        )
+        created_at = int(row["created_at"] or 0)
+
+        amount_text = rupiah(expected or price)
+        if received:
+            amount_text += f" • diterima {rupiah(received)}"
+
+        when = f"<t:{created_at}:d>" if created_at else "-"
+        lines.append(
+            f"`{ref}` • **{days} hari** • {status_text}\n"
+            f"{amount_text} • {when}"
+        )
+
+    # Discord embed descriptions are capped at 4096 characters.
+    description = "\n\n".join(lines)
+    if len(description) > 3900:
+        description = description[:3897] + "..."
+
+    embed.description = description
+    embed.set_footer(text=f"{len(rows)} transaksi terbaru • tombol Refresh untuk memperbarui")
+    return embed
 
 
 def premium_queue_embed():
@@ -5841,24 +6016,10 @@ def assign_order_payment_method(order_id: int, method_id: int):
 
 def payment_proof_instruction_text() -> str:
     return (
-        "📌 **Agar bukti dapat diperiksa dengan baik:**\n"
-        "• gunakan **screenshot asli langsung dari aplikasi pembayaran**;\n"
-        "• jangan crop terlalu ketat — tampilkan bagian transaksi secara utuh;\n"
-        "• **nominal transfer wajib persis sama dengan Total Transfer pada invoice, "
-        "termasuk kode unik**;\n"
-        "• contoh: harga paket Rp25.000 + kode unik 137 = transfer **Rp25.137**, "
-        "bukan Rp25.000;\n"
-        "• jangan membulatkan, menambah, atau mengurangi nominal;\n"
-        "• tanggal dan waktu transaksi harus terlihat;\n"
-        "• nomor referensi/ID transaksi harus terlihat bila tersedia;\n"
-        "• nama/akun pengirim harus sesuai dengan detail yang kamu isi;\n"
-        "• jangan blur bagian transaksi penting;\n"
-        "• jangan tambahkan stiker, coretan, filter, watermark, atau edit gambar;\n"
-        "• jangan kirim foto layar yang buram jika screenshot asli tersedia;\n"
-        "• kirim **1 file gambar asli** PNG/JPG/JPEG/WEBP.\n\n"
-        "⚠️ Nominal yang tidak persis sama dengan invoice—termasuk kode unik—"
-        "akan dianggap **TIDAK SESUAI**. Bukti yang terpotong, buram, terlalu kecil, "
-        "diedit, atau pernah digunakan sebelumnya dapat masuk **REVIEW** atau **DITOLAK**."
+        "📸 **Kirim 1 screenshot asli bukti pembayaran.**\n"
+        "Pastikan **nominal sesuai Total Transfer termasuk kode unik**, "
+        "serta waktu dan ID transaksi terlihat.\n"
+        "Jangan edit atau crop berlebihan. Format: PNG/JPG/JPEG/WEBP."
     )
 
 
@@ -8671,6 +8832,9 @@ def host_timezone(host) -> ZoneInfo:
 
 
 def host_schedule_allowed(host, now_ts: Optional[int] = None) -> bool:
+    if not premium_feature_enabled(int(host["guild_id"]), "advanced_schedule"):
+        return True
+
     now_dt = datetime.fromtimestamp(
         int(now_ts or time.time()),
         tz=host_timezone(host)
@@ -8705,6 +8869,9 @@ def _parse_hhmm(value: Optional[str]):
 
 
 def host_quiet_now(host, now_ts: Optional[int] = None) -> bool:
+    if not premium_feature_enabled(int(host["guild_id"]), "advanced_schedule"):
+        return False
+
     start = _parse_hhmm(host["quiet_start"] if "quiet_start" in host.keys() else None)
     end = _parse_hhmm(host["quiet_end"] if "quiet_end" in host.keys() else None)
 
@@ -8837,6 +9004,8 @@ def record_notification_history(
 
 
 def notification_stats(guild_id: int) -> dict:
+    analytics_days = int(premium_entitlements(int(guild_id))["analytics_days"])
+    cutoff = int(time.time()) - analytics_days * 86400
     with closing(db()) as conn:
         row = conn.execute("""
             SELECT
@@ -8846,17 +9015,17 @@ def notification_stats(guild_id: int) -> dict:
                 SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
                 AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS avg_latency
             FROM notification_history
-            WHERE guild_id=?
-        """, (int(guild_id),)).fetchone()
+            WHERE guild_id=? AND created_at>=?
+        """, (int(guild_id), cutoff)).fetchone()
 
         top = conn.execute("""
             SELECT host_id, COUNT(*) AS total
             FROM notification_history
-            WHERE guild_id=? AND status='sent'
+            WHERE guild_id=? AND status='sent' AND created_at>=?
             GROUP BY host_id
             ORDER BY total DESC
             LIMIT 1
-        """, (int(guild_id),)).fetchone()
+        """, (int(guild_id), cutoff)).fetchone()
 
     return {
         "total": int(row["total"] or 0),
@@ -8872,15 +9041,18 @@ def notification_stats(guild_id: int) -> dict:
 
 
 def recent_notifications(guild_id: int, limit: int = 25):
+    analytics_days = int(premium_entitlements(int(guild_id))["analytics_days"])
+    cutoff = int(time.time()) - analytics_days * 86400
     with closing(db()) as conn:
         return conn.execute("""
             SELECT *
             FROM notification_history
-            WHERE guild_id=?
+            WHERE guild_id=? AND created_at>=?
             ORDER BY id DESC
             LIMIT ?
         """, (
             int(guild_id),
+            cutoff,
             max(1, min(100, int(limit)))
         )).fetchall()
 
@@ -8928,7 +9100,10 @@ def host_delivery_channels(host) -> list[int]:
     if primary:
         result.append(int(primary))
 
-    if "extra_channel_ids" in host.keys():
+    if (
+        premium_feature_enabled(int(host["guild_id"]), "extra_channels")
+        and "extra_channel_ids" in host.keys()
+    ):
         for channel_id in parse_id_csv(host["extra_channel_ids"]):
             if channel_id not in result:
                 result.append(channel_id)
@@ -8943,7 +9118,10 @@ def host_mention_roles(host) -> list[int]:
     if primary_role:
         result.append(int(primary_role))
 
-    if "extra_role_ids" in host.keys():
+    if (
+        premium_feature_enabled(int(host["guild_id"]), "extra_channels")
+        and "extra_role_ids" in host.keys()
+    ):
         for role_id in parse_id_csv(host["extra_role_ids"]):
             if role_id not in result:
                 result.append(role_id)
@@ -8952,6 +9130,14 @@ def host_mention_roles(host) -> list[int]:
 
 
 def apply_host_embed_branding(host, embed: discord.Embed):
+    if not premium_feature_enabled(int(host["guild_id"]), "custom_branding"):
+        try:
+            if not getattr(embed.footer, "text", None):
+                embed.set_footer(text="Powered by Hi Notifku • FREE")
+        except Exception:
+            pass
+        return
+
     if "embed_title" in host.keys() and host["embed_title"]:
         embed.title = str(host["embed_title"])[:256]
 
@@ -9148,7 +9334,12 @@ async def _deliver_notification_now(
     channels = host_delivery_channels(host)
     primary_channel = channels[0] if channels else None
 
-    if webhook_url and http is not None and not http.closed:
+    if (
+        webhook_url
+        and premium_feature_enabled(int(host["guild_id"]), "webhook")
+        and http is not None
+        and not http.closed
+    ):
         try:
             webhook = discord.Webhook.from_url(
                 webhook_url,
@@ -9870,7 +10061,7 @@ async def check_youtube_live(host):
         )
 
         custom = render_template(
-            host["custom_live_message"],
+            premium_host_template(host, "custom_live_message"),
             creator=creator,
             url=url,
             platform="YouTube"
@@ -10019,7 +10210,7 @@ async def check_youtube_live_fallback(host):
         host,
         embed,
         render_template(
-            host["custom_live_message"],
+            premium_host_template(host, "custom_live_message"),
             creator=host["display_name"] or host["target"],
             url=data["url"],
             platform="YouTube"
@@ -10115,7 +10306,7 @@ async def check_generic_live(host):
                 host,
                 embed,
                 render_template(
-                    host["custom_end_message"],
+                    premium_host_template(host, "custom_end_message"),
                     creator=host["display_name"] or host["target"],
                     url=url,
                     platform=platform_display_name(platform)
@@ -10165,7 +10356,7 @@ async def check_generic_live(host):
         host,
         embed,
         render_template(
-            host["custom_live_message"],
+            premium_host_template(host, "custom_live_message"),
             creator=host["display_name"] or host["target"],
             url=data["url"],
             platform=platform_display_name(platform)
@@ -10324,7 +10515,7 @@ async def check_generic_content(host):
         host,
         embed,
         render_template(
-            host["custom_post_message"],
+            premium_host_template(host, "custom_post_message"),
             creator=host["display_name"] or host["target"],
             url=latest["url"],
             platform=platform_display_name(platform)
@@ -10379,7 +10570,7 @@ async def check_tiktok_live(host):
             )
 
             custom = render_template(
-                host["custom_live_message"],
+                premium_host_template(host, "custom_live_message"),
                 creator=f"@{username}",
                 url=url,
                 platform="TikTok"
@@ -10436,7 +10627,7 @@ async def maybe_send_live_end(host, creator: str, platform: str):
     )
 
     custom = render_template(
-        host["custom_end_message"],
+        premium_host_template(host, "custom_end_message"),
         creator=creator,
         url=url,
         platform=platform
@@ -10549,7 +10740,7 @@ async def check_tiktok_post(host):
         embed.set_image(url=latest["thumbnail"])
 
     custom = render_template(
-        host["custom_post_message"],
+        premium_host_template(host, "custom_post_message"),
         creator=f"@{username}",
         url=latest["url"],
         platform="TikTok"
@@ -13211,75 +13402,47 @@ def owner_home_embed():
         except Exception:
             pass
 
-    errors = sum(
-        1
-        for host in hosts
-        if host["last_error"]
-    )
+    errors = sum(1 for host in hosts if host["last_error"])
 
     embed = discord.Embed(
-        title="🛡️ Hi Notifku • Global Owner Bot",
-        description=(
-            "Panel administrasi global. **Pemilik Server dan Host Manager "
-            "tidak memiliki akses ke panel ini.**"
-        ),
+        title="🛡️ Hi Notifku • Global Owner",
+        description="Panel utama administrasi bot.",
         color=discord.Color.blue()
     )
     embed.add_field(
         name="Server",
         value=(
-            f"Total **{len(bot.guilds)}**\n"
-            f"🆓 FREE **{free_count}**\n"
-            f"⭐ PREMIUM **{premium_count}**"
+            f"**{len(bot.guilds)}** total • 🆓 **{free_count}** • ⭐ **{premium_count}**"
         ),
-        inline=True
+        inline=False
     )
     embed.add_field(
         name="Notifier",
         value=(
-            f"Host **{len(hosts)}**\n"
-            f"Error **{errors}**\n"
-            f"Ping **{round(bot.latency * 1000)} ms**"
+            f"Host **{len(hosts)}** • Error **{errors}** • Ping **{round(bot.latency * 1000)} ms**"
         ),
-        inline=True
+        inline=False
     )
     embed.add_field(
         name="Akses",
         value=(
-            f"Global Owner **{stats['global_owners']}**\n"
-            f"Pemilik Server **{stats['server_owners']}**\n"
-            f"Host Manager **{stats['host_managers']}**"
+            f"Owner **{stats['global_owners']}** • Server Owner **{stats['server_owners']}** • "
+            f"Manager **{stats['host_managers']}**"
         ),
-        inline=True
+        inline=False
     )
     embed.add_field(
-        name="Request Server",
+        name="Status",
         value=(
-            f"Manager **{stats['pending_access']}** • "
-            f"Host Baru **{stats['pending_hosts']}**"
+            f"Request Manager **{stats['pending_access']}** • Host **{stats['pending_hosts']}** • "
+            f"Uptime <t:{STARTED_AT}:R>"
         ),
-        inline=True
-    )
-    embed.add_field(
-        name="Uptime",
-        value=f"<t:{STARTED_AT}:R>",
-        inline=True
-    )
-    embed.add_field(
-        name="Auto Backup",
-        value=f"Setiap **{AUTO_BACKUP_HOURS} jam**",
-        inline=True
-    )
-    embed.add_field(
-        name="Release",
-        value=release_info_text(),
         inline=False
     )
     embed.set_footer(
-        text="/owner • Global Owner Bot only • semua pengaturan melalui DM"
+        text=f"v{APP_VERSION} • schema {CURRENT_SCHEMA_VERSION} • /owner • DM only"
     )
     return embed
-
 
 def server_embed(guild: discord.Guild):
     cfg = get_config(guild.id)
@@ -13797,6 +13960,11 @@ class CustomMessageModal(discord.ui.Modal):
         self.host_id = host_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await require_premium_feature(
+            interaction, self.guild_id, "custom_templates", "Custom pesan"
+        ):
+            return
+
         set_host_messages(
             self.host_id,
             self.live.value.strip() or None,
@@ -21370,6 +21538,15 @@ class HostManagerMessageModal(discord.ui.Modal):
             )
             return
 
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "custom_templates", "Custom pesan"
+        ):
+            return
+
         with closing(db()) as conn:
             conn.execute("""
                 UPDATE hosts
@@ -21448,6 +21625,15 @@ class HostManagerScheduleModal(discord.ui.Modal):
                 interaction,
                 "🔒 Kamu tidak punya izin mengubah jadwal host ini."
             )
+            return
+
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "advanced_schedule", "Jadwal & quiet hours"
+        ):
             return
 
         raw_days = self.days.value.strip()
@@ -21733,7 +21919,8 @@ class HostManagerDetailView(discord.ui.View):
             host,
             embed,
             render_template(
-                host["custom_live_message"] or host["custom_post_message"],
+                premium_host_template(host, "custom_live_message")
+                or premium_host_template(host, "custom_post_message"),
                 creator=host["display_name"] or host["target"],
                 url=url,
                 platform=platform_display_name(host["platform"])
@@ -21906,14 +22093,16 @@ class HostManagerDetailView(discord.ui.View):
         if not host:
             return
 
+        analytics_days = int(premium_entitlements(int(host["guild_id"]))["analytics_days"])
+        cutoff = int(time.time()) - analytics_days * 86400
         with closing(db()) as conn:
             rows = conn.execute("""
                 SELECT *
                 FROM notification_history
-                WHERE host_id=?
+                WHERE host_id=? AND created_at>=?
                 ORDER BY id DESC
                 LIMIT 10
-            """, (self.host_id,)).fetchall()
+            """, (self.host_id, cutoff)).fetchall()
 
         if rows:
             lines = []
@@ -21936,7 +22125,7 @@ class HostManagerDetailView(discord.ui.View):
             color=discord.Color.blurple()
         )
         embed.set_footer(
-            text="Hanya history host yang ditugaskan kepadamu."
+            text=f"History {analytics_days} hari • hanya host yang ditugaskan kepadamu."
         )
 
         await interaction.response.edit_message(
@@ -22073,6 +22262,15 @@ class HostTemplatePresetView(discord.ui.View):
                 interaction,
                 "🔒 Kamu tidak punya izin mengubah template."
             )
+            return
+
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "custom_templates", "Template Premium"
+        ):
             return
 
         apply_host_template_preset(
@@ -23823,7 +24021,7 @@ class TransactionHistoryView(discord.ui.View):
             view=TransactionHistoryView()
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
@@ -23920,7 +24118,7 @@ class RevenueReportView(discord.ui.View):
             view=RevenueReportView()
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
@@ -23951,7 +24149,7 @@ class HealthDetailView(discord.ui.View):
             view=HealthDetailView()
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
@@ -23975,14 +24173,21 @@ class OwnerDashboardView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
 
-    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_dashboard_embed(),
             view=OwnerDashboardView()
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Health Detail", emoji="🛠️", style=discord.ButtonStyle.secondary, row=0)
+    async def health_detail(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=health_detail_embed(),
+            view=HealthDetailView()
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(
             embed=owner_home_embed(),
@@ -24929,7 +25134,7 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerBackupCenterView(self.viewer_id)
         )
 
-    @discord.ui.button(label="Platform Health", emoji="🌐", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Platform", emoji="🌐", style=discord.ButtonStyle.secondary, row=2)
     async def platform_health(self, interaction, button):
         if not await self.valid(interaction):
             return
@@ -24938,7 +25143,7 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerPlatformHealthView(self.viewer_id)
         )
 
-    @discord.ui.button(label="Risk Control", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Risk", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2)
     async def risk(self, interaction, button):
         if not await self.valid(interaction, "server_admin"):
             return
@@ -24953,10 +25158,7 @@ class OwnerOpsHomeView(discord.ui.View):
             await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
             return
         if not is_primary_owner(interaction.user.id):
-            await safe_reply(
-                interaction,
-                "🔒 Emergency hanya untuk **Primary Global Owner**."
-            )
+            await safe_reply(interaction, "🔒 Emergency hanya untuk **Primary Global Owner**.")
             return
         await interaction.response.edit_message(
             embed=owner_emergency_embed(),
@@ -24990,55 +25192,20 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerDeadLetterView(self.viewer_id)
         )
 
-    @discord.ui.button(label="Payment", emoji="💳", style=discord.ButtonStyle.secondary, row=4)
-    async def payment(self, interaction, button):
-        if not await self.valid(interaction, "payment_admin"):
-            return
-        await interaction.response.edit_message(
-            embed=payment_health_embed(),
-            view=PaymentCenterView(self.viewer_id)
-        )
-
-    @discord.ui.button(label="Incidents", emoji="🚨", style=discord.ButtonStyle.secondary, row=4)
-    async def incidents(self, interaction, button):
-        if not await self.valid(interaction):
-            return
-        await interaction.response.edit_message(
-            embed=incident_center_embed(),
-            view=OwnerIncidentCenterView(self.viewer_id)
-        )
-
-    @discord.ui.button(label="Runtime", emoji="⚙️", style=discord.ButtonStyle.secondary, row=4)
-    async def runtime_tuning(self, interaction, button):
-        if not await self.valid(interaction, "server_admin"):
-            return
-        await interaction.response.edit_message(
-            embed=runtime_tuning_embed(),
-            view=OwnerRuntimeTuningView(self.viewer_id)
-        )
-
-    @discord.ui.button(label="Migration", emoji="🚚", style=discord.ButtonStyle.secondary, row=4)
-    async def migration(self, interaction, button):
-        if not await self.valid(interaction, "server_admin"):
-            return
-        await interaction.response.send_modal(ServerMigrationModal())
-
-    @discord.ui.button(label="Diagnostics", emoji="📦", style=discord.ButtonStyle.secondary, row=4)
-    async def diagnostics(self, interaction, button):
+    @discord.ui.button(label="Advanced", emoji="⚙️", style=discord.ButtonStyle.primary, row=4)
+    async def advanced(self, interaction, button):
         if not await self.valid(interaction):
             return
         await interaction.response.edit_message(
             embed=discord.Embed(
-                title="📦 Diagnostics",
-                description=(
-                    "Buat bundle diagnosis tanpa secret untuk debugging Railway."
-                ),
+                title="⚙️ Advanced Operations",
+                description="Payment • Incident • Runtime • Migration • Diagnostics",
                 color=discord.Color.blurple()
             ),
-            view=OwnerDiagnosticsView(self.viewer_id)
+            view=OwnerOpsAdvancedView(self.viewer_id)
         )
 
-    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=4)
     async def back(self, interaction, button):
         if not await self.valid(interaction):
             return
@@ -25047,7 +25214,7 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerHomeView(self.viewer_id)
         )
 
-    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=4)
     async def home(self, interaction, button):
         if not await self.valid(interaction):
             return
@@ -25056,6 +25223,85 @@ class OwnerOpsHomeView(discord.ui.View):
             view=OwnerHomeView(self.viewer_id)
         )
 
+
+class OwnerOpsAdvancedView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction, minimum="read_only"):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_owner_level(interaction, minimum)
+
+    @discord.ui.button(label="Payment", emoji="💳", style=discord.ButtonStyle.secondary, row=0)
+    async def payment(self, interaction, button):
+        if not await self.valid(interaction, "payment_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=payment_health_embed(),
+            view=PaymentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Incidents", emoji="🚨", style=discord.ButtonStyle.secondary, row=0)
+    async def incidents(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=incident_center_embed(),
+            view=OwnerIncidentCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Runtime", emoji="⚙️", style=discord.ButtonStyle.secondary, row=0)
+    async def runtime_tuning(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=runtime_tuning_embed(),
+            view=OwnerRuntimeTuningView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Migration", emoji="🚚", style=discord.ButtonStyle.secondary, row=0)
+    async def migration(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.send_modal(ServerMigrationModal())
+
+    @discord.ui.button(label="Diagnostics", emoji="📦", style=discord.ButtonStyle.secondary, row=0)
+    async def diagnostics(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="📦 Diagnostics",
+                description="Buat bundle diagnosis tanpa secret untuk debugging Railway.",
+                color=discord.Color.blurple()
+            ),
+            view=OwnerDiagnosticsView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧰 Owner Operations",
+                description="Operasional, keamanan, monitoring, dan maintenance bot.",
+                color=discord.Color.blurple()
+            ),
+            view=OwnerOpsHomeView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
 
 
 class OwnerSelfTestView(OwnerBasicBackView):
@@ -25938,59 +26184,74 @@ class OwnerBackupCenterView(OwnerBasicBackView):
 
 
 
+class OwnerPaymentMenuView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction, minimum="read_only"):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_owner_level(interaction, minimum)
+
+    @discord.ui.button(label="Request", emoji="💳", style=discord.ButtonStyle.secondary, row=0)
+    async def requests(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=premium_queue_embed(),
+            view=PremiumOrdersView()
+        )
+
+    @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=0)
+    async def history(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=transaction_history_embed(),
+            view=TransactionHistoryView()
+        )
+
+    @discord.ui.button(label="Pendapatan", emoji="💰", style=discord.ButtonStyle.secondary, row=0)
+    async def revenue(self, interaction, button):
+        if not await self.valid(interaction, "payment_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=revenue_embed(),
+            view=RevenueReportView()
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
+
 class OwnerHomeView(discord.ui.View):
     def __init__(self, viewer_id: Optional[int] = None):
         super().__init__(timeout=900)
         self.viewer_id = int(viewer_id) if viewer_id else None
         self.add_item(GuildSelect())
 
-    async def valid_owner(
-        self,
-        interaction: discord.Interaction,
-        minimum: str = "read_only"
-    ) -> bool:
-        if (
-            self.viewer_id is not None
-            and int(interaction.user.id) != self.viewer_id
-        ):
-            await safe_reply(
-                interaction,
-                "🔒 Panel Global Owner ini bukan milikmu."
-            )
+    async def valid_owner(self, interaction: discord.Interaction, minimum: str = "read_only") -> bool:
+        if self.viewer_id is not None and int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel Global Owner ini bukan milikmu.")
             return False
-
-        return await require_owner_level(
-            interaction,
-            minimum
-        )
-
-    @discord.ui.button(label="FREE", emoji="🆓", style=discord.ButtonStyle.secondary, row=1)
-    async def free_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.valid_owner(interaction):
-            return
-        guilds = guilds_by_plan("free")
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="🆓 Server FREE",
-                description=f"Total: **{len(guilds)} server**",
-                color=discord.Color.blue()
-            ),
-            view=PlanListView("free")
-        )
-
-    @discord.ui.button(label="Premium", emoji="⭐", style=discord.ButtonStyle.secondary, row=1)
-    async def premium_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.valid_owner(interaction):
-            return
-        guilds = guilds_by_plan("premium")
-        await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="⭐ Server PREMIUM",
-                description=f"Total: **{len(guilds)} server**",
-                color=discord.Color.gold()
-            ),
-            view=PlanListView("premium")
-        )
+        return await require_owner_level(interaction, minimum)
 
     @discord.ui.button(label="Plan", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
     async def plan_overview(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -26001,36 +26262,7 @@ class OwnerHomeView(discord.ui.View):
             view=PlanOverviewView()
         )
 
-    @discord.ui.button(label="Health", emoji="🩺", style=discord.ButtonStyle.secondary, row=2)
-    async def health(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.valid_owner(interaction):
-            return
-
-        hosts = []
-        for guild in bot.guilds:
-            hosts.extend(get_hosts(guild.id))
-
-        embed = discord.Embed(
-            title="🩺 Hi Notifku Health",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="Discord", value=f"✅ {round(bot.latency * 1000)} ms", inline=True)
-        embed.add_field(name="Uptime", value=f"<t:{STARTED_AT}:R>", inline=True)
-        embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
-        embed.add_field(name="Hosts", value=str(len(hosts)), inline=True)
-        embed.add_field(
-            name="With Errors",
-            value=str(sum(1 for h in hosts if h["last_error"])),
-            inline=True
-        )
-        embed.add_field(name="Database", value=f"`{DB_PATH}`", inline=False)
-
-        await interaction.response.edit_message(
-            embed=embed,
-            view=BackHomeView()
-        )
-
-    @discord.ui.button(label="Dashboard", emoji="📊", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Dashboard", emoji="📈", style=discord.ButtonStyle.secondary, row=1)
     async def dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
@@ -26039,118 +26271,55 @@ class OwnerHomeView(discord.ui.View):
             view=OwnerDashboardView()
         )
 
-    @discord.ui.button(label="Request", emoji="💳", style=discord.ButtonStyle.secondary, row=3)
-    async def premium_requests(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Payment", emoji="💳", style=discord.ButtonStyle.secondary, row=1)
+    async def payment(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
-            embed=premium_queue_embed(),
-            view=PremiumOrdersView()
-        )
-
-    @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=3)
-    async def premium_history(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.valid_owner(interaction):
-            return
-        await interaction.response.edit_message(
-            embed=transaction_history_embed(),
-            view=TransactionHistoryView()
-        )
-
-    @discord.ui.button(label="Pendapatan", emoji="💰", style=discord.ButtonStyle.secondary, row=3)
-    async def revenue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not owner_has_level(interaction.user.id, "payment_admin"):
-            await safe_reply(interaction, "❌ Akses Payment Admin diperlukan.")
-            return
-        await interaction.response.edit_message(
-            embed=revenue_embed(),
-            view=RevenueReportView()
-        )
-
-    @discord.ui.button(label="Health Detail", emoji="🛠️", style=discord.ButtonStyle.secondary, row=3)
-    async def health_detail(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.valid_owner(interaction):
-            return
-        await interaction.response.edit_message(
-            embed=health_detail_embed(),
-            view=HealthDetailView()
+            embed=discord.Embed(
+                title="💳 Payment Center",
+                description="Request • Riwayat • Pendapatan",
+                color=discord.Color.gold()
+            ),
+            view=OwnerPaymentMenuView(interaction.user.id)
         )
 
     @discord.ui.button(label="Global Owner", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2)
     async def owners(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_primary_owner(interaction.user.id):
-            await safe_reply(
-                interaction,
-                "❌ Hanya **Primary Global Owner Bot** dari `OWNER_IDS` yang dapat membuka menu ini."
-            )
+            await safe_reply(interaction, "❌ Hanya **Primary Global Owner Bot** dari `OWNER_IDS` yang dapat membuka menu ini.")
             return
-
         all_owners = OWNER_IDS | db_owner_ids()
         embed = discord.Embed(
             title="🛡️ Global Owner Bot",
-            description="\n".join(
-                f"• <@{x}> (`{x}`)"
-                for x in sorted(all_owners)
-            ) or "Tidak ada",
+            description="\n".join(f"• <@{x}> (`{x}`)" for x in sorted(all_owners)) or "Tidak ada",
             color=discord.Color.gold()
         )
-        await interaction.response.edit_message(
-            embed=embed,
-            view=OwnerManagementView()
-        )
+        await interaction.response.edit_message(embed=embed, view=OwnerManagementView())
 
-    @discord.ui.button(
-        label="Security",
-        emoji="🔐",
-        style=discord.ButtonStyle.primary,
-        row=4
-    )
-    async def security(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    @discord.ui.button(label="Security", emoji="🔐", style=discord.ButtonStyle.primary, row=2)
+    async def security(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
-
         await interaction.response.edit_message(
-            embed=global_owner_access_embed(
-                interaction.user.id
-            ),
-            view=OwnerAccessCenterView(
-                interaction.user.id
-            )
+            embed=global_owner_access_embed(interaction.user.id),
+            view=OwnerAccessCenterView(interaction.user.id)
         )
 
-    @discord.ui.button(
-        label="Operations",
-        emoji="🧰",
-        style=discord.ButtonStyle.primary,
-        row=4
-    )
-    async def operations(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    @discord.ui.button(label="Operations", emoji="🧰", style=discord.ButtonStyle.primary, row=2)
+    async def operations(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
-
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title="🧰 Owner Operations",
-                description=(
-                    "Self Test • Error Center • Notification • API/Quota • "
-                    "Audit • Backup • Risk • Emergency"
-                ),
+                description="Operasional, keamanan, monitoring, dan maintenance bot.",
                 color=discord.Color.blurple()
             ),
-            view=OwnerOpsHomeView(
-                interaction.user.id
-            )
+            view=OwnerOpsHomeView(interaction.user.id)
         )
 
-    @discord.ui.button(label="Server", emoji="🔎", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Server", emoji="🔎", style=discord.ButtonStyle.secondary, row=3)
     async def browse_servers(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.valid_owner(interaction):
             return
@@ -26162,7 +26331,6 @@ class OwnerHomeView(discord.ui.View):
             ),
             view=ServerBrowserView(0, "")
         )
-
 
 
 class BackHomeView(discord.ui.View):
@@ -26978,6 +27146,11 @@ class HostDeliveryModal(discord.ui.Modal):
             await safe_reply(interaction, "❌ Host tidak ditemukan.")
             return
 
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "extra_channels", "Delivery lanjutan"
+        ):
+            return
+
         channels = ",".join(
             str(x) for x in parse_id_csv(self.extra_channels.value)
         )
@@ -27049,6 +27222,15 @@ class HostScheduleModal(discord.ui.Modal):
             self.quiet_end.default = host["quiet_end"] or ""
 
     async def on_submit(self, interaction: discord.Interaction):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "advanced_schedule", "Jadwal & quiet hours"
+        ):
+            return
+
         try:
             ZoneInfo(self.timezone_name.value.strip())
         except Exception:
@@ -27127,6 +27309,15 @@ class HostBrandingModal(discord.ui.Modal):
             self.language.default = host["language"] or "id"
 
     async def on_submit(self, interaction: discord.Interaction):
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(
+            interaction, int(host["guild_id"]), "custom_branding", "Custom branding"
+        ):
+            return
+
         color_value = None
         raw_color = self.color.value.strip().lstrip("#")
 
@@ -27246,7 +27437,7 @@ class HostAdvancedView(discord.ui.View):
         await safe_reply(
             interaction,
             render_template(
-                host["custom_live_message"],
+                premium_host_template(host, "custom_live_message"),
                 creator=host["display_name"] or host["target"],
                 url=url,
                 platform=host["platform"].title()
@@ -28489,7 +28680,7 @@ class HostCardView(discord.ui.View):
         )
 
         custom = render_template(
-            host["custom_live_message"],
+            premium_host_template(host, "custom_live_message"),
             creator=f"@{host['target']}",
             url=url,
             platform="TikTok"
@@ -28517,7 +28708,7 @@ class HostCardView(discord.ui.View):
         )
 
         custom = render_template(
-            host["custom_post_message"],
+            premium_host_template(host, "custom_post_message"),
             creator=f"@{host['target']}",
             url=url,
             platform="TikTok"
@@ -28545,7 +28736,7 @@ class HostCardView(discord.ui.View):
         )
 
         custom = render_template(
-            host["custom_live_message"],
+            premium_host_template(host, "custom_live_message"),
             creator=host["display_name"] or host["target"],
             url=url,
             platform="YouTube"
@@ -29308,20 +29499,32 @@ async def on_message(message: discord.Message):
         return
 
     if message.guild is None:
-        # Payment proof upload from regular users.
-        if message.attachments and not is_global_owner(message.author.id):
+        # Payment proof upload from any user, including Global Owner.
+        # Proof handling must run before the Global Owner QRIS-upload flow so
+        # owners can also test/buy Premium without their proof being skipped.
+        if message.attachments:
             order = latest_waiting_proof_order(message.author.id)
 
             if order:
+                if len(message.attachments) != 1:
+                    await message.channel.send(
+                        "❌ Kirim tepat **1 screenshot bukti transfer** dalam satu pesan "
+                        "agar screening otomatis dapat dijalankan."
+                    )
+                    return
+
                 attachment = message.attachments[0]
                 proof_url = attachment.url
-
-                proof_bytes = await attachment.read()
-                proof_hash_value = hashlib.sha256(
-                    proof_bytes
-                ).hexdigest()
+                scan_notice = await message.channel.send(
+                    "🔎 Bukti diterima. Sedang melakukan **screening otomatis**..."
+                )
 
                 try:
+                    proof_bytes = await attachment.read()
+                    proof_hash_value = hashlib.sha256(
+                        proof_bytes
+                    ).hexdigest()
+
                     scan = await asyncio.to_thread(
                         scan_payment_proof_bytes,
                         proof_bytes,
@@ -29337,9 +29540,24 @@ async def on_message(message: discord.Message):
                         scan=scan
                     )
                 except ValueError as exc:
-                    await message.channel.send(
-                        f"❌ {exc}"
-                    )
+                    try:
+                        await scan_notice.edit(content=f"❌ Screening gagal: {exc}")
+                    except Exception:
+                        await message.channel.send(f"❌ Screening gagal: {exc}")
+                    return
+                except Exception as exc:
+                    log.exception("Screening bukti pembayaran gagal")
+                    try:
+                        await scan_notice.edit(
+                            content=(
+                                "❌ Screening bukti gagal diproses. "
+                                f"`{type(exc).__name__}`. Silakan kirim ulang bukti."
+                            )
+                        )
+                    except Exception:
+                        await message.channel.send(
+                            "❌ Screening bukti gagal diproses. Silakan kirim ulang bukti."
+                        )
                     return
 
                 updated_order = get_premium_order(int(order["id"]))
@@ -29398,22 +29616,24 @@ async def on_message(message: discord.Message):
 
                 scan_text = payment_proof_scan_label(updated_order)
 
-                await message.channel.send(
-                    (
-                        f"✅ Bukti `{invoice_ref}` sudah diterima.\n"
-                        f"Screening: {scan_text}\n"
-                        + (
-                            "⭐ Pembayaran sebelumnya sudah terverifikasi, "
-                            "jadi Premium otomatis diaktifkan."
-                            if auto_ok
-                            else (
-                                "⏳ Menunggu verifikasi pembayaran/nominal masuk.\n"
-                                "Pastikan screenshot yang dikirim sudah mengikuti instruksi "
-                                "agar tidak masuk REVIEW/DITOLAK."
-                            )
+                final_scan_message = (
+                    f"✅ Bukti `{invoice_ref}` sudah diterima dan selesai discan.\n"
+                    f"Screening: {scan_text}\n"
+                    + (
+                        "⭐ Pembayaran sebelumnya sudah terverifikasi, "
+                        "jadi Premium otomatis diaktifkan."
+                        if auto_ok
+                        else (
+                            "⏳ Menunggu verifikasi pembayaran/nominal masuk.\n"
+                            "Pastikan screenshot yang dikirim sudah mengikuti instruksi "
+                            "agar tidak masuk REVIEW/DITOLAK."
                         )
                     )
                 )
+                try:
+                    await scan_notice.edit(content=final_scan_message)
+                except Exception:
+                    await message.channel.send(final_scan_message)
                 return
 
         if is_global_owner(message.author.id):
