@@ -1086,3 +1086,90 @@ Peningkatan:
 - warning H-3 sebelum akses Host Manager berakhir.
 
 Global Owner tetap menggunakan `/owner`. Host Manager tidak memperoleh akses ke payment, premium admin, backup, restore, revenue, owner management, atau konfigurasi global.
+
+## User Belum Punya Host — Hubungi Pemilik Server
+
+Jika `/menu` mendeteksi user bukan server owner dan belum memiliki Host Manager assignment, bot tidak lagi menyuruh user menghubungi "owner bot".
+
+Alur baru:
+```text
+/menu
+→ pilih server mutual
+→ 👑 Pemilik Server
+atau
+→ 📨 Minta Akses Host
+```
+
+`👑 Pemilik Server` menampilkan mention owner Discord dari server yang dipilih. Mention dapat ditekan untuk membuka profilnya.
+
+`📨 Minta Akses Host` mengirim DM ke pemilik server. Pemilik server kemudian dapat memilih salah satu host di servernya untuk diberikan kepada user sebagai Host Manager. Proses ini tidak memberikan akses `/owner` dan tidak melibatkan Global Owner bot.
+
+### Request akses ketika server belum punya host
+
+Tombol `📨 Minta Akses Host` tetap mengirim DM ke pemilik server walaupun server belum mempunyai host. Owner menerima pemberitahuan siapa yang meminta akses dan instruksi membuat host melalui:
+
+`/menu → pilih server → Kelola Host → Tambah Host`
+
+Jika server sudah mempunyai host, owner menerima selector host untuk langsung memberikan akses Host Manager.
+
+### Auto backup tidak reset saat redeploy
+
+Auto backup tetap mengikuti interval `AUTO_BACKUP_HOURS` (saat ini 48 jam / 2 hari), tetapi scheduler mengecek jatuh tempo setiap 1 jam. Timestamp backup terakhir disimpan melalui `backup_log` dan marker `.last_auto_backup` di `AUTO_BACKUP_DIR`.
+
+Artinya:
+- mengganti `bot.py`;
+- push GitHub;
+- restart Railway;
+- redeploy Railway;
+
+tidak otomatis mengirim backup baru ke DM owner jika belum 48 jam sejak backup otomatis terakhir.
+
+Agar jadwal tetap bertahan melewati restart, gunakan Railway Volume pada `/data` dan `AUTO_BACKUP_DIR=/data/backups`.
+
+## Pemisahan Akses: Global Owner Bot vs Pemilik Server
+
+### 🛡️ Global Owner Bot
+Masuk melalui `/owner`. Hak akses:
+- semua server;
+- premium admin dan transaksi;
+- payment/QRIS/revenue;
+- backup/restore;
+- owner management;
+- audit/health/maintenance;
+- konfigurasi global.
+
+### 👑 Pemilik Server
+Masuk melalui `/menu → pilih server miliknya`. Hak akses hanya pada server tersebut:
+- melihat plan server sendiri;
+- request/upgrade Premium untuk server sendiri;
+- tambah host sesuai limit plan;
+- pause/resume/recheck/hapus host server sendiri;
+- menerima request Host Manager;
+- Setujui/Tolak request Host Manager;
+- memilih host yang akan diberikan ke Host Manager.
+
+Pemilik Server tidak dapat membuka `/owner`, melihat server lain, revenue, QRIS admin, backup/restore global, atau owner management.
+
+### 🎙️ Host Manager
+Masuk melalui `/menu → Host Saya` dan hanya dapat mengakses host/server yang diberikan sesuai permission.
+
+### Approval Host Manager
+Request dari user disimpan sebagai pending. DM Pemilik Server mempunyai tombol `✅ Setujui` dan `❌ Tolak`. Saat Setujui dipilih, Pemilik Server memilih host dari servernya sendiri. Jika belum ada host, request tetap pending sampai host dibuat.
+
+## /menu — Dua Pilihan Peran
+
+Root `/menu` sekarang hanya menampilkan dua jalur utama:
+
+```text
+📩 /menu
+├── 👑 Pemilik Server
+└── 🎙️ Host Manager
+```
+
+### 👑 Pemilik Server
+Menampilkan server yang benar-benar dimiliki user. Dari sana user dapat mengatur plan dan host servernya sendiri sesuai batas plan.
+
+### 🎙️ Host Manager
+Menampilkan dashboard Host Manager dan hanya host/server yang diberikan kepadanya. Jika belum memiliki assignment, menu ini mengarahkan user ke flow permintaan akses kepada Pemilik Server.
+
+`🛡️ Global Owner Bot` tidak ditampilkan sebagai pilihan `/menu`; akses global tetap hanya melalui `/owner`.
