@@ -1248,3 +1248,135 @@ Panel Global Owner sekarang memiliki `🔐 Security`:
 - pengelolaan Global Owner hanya untuk Primary Owner.
 
 Global Owner dapat memantau request Host Manager/host baru secara global, tetapi approval request tersebut tetap wajib dilakukan oleh Pemilik Server.
+
+## Global Owner Operations Upgrade
+
+`/owner → 🧰 Operations` menyediakan:
+- 🧪 Self Test Bot
+- 🚨 Error & Recovery Center
+- 🔔 Notification Center
+- 📡 API / Quota Monitor
+- 🧾 Global Audit Log
+- 🗄️ Backup Center + manual backup + verify
+- 🛡️ Server Risk Control
+- 🚨 Emergency Control
+
+Semua submenu baru memiliki `⬅️ Kembali` dan `🏠 Menu Awal`.
+
+Emergency Control hanya Primary Global Owner:
+- pause checker;
+- stop notifikasi;
+- stop request baru;
+- maintenance global.
+
+Status emergency disimpan di SQLite sehingga bertahan setelah restart.
+
+Risk Control:
+- allowed / Normal
+- warning
+- suspended
+- blacklist
+- whitelist
+
+`suspended` dan `blacklist` memblokir checker server. Approval Host Manager/host baru tetap kewenangan Pemilik Server, bukan Global Owner.
+
+## Bot Bisa Join Server Mana Pun — Command DM Only
+
+Hi Notifku boleh diundang dan tetap berada di server Discord mana pun.
+
+Namun seluruh slash command dibatasi ke DM/private context:
+- `/ping`
+- `/start`
+- `/menu`
+- `/owner`
+
+Command tidak dapat digunakan dari channel server.
+
+Bot tetap dapat menggunakan server untuk fungsi notifier seperti mengirim notifikasi ke channel yang sudah dikonfigurasi.
+
+Pemisahan akses tetap:
+- Global Owner Bot → `/owner` di DM
+- Pemilik Server → `/menu` di DM
+- Host Manager → `/menu` di DM
+
+Pembatasan command memiliki dua lapisan:
+1. Discord command contexts (`guilds=False`);
+2. runtime guard `require_dm_command()` sebagai fallback keamanan.
+
+## Verifikasi Wajib Pemilik Server Saat Invite Bot
+
+Hi Notifku boleh diundang ke server Discord mana pun, tetapi notifier server belum aktif sampai Pemilik Server terverifikasi.
+
+Alur:
+```text
+Invite bot
+→ bot join server
+→ owner belum terverifikasi
+→ owner wajib join Server Owner/Support
+→ owner buka DM bot
+→ /start
+→ verifikasi berhasil
+→ notifier server boleh berjalan
+```
+
+Status disimpan di tabel `guild_owner_verification`. Membership owner tetap dicek live oleh monitor. Semua slash command tetap DM-only.
+
+## Auto Verifikasi Pemilik Server
+
+Verifikasi tidak lagi membutuhkan approval manual atau `/start`.
+
+Saat Pemilik Server join `REQUIRED_GUILD_ID`:
+```text
+on_member_join
+→ cocokkan user ID dengan guild.owner_id
+→ semua server miliknya otomatis verified
+→ notifier otomatis diperbolehkan
+→ DM konfirmasi dikirim
+```
+
+Jika Pemilik Server keluar dari `REQUIRED_GUILD_ID`:
+```text
+on_member_remove
+→ semua server miliknya otomatis unverified
+→ notifier ditahan
+→ DM pemberitahuan dikirim
+```
+
+`/start` tetap tersedia sebagai pengecekan/refresh manual, tetapi bukan lagi syarat utama verifikasi.
+
+## Verification System v2
+
+Verifikasi Pemilik Server sekarang menggunakan satu alur otomatis:
+
+- invite bot → owner langsung dicek;
+- owner join Server Owner/Support → auto verified;
+- owner keluar → auto unverified;
+- transfer kepemilikan server → owner baru diverifikasi ulang;
+- reconciliation setiap 1 jam memperbaiki event yang mungkin terlewat;
+- `/start` hanya refresh manual, bukan syarat verifikasi.
+
+Status menyimpan:
+- owner ID;
+- verified/unverified;
+- waktu terakhir dicek;
+- sumber verifikasi;
+- alasan status.
+
+Bot tetap boleh berada di server belum terverifikasi, tetapi notifier server ditahan sampai owner valid.
+
+## Stability & Operations Upgrade v3
+
+Peningkatan:
+- schema version tracking (`schema_meta`, version 16);
+- atomic claim untuk approval Host Manager dan request host;
+- pending approval recovery setelah restart/redeploy;
+- reminder request pending pada H+24 dan H+48;
+- startup integrity check dan DM warning ke Primary Owner;
+- Platform Health dashboard;
+- restore backup preview dengan diff;
+- pagination + search host Pemilik Server;
+- `/ping` menampilkan IPv4 dan IPv6;
+- tombol `📋 Ambil IP` untuk mengambil alamat IP terbaru;
+- tombol `🔄 Refresh` pada `/ping`.
+
+Catatan: public IP dideteksi best-effort melalui endpoint IP lookup. Jika akses IPv6 tidak tersedia pada runtime/provider, IPv6 akan tampil `Tidak tersedia` atau fallback alamat lokal runtime.

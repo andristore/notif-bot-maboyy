@@ -9,6 +9,7 @@ import logging
 import platform
 import sqlite3
 import shutil
+import socket
 from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
@@ -254,6 +255,187 @@ def host_public_url(host, *, live: bool = False) -> str:
     return target
 
 
+
+async def fetch_public_ip(
+    *,
+    ipv6: bool = False
+) -> Optional[str]:
+    """
+    Best-effort public IP lookup.
+    IPv4 uses api.ipify.org and IPv6 uses api6.ipify.org.
+    """
+    url = (
+        "https://api6.ipify.org"
+        if ipv6
+        else "https://api.ipify.org"
+    )
+
+    session = http
+    own_session = False
+
+    try:
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+            own_session = True
+
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as response:
+            if response.status != 200:
+                return None
+
+            value = (await response.text()).strip()
+            if not value:
+                return None
+
+            # Keep output compact and safe.
+            if len(value) > 80:
+                return None
+
+            return value
+
+    except Exception:
+        return None
+
+    finally:
+        if own_session and session is not None:
+            await session.close()
+
+
+def local_ip_candidates() -> tuple[Optional[str], Optional[str]]:
+    ipv4 = None
+    ipv6 = None
+
+    try:
+        infos = socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            type=socket.SOCK_STREAM
+        )
+        for family, _, _, _, sockaddr in infos:
+            if family == socket.AF_INET and not ipv4:
+                candidate = sockaddr[0]
+                if candidate and not candidate.startswith("127."):
+                    ipv4 = candidate
+            elif family == socket.AF_INET6 and not ipv6:
+                candidate = sockaddr[0].split("%", 1)[0]
+                if candidate and candidate != "::1":
+                    ipv6 = candidate
+    except Exception:
+        pass
+
+    return ipv4, ipv6
+
+
+async def current_ip_info() -> dict:
+    public_v4, public_v6 = await asyncio.gather(
+        fetch_public_ip(ipv6=False),
+        fetch_public_ip(ipv6=True)
+    )
+
+    local_v4, local_v6 = local_ip_candidates()
+
+    return {
+        "ipv4": public_v4 or local_v4 or "Tidak tersedia",
+        "ipv6": public_v6 or local_v6 or "Tidak tersedia",
+        "ipv4_public": bool(public_v4),
+        "ipv6_public": bool(public_v6),
+    }
+
+
+def apply_ip_fields(
+    embed: discord.Embed,
+    ip_info: dict
+) -> discord.Embed:
+    embed.add_field(
+        name="IPv4",
+        value=f"`{ip_info['ipv4']}`",
+        inline=False
+    )
+    embed.add_field(
+        name="IPv6",
+        value=f"`{ip_info['ipv6']}`",
+        inline=False
+    )
+    return embed
+
+
+class PingView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = int(user_id)
+
+    async def valid(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(
+                interaction,
+                "🔒 Tombol `/ping` ini bukan milikmu."
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Ambil IP",
+        emoji="📋",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def get_ip(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+
+        info = await current_ip_info()
+
+        await interaction.followup.send(
+            (
+                "**IP Hi Notifku**\n"
+                f"IPv4: `{info['ipv4']}`\n"
+                f"IPv6: `{info['ipv6']}`\n\n"
+                "Tekan lama / pilih teks untuk menyalin."
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid(interaction):
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
+        )
+        info = await current_ip_info()
+        embed = bot_status_embed()
+        apply_ip_fields(embed, info)
+
+        await interaction.edit_original_response(
+            embed=embed,
+            view=PingView(self.user_id)
+        )
+
+
+
+
 # ============================================================
 # BOT STATUS / PING
 # ============================================================
@@ -409,6 +591,14 @@ def migrate_database():
     with closing(db()) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                version INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
 
         # Guild config
         if not table_exists(conn, "guild_config"):
@@ -648,6 +838,83 @@ def migrate_database():
                     error TEXT
                 )
             """)
+
+
+        if not table_exists(conn, "bot_runtime_settings"):
+            conn.execute("""
+                CREATE TABLE bot_runtime_settings (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    monitor_paused INTEGER NOT NULL DEFAULT 0,
+                    notifications_paused INTEGER NOT NULL DEFAULT 0,
+                    requests_paused INTEGER NOT NULL DEFAULT 0,
+                    maintenance_all INTEGER NOT NULL DEFAULT 0,
+                    updated_by INTEGER,
+                    updated_at INTEGER
+                )
+            """)
+            conn.execute("""
+                INSERT OR IGNORE INTO bot_runtime_settings(
+                    id,
+                    monitor_paused,
+                    notifications_paused,
+                    requests_paused,
+                    maintenance_all
+                )
+                VALUES(1,0,0,0,0)
+            """)
+
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS request_reminders (
+                request_kind TEXT NOT NULL,
+                request_id INTEGER NOT NULL,
+                milestone_hours INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY(request_kind, request_id, milestone_hours)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS request_recovery_log (
+                request_kind TEXT NOT NULL,
+                request_id INTEGER NOT NULL,
+                sent_at INTEGER NOT NULL,
+                PRIMARY KEY(request_kind, request_id)
+            )
+        """)
+
+        if not table_exists(conn, "guild_owner_verification"):
+            conn.execute("""
+                CREATE TABLE guild_owner_verification (
+                    guild_id INTEGER PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 0,
+                    verified_at INTEGER,
+                    last_checked_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    verification_source TEXT,
+                    status_reason TEXT
+                )
+            """)
+        else:
+            verification_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(guild_owner_verification)"
+                ).fetchall()
+            }
+
+            if "verification_source" not in verification_columns:
+                conn.execute(
+                    "ALTER TABLE guild_owner_verification "
+                    "ADD COLUMN verification_source TEXT"
+                )
+
+            if "status_reason" not in verification_columns:
+                conn.execute(
+                    "ALTER TABLE guild_owner_verification "
+                    "ADD COLUMN status_reason TEXT"
+                )
 
         # Legacy single payment configuration
         if not table_exists(conn, "payment_settings"):
@@ -1277,7 +1544,7 @@ def mark_premium_warning_sent(guild_id: int, sent: bool = True):
 
 
 def set_access_state(guild_id: int, state: str):
-    if state not in {"allowed", "blacklist", "whitelist"}:
+    if state not in {"allowed", "blacklist", "whitelist", "warning", "suspended"}:
         state = "allowed"
     ensure_guild(guild_id)
     with closing(db()) as conn:
@@ -2560,6 +2827,15 @@ def add_activity(
             detail[:1500],
             int(time.time())
         ))
+
+        conn.execute("""
+            INSERT INTO schema_meta(id, version, updated_at)
+            VALUES(1,16,?)
+            ON CONFLICT(id)
+            DO UPDATE SET
+                version=excluded.version,
+                updated_at=excluded.updated_at
+        """, (int(time.time()),))
         conn.commit()
 
 
@@ -4048,41 +4324,92 @@ def backup_preview_embed(data: dict):
             color=discord.Color.red()
         )
 
-    guild_id = data.get("guild_id")
+    guild_id = int(data.get("guild_id") or 0)
     hosts = data.get("hosts") or []
     settings = data.get("guild_settings") or {}
 
+    current_hosts = []
+    current_plan = "-"
+    guild = bot.get_guild(guild_id)
+
+    if guild:
+        try:
+            current_hosts = list(get_hosts(guild_id))
+            current_plan = str(
+                get_guild_settings(guild_id)["plan"]
+            ).upper()
+        except Exception:
+            pass
+
+    incoming_keys = {
+        (
+            str(h.get("platform")),
+            str(h.get("target"))
+        )
+        for h in hosts
+        if isinstance(h, dict)
+    }
+    current_keys = {
+        (
+            str(h["platform"]),
+            str(h["target"])
+        )
+        for h in current_hosts
+    }
+
+    add_count = len(incoming_keys - current_keys)
+    existing_count = len(incoming_keys & current_keys)
+    missing_count = len(current_keys - incoming_keys)
+
     embed = discord.Embed(
-        title="🔎 Preview Restore",
-        description="Periksa isi backup sebelum diterapkan.",
+        title="🔎 Preview Restore + Diff",
+        description=(
+            "Periksa perubahan sebelum menerapkan backup. "
+            "Restore tetap memerlukan konfirmasi manual."
+        ),
         color=discord.Color.orange()
     )
     embed.add_field(
-        name="Server ID Backup",
-        value=f"`{guild_id}`",
+        name="Server",
+        value=(
+            f"**{guild.name if guild else 'Tidak ditemukan'}**\n"
+            f"`{guild_id}`"
+        ),
         inline=False
     )
     embed.add_field(
         name="Plan",
-        value=str(settings.get("plan", "free")).upper(),
+        value=(
+            f"Sekarang: **{current_plan}**\n"
+            f"Backup: **{str(settings.get('plan', 'free')).upper()}**"
+        ),
         inline=True
     )
     embed.add_field(
-        name="Jumlah Host",
-        value=str(len(hosts)),
+        name="Host",
+        value=(
+            f"Sekarang: **{len(current_hosts)}**\n"
+            f"Backup: **{len(hosts)}**"
+        ),
         inline=True
+    )
+    embed.add_field(
+        name="Diff Host",
+        value=(
+            f"➕ Baru dari backup: **{add_count}**\n"
+            f"♻️ Sudah ada: **{existing_count}**\n"
+            f"⚠️ Ada sekarang, tidak di backup: **{missing_count}**"
+        ),
+        inline=False
     )
     embed.add_field(
         name="Konfirmasi",
         value=(
-            "Restore hanya boleh dilanjutkan setelah owner menekan "
-            "**Konfirmasi Restore**."
+            "Tekan **Konfirmasi Restore** hanya setelah diff sesuai."
         ),
         inline=False
     )
-
     return embed
-
 
 
 # ============================================================
@@ -4652,8 +4979,281 @@ async def is_user_in_required_guild(user_id: int) -> bool:
         return False
 
 
+def set_guild_owner_verification(
+    guild_id: int,
+    owner_id: int,
+    verified: bool,
+    *,
+    source: str = "live_check",
+    reason: Optional[str] = None
+):
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        existing = conn.execute("""
+            SELECT created_at
+            FROM guild_owner_verification
+            WHERE guild_id=?
+        """, (int(guild_id),)).fetchone()
+
+        created_at = (
+            int(existing["created_at"])
+            if existing and existing["created_at"]
+            else now
+        )
+
+        conn.execute("""
+            INSERT INTO guild_owner_verification(
+                guild_id,
+                owner_id,
+                verified,
+                verified_at,
+                last_checked_at,
+                created_at,
+                verification_source,
+                status_reason
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id)
+            DO UPDATE SET
+                owner_id=excluded.owner_id,
+                verified=excluded.verified,
+                verified_at=excluded.verified_at,
+                last_checked_at=excluded.last_checked_at,
+                verification_source=excluded.verification_source,
+                status_reason=excluded.status_reason
+        """, (
+            int(guild_id),
+            int(owner_id),
+            1 if verified else 0,
+            now if verified else None,
+            now,
+            created_at,
+            str(source),
+            reason
+        ))
+        conn.commit()
+
+
+def get_guild_owner_verification(guild_id: int):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM guild_owner_verification
+            WHERE guild_id=?
+        """, (int(guild_id),)).fetchone()
+
+
+async def refresh_guild_owner_verification(
+    guild: discord.Guild,
+    *,
+    source: str = "live_check"
+) -> bool:
+    if not REQUIRED_GUILD_ID:
+        verified = True
+        reason = "REQUIRED_GUILD_ID tidak dikonfigurasi."
+    else:
+        verified = await is_user_in_required_guild(
+            guild.owner_id
+        )
+        reason = (
+            "Owner terdeteksi sebagai member Server Owner/Support."
+            if verified
+            else "Owner belum terdeteksi di Server Owner/Support."
+        )
+
+    set_guild_owner_verification(
+        guild.id,
+        guild.owner_id,
+        verified,
+        source=source,
+        reason=reason
+    )
+    return verified
+
+
+async def verify_owned_guilds_for_user(
+    user_id: int
+) -> tuple[int, int]:
+    owned = [
+        guild for guild in bot.guilds
+        if int(guild.owner_id) == int(user_id)
+    ]
+    verified_count = 0
+
+    for guild in owned:
+        if await refresh_guild_owner_verification(guild):
+            verified_count += 1
+
+    return verified_count, len(owned)
+
+
+async def auto_verify_owned_guilds_for_member(
+    user_id: int,
+    *,
+    verified: bool
+) -> int:
+    """
+    Automatically update every guild owned by this Discord user.
+    Used when they join/leave REQUIRED_GUILD_ID.
+    """
+    updated = 0
+
+    for guild in bot.guilds:
+        if int(guild.owner_id) != int(user_id):
+            continue
+
+        set_guild_owner_verification(
+            guild.id,
+            guild.owner_id,
+            verified,
+            source=(
+                "support_member_join"
+                if verified
+                else "support_member_remove"
+            ),
+            reason=(
+                "Owner join Server Owner/Support."
+                if verified
+                else "Owner keluar dari Server Owner/Support."
+            )
+        )
+        updated += 1
+
+    return updated
+
+
+async def notify_owner_auto_verification(
+    user_id: int,
+    *,
+    verified: bool,
+    guild_count: int
+):
+    try:
+        user = bot.get_user(int(user_id)) or await bot.fetch_user(int(user_id))
+
+        if verified:
+            await user.send(
+                embed=discord.Embed(
+                    title="✅ Verifikasi Pemilik Server Otomatis",
+                    description=(
+                        "Kamu sudah terdeteksi join **Server Owner/Support**.\n"
+                        f"Sebanyak **{guild_count}** server milikmu otomatis "
+                        "berstatus **TERVERIFIKASI**.\n\n"
+                        "Notifier dapat berjalan tanpa menunggu persetujuan manual."
+                    ),
+                    color=discord.Color.green()
+                )
+            )
+        else:
+            await user.send(
+                embed=discord.Embed(
+                    title="🔒 Verifikasi Pemilik Server Dicabut",
+                    description=(
+                        "Kamu tidak lagi terdeteksi sebagai member "
+                        "**Server Owner/Support**.\n"
+                        f"Sebanyak **{guild_count}** server milikmu kembali "
+                        "berstatus **BELUM TERVERIFIKASI** dan notifier ditahan."
+                    ),
+                    color=discord.Color.orange()
+                )
+            )
+    except Exception:
+        log.exception(
+            "Gagal kirim DM perubahan verifikasi otomatis user_id=%s",
+            user_id
+        )
+
+
+
+
+def guild_verification_status_text(guild_id: int) -> str:
+    row = get_guild_owner_verification(guild_id)
+
+    if not row:
+        return "⚠️ Belum dicek"
+
+    if row["verified"]:
+        checked = (
+            f" • <t:{int(row['last_checked_at'])}:R>"
+            if row["last_checked_at"]
+            else ""
+        )
+        return f"✅ Terverifikasi{checked}"
+
+    checked = (
+        f" • <t:{int(row['last_checked_at'])}:R>"
+        if row["last_checked_at"]
+        else ""
+    )
+    return f"🔒 Belum terverifikasi{checked}"
+
+
+def guild_verification_detail_embed(guild: discord.Guild):
+    row = get_guild_owner_verification(guild.id)
+
+    if not row:
+        return discord.Embed(
+            title="🔐 Status Verifikasi Owner",
+            description="Status belum pernah diperiksa.",
+            color=discord.Color.orange()
+        )
+
+    verified = bool(row["verified"])
+    embed = discord.Embed(
+        title=f"🔐 Verifikasi Owner • {guild.name}",
+        description=(
+            "✅ **TERVERIFIKASI**"
+            if verified
+            else "🔒 **BELUM TERVERIFIKASI**"
+        ),
+        color=(
+            discord.Color.green()
+            if verified
+            else discord.Color.orange()
+        )
+    )
+    embed.add_field(
+        name="Pemilik Server",
+        value=f"<@{row['owner_id']}> (`{row['owner_id']}`)",
+        inline=False
+    )
+    embed.add_field(
+        name="Sumber",
+        value=str(row["verification_source"] or "-"),
+        inline=True
+    )
+    embed.add_field(
+        name="Terakhir Dicek",
+        value=(
+            f"<t:{int(row['last_checked_at'])}:F>\n"
+            f"<t:{int(row['last_checked_at'])}:R>"
+            if row["last_checked_at"]
+            else "-"
+        ),
+        inline=True
+    )
+    embed.add_field(
+        name="Keterangan",
+        value=str(row["status_reason"] or "-")[:1024],
+        inline=False
+    )
+    embed.add_field(
+        name="Aktivasi",
+        value=(
+            "Notifier boleh berjalan."
+            if verified
+            else (
+                "Notifier ditahan. Owner cukup join Server Owner/Support; "
+                "verifikasi aktif otomatis tanpa approval manual."
+            )
+        ),
+        inline=False
+    )
+    return embed
+
+
 async def guild_owner_verified(guild: discord.Guild) -> bool:
-    return await is_user_in_required_guild(guild.owner_id)
+    return await refresh_guild_owner_verification(guild)
 
 
 def required_join_text() -> str:
@@ -4670,9 +5270,278 @@ def required_join_text() -> str:
     )
 
 
+def get_runtime_settings():
+    with closing(db()) as conn:
+        row = conn.execute("""
+            SELECT *
+            FROM bot_runtime_settings
+            WHERE id=1
+        """).fetchone()
+
+    if row:
+        return row
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_runtime_settings(
+                id,
+                monitor_paused,
+                notifications_paused,
+                requests_paused,
+                maintenance_all
+            )
+            VALUES(1,0,0,0,0)
+        """)
+        conn.commit()
+        return conn.execute(
+            "SELECT * FROM bot_runtime_settings WHERE id=1"
+        ).fetchone()
+
+
+def set_runtime_setting(
+    name: str,
+    enabled: bool,
+    actor_id: int
+):
+    allowed = {
+        "monitor_paused",
+        "notifications_paused",
+        "requests_paused",
+        "maintenance_all",
+    }
+    if name not in allowed:
+        raise ValueError("Runtime setting tidak valid.")
+
+    with closing(db()) as conn:
+        conn.execute(
+            f"""
+            UPDATE bot_runtime_settings
+            SET {name}=?,
+                updated_by=?,
+                updated_at=?
+            WHERE id=1
+            """,
+            (
+                1 if enabled else 0,
+                int(actor_id),
+                int(time.time())
+            )
+        )
+        conn.commit()
+
+
+def runtime_setting_enabled(name: str) -> bool:
+    row = get_runtime_settings()
+    return bool(row[name]) if row and name in row.keys() else False
+
+
+def reset_host_error_state(host_id: int):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE hosts
+            SET last_error=NULL,
+                error_count=0,
+                cooldown_until=NULL
+            WHERE id=?
+        """, (int(host_id),))
+        conn.commit()
+
+
+def host_health_score(host) -> int:
+    score = 100
+
+    if not host["enabled"]:
+        score -= 20
+
+    errors = int(host["error_count"] or 0)
+    score -= min(60, errors * 8)
+
+    if host["last_error"]:
+        score -= 15
+
+    if (
+        host["cooldown_until"]
+        and int(host["cooldown_until"]) > int(time.time())
+    ):
+        score -= 15
+
+    return max(0, min(100, score))
+
+
+def access_state_label(state: str) -> str:
+    return {
+        "allowed": "🟢 Normal",
+        "whitelist": "🔵 Whitelist",
+        "warning": "🟡 Warning",
+        "suspended": "🟠 Suspended",
+        "blacklist": "🔴 Blacklist",
+    }.get(str(state), str(state))
+
+
+def global_notification_stats():
+    now = int(time.time())
+    day_start = now - 86400
+
+    with closing(db()) as conn:
+        summary = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                AVG(CASE WHEN latency_ms IS NOT NULL THEN latency_ms END) AS latency
+            FROM notification_history
+            WHERE created_at>=?
+        """, (day_start,)).fetchone()
+
+        recent = conn.execute("""
+            SELECT nh.*, h.platform, h.target, h.display_name
+            FROM notification_history nh
+            LEFT JOIN hosts h ON h.id=nh.host_id
+            ORDER BY nh.id DESC
+            LIMIT 20
+        """).fetchall()
+
+    return summary, recent
+
+
+def global_activity_rows(limit: int = 25):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT *
+            FROM activity_log
+            ORDER BY id DESC
+            LIMIT ?
+        """, (max(1, min(50, int(limit))),)).fetchall()
+
+
+def api_usage_today_rows():
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT service, endpoint, calls
+            FROM api_usage
+            WHERE day=?
+            ORDER BY calls DESC, service, endpoint
+        """, (day,)).fetchall()
+
+
+def manual_backup_payload_and_bytes():
+    payload = create_full_backup_payload()
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2
+    ).encode("utf-8")
+    return payload, raw
+
+
+def verify_backup_payload(payload: dict) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Root backup bukan object JSON."
+
+    version = payload.get("version")
+    guilds = payload.get("guilds")
+
+    if not isinstance(version, int):
+        return False, "Field version tidak valid."
+
+    if not isinstance(guilds, list):
+        return False, "Field guilds tidak valid."
+
+    for index, item in enumerate(guilds[:1000]):
+        if not isinstance(item, dict):
+            return False, f"Guild index {index} bukan object."
+        if "guild_id" not in item:
+            return False, f"Guild index {index} tidak memiliki guild_id."
+        if not isinstance(item.get("hosts", []), list):
+            return False, f"hosts pada guild {item.get('guild_id')} tidak valid."
+
+    return True, f"Backup valid • version {version} • {len(guilds)} server"
+
+
+def owner_self_test_results() -> list[tuple[str, bool, str]]:
+    results = []
+
+    results.append((
+        "Discord",
+        bool(bot.user),
+        f"Bot {'online' if bot.user else 'belum ready'} • ping {round(bot.latency * 1000)} ms"
+    ))
+
+    try:
+        with closing(db()) as conn:
+            conn.execute("SELECT 1").fetchone()
+        db_ok = True
+        db_detail = f"Database OK • {DB_PATH}"
+    except Exception as exc:
+        db_ok = False
+        db_detail = f"{type(exc).__name__}: {exc}"
+    results.append(("Database", db_ok, db_detail))
+
+    try:
+        folder = Path(AUTO_BACKUP_DIR)
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".selftest-write"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        storage_ok = True
+        storage_detail = f"Writable • {folder}"
+    except Exception as exc:
+        storage_ok = False
+        storage_detail = f"{type(exc).__name__}: {exc}"
+    results.append(("Storage", storage_ok, storage_detail))
+
+    results.append((
+        "YouTube API",
+        bool(YOUTUBE_API_KEY),
+        "Key loaded" if YOUTUBE_API_KEY else "YOUTUBE_API_KEY kosong"
+    ))
+
+    results.append((
+        "Monitor Loop",
+        monitor_loop.is_running(),
+        "running" if monitor_loop.is_running() else "STOP"
+    ))
+    results.append((
+        "Premium Loop",
+        premium_expiry_loop.is_running(),
+        "running" if premium_expiry_loop.is_running() else "STOP"
+    ))
+    results.append((
+        "Invoice Loop",
+        invoice_expiry_loop.is_running(),
+        "running" if invoice_expiry_loop.is_running() else "STOP"
+    ))
+    results.append((
+        "Backup Loop",
+        auto_backup_loop.is_running(),
+        "running" if auto_backup_loop.is_running() else "STOP"
+    ))
+    results.append((
+        "Maintenance Loop",
+        db_maintenance_loop.is_running(),
+        "running" if db_maintenance_loop.is_running() else "STOP"
+    ))
+
+    settings = get_runtime_settings()
+    results.append((
+        "Emergency Mode",
+        not bool(settings["maintenance_all"]),
+        (
+            "normal"
+            if not settings["maintenance_all"]
+            else "maintenance_all aktif"
+        )
+    ))
+
+    return results
+
+
+
+
 def guild_access_allowed(guild_id: int) -> bool:
     settings = get_guild_settings(guild_id)
-    return settings["access_state"] != "blacklist"
+    return settings["access_state"] not in {"blacklist", "suspended"}
 
 
 # ============================================================
@@ -5672,6 +6541,16 @@ async def send_notification(
     source_url: Optional[str] = None,
     dedupe: bool = True
 ):
+    if (
+        runtime_setting_enabled("notifications_paused")
+        or runtime_setting_enabled("maintenance_all")
+    ):
+        log.warning(
+            "Notifikasi ditahan oleh Emergency Mode host_id=%s",
+            host["id"]
+        )
+        return False
+
     if dedupe and event_key:
         if not reserve_notification_event(
             int(host["id"]),
@@ -6828,6 +7707,254 @@ def host_due(host, now: int) -> bool:
     return now - last >= interval
 
 
+@tasks.loop(hours=1)
+async def owner_verification_reconcile_loop():
+    """
+    Reconcile all server-owner verification states.
+
+    This repairs missed join/leave events after deploys, gateway reconnects,
+    or temporary Discord API failures.
+    """
+    if not REQUIRED_GUILD_ID:
+        return
+
+    changed = 0
+
+    for guild in list(bot.guilds):
+        try:
+            previous = get_guild_owner_verification(
+                guild.id
+            )
+            previous_verified = (
+                bool(previous["verified"])
+                if previous
+                else None
+            )
+            previous_owner = (
+                int(previous["owner_id"])
+                if previous
+                else None
+            )
+
+            current_verified = await refresh_guild_owner_verification(
+                guild,
+                source="hourly_reconcile"
+            )
+
+            if (
+                previous_verified is None
+                or previous_verified != current_verified
+                or previous_owner != int(guild.owner_id)
+            ):
+                changed += 1
+                log.info(
+                    "Verification reconcile guild=%s owner=%s verified=%s",
+                    guild.id,
+                    guild.owner_id,
+                    current_verified
+                )
+
+        except Exception:
+            log.exception(
+                "Verification reconcile gagal guild_id=%s",
+                guild.id
+            )
+
+    if changed:
+        log.info(
+            "Verification reconcile memperbarui %s server.",
+            changed
+        )
+
+
+@owner_verification_reconcile_loop.before_loop
+async def before_owner_verification_reconcile_loop():
+    await bot.wait_until_ready()
+
+
+async def resend_pending_request_to_owner(
+    request_kind: str,
+    row
+) -> bool:
+    guild = bot.get_guild(int(row["guild_id"]))
+    if not guild:
+        return False
+
+    try:
+        owner = (
+            guild.owner
+            or bot.get_user(guild.owner_id)
+            or await bot.fetch_user(guild.owner_id)
+        )
+
+        if request_kind == "manager":
+            await owner.send(
+                embed=server_host_access_request_embed(
+                    int(row["id"])
+                ),
+                view=ServerOwnerAccessRequestView(
+                    int(row["id"]),
+                    int(row["user_id"]),
+                    int(row["guild_id"])
+                )
+            )
+        else:
+            await owner.send(
+                embed=host_creation_request_embed(
+                    int(row["id"])
+                ),
+                view=ServerOwnerHostCreationApprovalView(
+                    int(row["id"]),
+                    int(row["guild_id"]),
+                    int(row["requester_id"])
+                )
+            )
+
+        return True
+
+    except Exception:
+        return False
+
+
+async def recover_pending_request_views():
+    """
+    Re-send fresh approval buttons after restart/redeploy.
+    Limited to once per request per 6 hours.
+    """
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        access_rows = conn.execute("""
+            SELECT *
+            FROM server_host_access_requests
+            WHERE status='pending'
+            ORDER BY id DESC
+        """).fetchall()
+
+        host_rows = conn.execute("""
+            SELECT *
+            FROM host_creation_requests
+            WHERE status='pending'
+            ORDER BY id DESC
+        """).fetchall()
+
+    for kind, rows in (
+        ("manager", access_rows),
+        ("host", host_rows)
+    ):
+        for row in rows:
+            with closing(db()) as conn:
+                previous = conn.execute("""
+                    SELECT sent_at
+                    FROM request_recovery_log
+                    WHERE request_kind=? AND request_id=?
+                """, (
+                    kind,
+                    int(row["id"])
+                )).fetchone()
+
+            if (
+                previous
+                and now - int(previous["sent_at"]) < 6 * 3600
+            ):
+                continue
+
+            if await resend_pending_request_to_owner(kind, row):
+                with closing(db()) as conn:
+                    conn.execute("""
+                        INSERT INTO request_recovery_log(
+                            request_kind,
+                            request_id,
+                            sent_at
+                        )
+                        VALUES(?,?,?)
+                        ON CONFLICT(request_kind, request_id)
+                        DO UPDATE SET sent_at=excluded.sent_at
+                    """, (
+                        kind,
+                        int(row["id"]),
+                        now
+                    ))
+                    conn.commit()
+
+
+@tasks.loop(hours=6)
+async def pending_request_reminder_loop():
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        access_rows = conn.execute("""
+            SELECT *
+            FROM server_host_access_requests
+            WHERE status='pending'
+        """).fetchall()
+
+        host_rows = conn.execute("""
+            SELECT *
+            FROM host_creation_requests
+            WHERE status='pending'
+        """).fetchall()
+
+    for kind, rows in (
+        ("manager", access_rows),
+        ("host", host_rows)
+    ):
+        for row in rows:
+            age_hours = max(
+                0,
+                (now - int(row["created_at"])) // 3600
+            )
+
+            milestone = (
+                48 if age_hours >= 48
+                else 24 if age_hours >= 24
+                else 0
+            )
+            if not milestone:
+                continue
+
+            with closing(db()) as conn:
+                sent = conn.execute("""
+                    SELECT 1
+                    FROM request_reminders
+                    WHERE request_kind=?
+                      AND request_id=?
+                      AND milestone_hours=?
+                """, (
+                    kind,
+                    int(row["id"]),
+                    milestone
+                )).fetchone()
+
+            if sent:
+                continue
+
+            if await resend_pending_request_to_owner(kind, row):
+                with closing(db()) as conn:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO request_reminders(
+                            request_kind,
+                            request_id,
+                            milestone_hours,
+                            sent_at
+                        )
+                        VALUES(?,?,?,?)
+                    """, (
+                        kind,
+                        int(row["id"]),
+                        milestone,
+                        now
+                    ))
+                    conn.commit()
+
+
+@pending_request_reminder_loop.before_loop
+async def before_pending_request_reminder_loop():
+    await bot.wait_until_ready()
+
+
+
+
 @tasks.loop(hours=12)
 async def host_manager_expiry_warning_loop():
     now = int(time.time())
@@ -6909,6 +8036,9 @@ async def before_host_manager_expiry_warning_loop():
 
 @tasks.loop(seconds=BASE_MONITOR_TICK)
 async def monitor_loop():
+    if runtime_setting_enabled("monitor_paused") or runtime_setting_enabled("maintenance_all"):
+        return
+
     now = int(time.time())
     due_hosts = [
         host for host in get_enabled_hosts()
@@ -7817,6 +8947,340 @@ def owner_backup_status_embed():
         inline=False
     )
     return embed
+
+
+
+
+def platform_health_summary() -> dict:
+    summary = {
+        platform: {
+            "total": 0,
+            "healthy": 0,
+            "warning": 0,
+            "error": 0,
+        }
+        for platform in SUPPORTED_PLATFORMS
+    }
+
+    for guild in bot.guilds:
+        try:
+            hosts = get_hosts(guild.id)
+        except Exception:
+            continue
+
+        for host in hosts:
+            platform = str(host["platform"])
+            if platform not in summary:
+                continue
+
+            score = host_health_score(host)
+            summary[platform]["total"] += 1
+
+            if score >= 90:
+                summary[platform]["healthy"] += 1
+            elif score >= 60:
+                summary[platform]["warning"] += 1
+            else:
+                summary[platform]["error"] += 1
+
+    return summary
+
+
+def owner_platform_health_embed():
+    summary = platform_health_summary()
+    lines = []
+
+    for platform in sorted(SUPPORTED_PLATFORMS):
+        item = summary[platform]
+        if item["total"] == 0:
+            icon = "⚪"
+        elif item["error"]:
+            icon = "🔴"
+        elif item["warning"]:
+            icon = "🟡"
+        else:
+            icon = "🟢"
+
+        lines.append(
+            f"{icon} **{platform_display_name(platform)}** — "
+            f"{item['healthy']} sehat • "
+            f"{item['warning']} warning • "
+            f"{item['error']} error • "
+            f"{item['total']} total"
+        )
+
+    return discord.Embed(
+        title="🌐 Platform Health",
+        description="\n".join(lines),
+        color=discord.Color.blurple()
+    ).add_field(
+        name="Catatan",
+        value=(
+            "Status dihitung dari health/error host. "
+            "Gangguan platform eksternal dapat memengaruhi banyak host sekaligus."
+        ),
+        inline=False
+    )
+
+
+
+
+def owner_self_test_embed():
+    results = owner_self_test_results()
+    passed = sum(1 for _, ok, _ in results if ok)
+
+    lines = [
+        f"{'✅' if ok else '❌'} **{name}** — {detail}"
+        for name, ok, detail in results
+    ]
+
+    return discord.Embed(
+        title="🧪 Self Test Bot",
+        description="\n".join(lines),
+        color=(
+            discord.Color.green()
+            if passed == len(results)
+            else discord.Color.orange()
+        )
+    ).add_field(
+        name="Ringkasan",
+        value=f"**{passed}/{len(results)}** pemeriksaan OK",
+        inline=False
+    )
+
+
+def owner_error_center_embed():
+    hosts = []
+    for guild in bot.guilds:
+        try:
+            hosts.extend(get_hosts(guild.id))
+        except Exception:
+            pass
+
+    problems = [
+        host
+        for host in hosts
+        if (
+            host["last_error"]
+            or int(host["error_count"] or 0) > 0
+            or not host["enabled"]
+        )
+    ]
+
+    lines = []
+    for host in sorted(
+        problems,
+        key=lambda x: (host_health_score(x), -int(x["error_count"] or 0))
+    )[:20]:
+        score = host_health_score(host)
+        icon = "🟢" if score >= 90 else "🟡" if score >= 60 else "🔴"
+        guild = bot.get_guild(int(host["guild_id"]))
+        label = host["display_name"] or host["target"]
+        lines.append(
+            f"{icon} **#{host['id']} {platform_display_name(host['platform'])} • {label}** "
+            f"— {score}%\n"
+            f"↳ {guild.name if guild else host['guild_id']} • "
+            f"error {int(host['error_count'] or 0)}"
+        )
+
+    embed = discord.Embed(
+        title="🚨 Error & Recovery Center",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "✅ Tidak ada host bermasalah."
+        ),
+        color=(
+            discord.Color.orange()
+            if problems
+            else discord.Color.green()
+        )
+    )
+    embed.add_field(
+        name="Recovery",
+        value=(
+            "Pilih host bermasalah untuk **Recheck** atau **Reset Error**. "
+            "Reset tidak mengubah konfigurasi host."
+        ),
+        inline=False
+    )
+    return embed
+
+
+def owner_notification_center_embed():
+    summary, rows = global_notification_stats()
+
+    lines = []
+    for row in rows[:15]:
+        status_icon = (
+            "✅" if row["status"] == "sent"
+            else "❌" if row["status"] == "failed"
+            else "⏳"
+        )
+        label = row["display_name"] or row["target"] or f"Host {row['host_id']}"
+        lines.append(
+            f"{status_icon} <t:{row['created_at']}:R> • "
+            f"**{label}** • `{row['event_type'] or 'notification'}`"
+        )
+
+    embed = discord.Embed(
+        title="🔔 Notification Center",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "Belum ada riwayat notifikasi."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.add_field(
+        name="24 Jam",
+        value=(
+            f"Total **{int(summary['total'] or 0)}** • "
+            f"Sent **{int(summary['sent'] or 0)}** • "
+            f"Failed **{int(summary['failed'] or 0)}** • "
+            f"Latency **{round(float(summary['latency'] or 0))} ms**"
+        ),
+        inline=False
+    )
+    return embed
+
+
+def owner_quota_embed():
+    rows = api_usage_today_rows()
+
+    lines = [
+        f"• **{row['service']}** `{row['endpoint']}` → **{row['calls']} calls**"
+        for row in rows[:25]
+    ]
+
+    return discord.Embed(
+        title="📡 API / Quota Monitor",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "Belum ada API call tercatat hari ini."
+        ),
+        color=discord.Color.blurple()
+    ).add_field(
+        name="Catatan",
+        value=(
+            "Angka ini adalah **jumlah call lokal bot**, bukan unit quota resmi "
+            "Google/YouTube."
+        ),
+        inline=False
+    )
+
+
+def owner_audit_embed():
+    rows = global_activity_rows(20)
+
+    lines = []
+    for row in rows:
+        guild = bot.get_guild(int(row["guild_id"])) if row["guild_id"] else None
+        lines.append(
+            f"• <t:{row['created_at']}:R> • "
+            f"**{row['action']}**\n"
+            f"  Actor `{row['actor_id'] or '-'}` • "
+            f"{guild.name if guild else row['guild_id'] or 'global'}"
+        )
+
+    return discord.Embed(
+        title="🧾 Global Audit Log",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "Belum ada aktivitas."
+        ),
+        color=discord.Color.dark_gray()
+    )
+
+
+def owner_emergency_embed():
+    row = get_runtime_settings()
+
+    def mark(value):
+        return "🔴 ON" if value else "🟢 OFF"
+
+    embed = discord.Embed(
+        title="🚨 Emergency Control",
+        description=(
+            "Hanya **Primary Global Owner**. Semua perubahan tersimpan di database."
+        ),
+        color=discord.Color.red()
+    )
+    embed.add_field(
+        name="Pause Checker",
+        value=mark(bool(row["monitor_paused"])),
+        inline=True
+    )
+    embed.add_field(
+        name="Stop Notifikasi",
+        value=mark(bool(row["notifications_paused"])),
+        inline=True
+    )
+    embed.add_field(
+        name="Stop Request Baru",
+        value=mark(bool(row["requests_paused"])),
+        inline=True
+    )
+    embed.add_field(
+        name="Maintenance Global",
+        value=mark(bool(row["maintenance_all"])),
+        inline=True
+    )
+    return embed
+
+
+def owner_risk_embed():
+    lines = []
+    for guild in bot.guilds[:30]:
+        settings = get_guild_settings(guild.id)
+        state = str(settings["access_state"] or "allowed")
+        if state != "allowed":
+            lines.append(
+                f"• **{guild.name}** (`{guild.id}`) — {access_state_label(state)}"
+            )
+
+    return discord.Embed(
+        title="🛡️ Server Risk Control",
+        description=(
+            "\n".join(lines)
+            if lines
+            else "✅ Semua server dalam status Normal."
+        ),
+        color=discord.Color.orange()
+    ).add_field(
+        name="Status",
+        value="Normal • Warning • Suspended • Blacklist • Whitelist",
+        inline=False
+    )
+
+
+def owner_backup_center_embed():
+    last_at = last_successful_auto_backup_at()
+    due = (
+        int(last_at) + int(AUTO_BACKUP_HOURS * 3600)
+        if last_at else None
+    )
+
+    return discord.Embed(
+        title="🗄️ Backup Center",
+        description=(
+            "Backup manual **tidak mengubah jadwal auto backup 48 jam**."
+        ),
+        color=discord.Color.blurple()
+    ).add_field(
+        name="Auto Backup",
+        value=(
+            f"Terakhir: {f'<t:{last_at}:R>' if last_at else 'belum ada'}\n"
+            f"Berikutnya: {f'<t:{due}:R>' if due else 'menunggu backup pertama'}"
+        ),
+        inline=False
+    ).add_field(
+        name="Storage",
+        value=f"`{AUTO_BACKUP_DIR}`",
+        inline=False
+    )
 
 
 
@@ -9358,6 +10822,11 @@ def user_server_embed(guild: discord.Guild):
         value="👑 Pemilik Server",
         inline=True
     )
+    embed.add_field(
+        name="Verifikasi Owner",
+        value=guild_verification_status_text(guild.id),
+        inline=True
+    )
 
     pending_total = (
         len(pending_server_access_requests(guild.id))
@@ -9413,10 +10882,88 @@ def guild_host_count(guild_id: int) -> int:
     return len(get_hosts(int(guild_id)))
 
 
+def claim_host_creation_request(
+    request_id: int,
+    actor_id: int
+) -> bool:
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            UPDATE host_creation_requests
+            SET status='processing',
+                processed_by=?,
+                processed_at=?
+            WHERE id=? AND status='pending'
+        """, (
+            int(actor_id),
+            int(time.time()),
+            int(request_id)
+        ))
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def reset_host_creation_request_claim(
+    request_id: int
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE host_creation_requests
+            SET status='pending',
+                processed_by=NULL,
+                processed_at=NULL
+            WHERE id=? AND status='processing'
+        """, (int(request_id),))
+        conn.commit()
+
+
+def claim_server_access_request(
+    request_id: int,
+    actor_id: int
+) -> bool:
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            UPDATE server_host_access_requests
+            SET status='processing',
+                processed_by=?,
+                processed_at=?
+            WHERE id=? AND status='pending'
+        """, (
+            int(actor_id),
+            int(time.time()),
+            int(request_id)
+        ))
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def reset_server_access_request_claim(
+    request_id: int
+):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE server_host_access_requests
+            SET status='pending',
+                processed_by=NULL,
+                processed_at=NULL
+            WHERE id=? AND status='processing'
+        """, (int(request_id),))
+        conn.commit()
+
+
+
+
 def create_server_host_access_request(
     guild_id: int,
     user_id: int
 ) -> int:
+    if (
+        runtime_setting_enabled("requests_paused")
+        or runtime_setting_enabled("maintenance_all")
+    ):
+        raise RuntimeError(
+            "Request baru sedang dinonaktifkan sementara oleh Global Owner."
+        )
+
     with closing(db()) as conn:
         existing = conn.execute("""
             SELECT id
@@ -9477,7 +11024,7 @@ def finish_server_host_access_request(
                 approved_host_id=?,
                 processed_by=?,
                 processed_at=?
-            WHERE id=? AND status='pending'
+            WHERE id=? AND status IN ('pending','processing')
         """, (
             status,
             int(host_id) if host_id else None,
@@ -9566,6 +11113,14 @@ def create_host_creation_request(
     channel_id: int,
     role_id: Optional[int]
 ) -> int:
+    if (
+        runtime_setting_enabled("requests_paused")
+        or runtime_setting_enabled("maintenance_all")
+    ):
+        raise RuntimeError(
+            "Pengajuan host baru sedang dinonaktifkan sementara oleh Global Owner."
+        )
+
     if not server_host_manager_access(
         requester_id,
         guild_id
@@ -9659,7 +11214,7 @@ def finish_host_creation_request(
                 processed_at=?,
                 created_host_id=?,
                 rejection_reason=?
-            WHERE id=? AND status='pending'
+            WHERE id=? AND status IN ('pending','processing')
         """, (
             status,
             int(actor_id),
@@ -10198,17 +11753,36 @@ class ServerOwnerAccessRequestView(discord.ui.View):
             )
             return
 
-        grant_server_host_manager(
-            self.guild_id,
-            self.requester_id,
-            interaction.user.id
-        )
-
-        finish_server_host_access_request(
+        if not claim_server_access_request(
             self.request_id,
-            status="approved",
-            actor_id=interaction.user.id
-        )
+            interaction.user.id
+        ):
+            await safe_reply(
+                interaction,
+                "ℹ️ Request sedang atau sudah diproses."
+            )
+            return
+
+        try:
+            grant_server_host_manager(
+                self.guild_id,
+                self.requester_id,
+                interaction.user.id
+            )
+
+            if not finish_server_host_access_request(
+                self.request_id,
+                status="approved",
+                actor_id=interaction.user.id
+            ):
+                raise RuntimeError(
+                    "Finalisasi request akses gagal."
+                )
+        except Exception:
+            reset_server_access_request_claim(
+                self.request_id
+            )
+            raise
 
         try:
             requester = (
@@ -10267,6 +11841,16 @@ class ServerOwnerAccessRequestView(discord.ui.View):
             await safe_reply(
                 interaction,
                 "⏳ Request sedang diproses. Jangan tekan dua kali."
+            )
+            return
+
+        if not claim_server_access_request(
+            self.request_id,
+            interaction.user.id
+        ):
+            await safe_reply(
+                interaction,
+                "ℹ️ Request sedang atau sudah diproses."
             )
             return
 
@@ -12024,20 +13608,43 @@ class UserServerHostSelect(discord.ui.Select):
     def __init__(
         self,
         guild_id: int,
-        user_id: int
+        user_id: int,
+        page: int = 0,
+        query: str = ""
     ):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
-        hosts = get_hosts(self.guild_id)
+        self.page = max(0, int(page))
+        self.query = str(query or "").strip().lower()
+
+        hosts = list(get_hosts(self.guild_id))
+
+        if self.query:
+            hosts = [
+                host for host in hosts
+                if (
+                    self.query in str(host["id"]).lower()
+                    or self.query in str(host["platform"]).lower()
+                    or self.query in str(host["target"]).lower()
+                    or self.query in str(host["display_name"] or "").lower()
+                )
+            ]
+
+        start = self.page * 25
+        current = hosts[start:start + 25]
 
         options = []
-        for host in hosts[:25]:
+        for host in current:
             label = host["display_name"] or host["target"]
             state = "Aktif" if host["enabled"] else "Pause"
             options.append(
                 discord.SelectOption(
-                    label=f"{platform_display_name(host['platform'])} • {label}"[:100],
-                    description=f"{state} • Host ID {host['id']}"[:100],
+                    label=(
+                        f"{platform_display_name(host['platform'])} • {label}"
+                    )[:100],
+                    description=(
+                        f"{state} • Host ID {host['id']}"
+                    )[:100],
                     value=str(host["id"]),
                     emoji=platform_icon(host["platform"])
                 )
@@ -12046,15 +13653,15 @@ class UserServerHostSelect(discord.ui.Select):
         if not options:
             options.append(
                 discord.SelectOption(
-                    label="Belum ada host",
-                    description="Tekan Tambah Host untuk membuat host pertama.",
+                    label="Host tidak ditemukan",
+                    description="Coba halaman atau pencarian lain.",
                     value="0",
                     emoji="ℹ️"
                 )
             )
 
         super().__init__(
-            placeholder="Pilih host server",
+            placeholder=f"Pilih host • Halaman {self.page + 1}",
             options=options,
             row=0
         )
@@ -12071,7 +13678,7 @@ class UserServerHostSelect(discord.ui.Select):
         if not host_id:
             await safe_reply(
                 interaction,
-                "ℹ️ Belum ada host. Tekan **Tambah Host**."
+                "ℹ️ Host tidak ditemukan."
             )
             return
 
@@ -12159,19 +13766,58 @@ def user_server_host_detail_embed(host):
     return embed
 
 
+class UserServerHostSearchModal(discord.ui.Modal):
+    query = discord.ui.TextInput(
+        label="Cari Host",
+        placeholder="ID / platform / username / target",
+        max_length=120
+    )
+
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(title="Cari Host Server", timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
+            return
+
+        if not await require_server_owner(interaction, self.guild_id):
+            return
+
+        guild = bot.get_guild(self.guild_id)
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id,
+                page=0,
+                query=self.query.value.strip()
+            )
+        )
+
+
 class UserServerHostsView(discord.ui.View):
     def __init__(
         self,
         guild_id: int,
-        user_id: int
+        user_id: int,
+        page: int = 0,
+        query: str = ""
     ):
         super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
+        self.page = max(0, int(page))
+        self.query = str(query or "")
+
         self.add_item(
             UserServerHostSelect(
                 self.guild_id,
-                self.user_id
+                self.user_id,
+                self.page,
+                self.query
             )
         )
 
@@ -12188,17 +13834,30 @@ class UserServerHostsView(discord.ui.View):
             self.guild_id
         )
 
+    def filtered_hosts(self):
+        hosts = list(get_hosts(self.guild_id))
+        q = self.query.strip().lower()
+
+        if q:
+            hosts = [
+                host for host in hosts
+                if (
+                    q in str(host["id"]).lower()
+                    or q in str(host["platform"]).lower()
+                    or q in str(host["target"]).lower()
+                    or q in str(host["display_name"] or "").lower()
+                )
+            ]
+
+        return hosts
+
     @discord.ui.button(
         label="Tambah Host",
         emoji="➕",
         style=discord.ButtonStyle.success,
         row=1
     )
-    async def add_host_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def add_host_button(self, interaction, button):
         guild = await self.valid_owner(interaction)
         if not guild:
             return
@@ -12211,7 +13870,8 @@ class UserServerHostsView(discord.ui.View):
             await safe_reply(
                 interaction,
                 (
-                    f"❌ Batas host {'PREMIUM' if settings['plan']=='premium' else 'FREE'} "
+                    f"❌ Batas host "
+                    f"{'PREMIUM' if settings['plan']=='premium' else 'FREE'} "
                     f"sudah tercapai (**{current}/{limit}**)."
                 )
             )
@@ -12225,16 +13885,11 @@ class UserServerHostsView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Refresh",
-        emoji="🔄",
+        label="◀",
         style=discord.ButtonStyle.secondary,
         row=1
     )
-    async def refresh(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def previous(self, interaction, button):
         guild = await self.valid_owner(interaction)
         if not guild:
             return
@@ -12243,7 +13898,70 @@ class UserServerHostsView(discord.ui.View):
             embed=user_server_hosts_embed(guild),
             view=UserServerHostsView(
                 self.guild_id,
+                self.user_id,
+                max(0, self.page - 1),
+                self.query
+            )
+        )
+
+    @discord.ui.button(
+        label="▶",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def next_page(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+
+        hosts = self.filtered_hosts()
+        max_page = max(0, (len(hosts) - 1) // 25)
+
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id,
+                min(max_page, self.page + 1),
+                self.query
+            )
+        )
+
+    @discord.ui.button(
+        label="Cari",
+        emoji="🔎",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def search(self, interaction, button):
+        if not await self.valid_owner(interaction):
+            return
+
+        await interaction.response.send_modal(
+            UserServerHostSearchModal(
+                self.guild_id,
                 self.user_id
+            )
+        )
+
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def refresh(self, interaction, button):
+        guild = await self.valid_owner(interaction)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=user_server_hosts_embed(guild),
+            view=UserServerHostsView(
+                self.guild_id,
+                self.user_id,
+                self.page,
+                self.query
             )
         )
 
@@ -12251,45 +13969,34 @@ class UserServerHostsView(discord.ui.View):
         label="Kembali",
         emoji="⬅️",
         style=discord.ButtonStyle.secondary,
-        row=2
+        row=3
     )
-    async def back(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def back(self, interaction, button):
         guild = await self.valid_owner(interaction)
         if not guild:
             return
 
         await interaction.response.edit_message(
             embed=user_server_embed(guild),
-            view=UserServerMenuView(self.guild_id)
+            view=UserServerMenuView(
+                self.user_id,
+                self.guild_id
+            )
         )
 
     @discord.ui.button(
         label="Menu Awal",
         emoji="🏠",
         style=discord.ButtonStyle.secondary,
-        row=2
+        row=3
     )
-    async def home(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-        if interaction.user.id != self.user_id:
-            await safe_reply(
-                interaction,
-                "🔒 Menu ini bukan milikmu."
-            )
+    async def home(self, interaction, button):
+        if not await self.valid_owner(interaction):
             return
 
         await interaction.response.edit_message(
             embed=dm_menu_home_embed(self.user_id),
-            view=MenuRoleChoiceView(
-                self.user_id
-            )
+            view=MenuRoleChoiceView(self.user_id)
         )
 
 
@@ -14116,6 +15823,16 @@ class ServerOwnerHostCreationApprovalView(discord.ui.View):
             interaction
         )
 
+        if not claim_host_creation_request(
+            self.request_id,
+            interaction.user.id
+        ):
+            await interaction.followup.send(
+                "ℹ️ Request sedang atau sudah diproses.",
+                ephemeral=True
+            )
+            return
+
         try:
             display_name = (
                 f"@{target}"
@@ -14219,6 +15936,9 @@ class ServerOwnerHostCreationApprovalView(discord.ui.View):
             )
 
         except Exception as exc:
+            reset_host_creation_request_claim(
+                self.request_id
+            )
             await interaction.followup.send(
                 (
                     f"❌ Gagal membuat host. Request tetap **PENDING**.\n"
@@ -14251,6 +15971,16 @@ class ServerOwnerHostCreationApprovalView(discord.ui.View):
             await safe_reply(
                 interaction,
                 "⏳ Request sedang diproses. Jangan tekan dua kali."
+            )
+            return
+
+        if not claim_host_creation_request(
+            self.request_id,
+            interaction.user.id
+        ):
+            await safe_reply(
+                interaction,
+                "ℹ️ Request sedang atau sudah diproses."
             )
             return
 
@@ -17577,6 +19307,590 @@ class OwnerReadOnlyAuditView(discord.ui.View):
 
 
 
+
+
+class OwnerOpsHomeView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction, minimum="read_only"):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_owner_level(interaction, minimum)
+
+    @discord.ui.button(label="Self Test", emoji="🧪", style=discord.ButtonStyle.primary, row=0)
+    async def self_test(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_self_test_embed(),
+            view=OwnerSelfTestView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Error Center", emoji="🚨", style=discord.ButtonStyle.danger, row=0)
+    async def errors(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_error_center_embed(),
+            view=OwnerErrorCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Notification", emoji="🔔", style=discord.ButtonStyle.secondary, row=0)
+    async def notifications(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_notification_center_embed(),
+            view=OwnerNotificationCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="API / Quota", emoji="📡", style=discord.ButtonStyle.secondary, row=1)
+    async def quota(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_quota_embed(),
+            view=OwnerQuotaView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Audit Log", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
+    async def audit(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_audit_embed(),
+            view=OwnerAuditView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Backup", emoji="🗄️", style=discord.ButtonStyle.secondary, row=1)
+    async def backup(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_backup_center_embed(),
+            view=OwnerBackupCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Platform Health", emoji="🌐", style=discord.ButtonStyle.secondary, row=2)
+    async def platform_health(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_platform_health_embed(),
+            view=OwnerPlatformHealthView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Risk Control", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2)
+    async def risk(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=owner_risk_embed(),
+            view=OwnerRiskView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Emergency", emoji="🚨", style=discord.ButtonStyle.danger, row=2)
+    async def emergency(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(
+                interaction,
+                "🔒 Emergency hanya untuk **Primary Global Owner**."
+            )
+            return
+        await interaction.response.edit_message(
+            embed=owner_emergency_embed(),
+            view=OwnerEmergencyView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=3)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=3)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
+
+class OwnerBasicBackView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_global_owner(interaction)
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧰 Owner Operations",
+                description="Pilih pusat operasi Global Owner.",
+                color=discord.Color.blurple()
+            ),
+            view=OwnerOpsHomeView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=4)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
+
+
+class OwnerSelfTestView(OwnerBasicBackView):
+    @discord.ui.button(label="Jalankan Lagi", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def rerun(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_self_test_embed(),
+            view=OwnerSelfTestView(self.viewer_id)
+        )
+
+
+class OwnerNotificationCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_notification_center_embed(),
+            view=OwnerNotificationCenterView(self.viewer_id)
+        )
+
+
+class OwnerPlatformHealthView(OwnerBasicBackView):
+    @discord.ui.button(
+        label="Refresh",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_platform_health_embed(),
+            view=OwnerPlatformHealthView(self.viewer_id)
+        )
+
+
+
+
+class OwnerQuotaView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_quota_embed(),
+            view=OwnerQuotaView(self.viewer_id)
+        )
+
+
+class OwnerAuditView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_audit_embed(),
+            view=OwnerAuditView(self.viewer_id)
+        )
+
+
+class OwnerErrorHostSelect(discord.ui.Select):
+    def __init__(self, viewer_id: int):
+        self.viewer_id = int(viewer_id)
+        hosts = []
+        for guild in bot.guilds:
+            try:
+                hosts.extend(get_hosts(guild.id))
+            except Exception:
+                pass
+
+        problems = [
+            h for h in hosts
+            if h["last_error"] or int(h["error_count"] or 0) > 0 or not h["enabled"]
+        ][:25]
+
+        options = [
+            discord.SelectOption(
+                label=(
+                    f"#{h['id']} • {platform_display_name(h['platform'])} • "
+                    f"{h['display_name'] or h['target']}"
+                )[:100],
+                description=(
+                    f"Health {host_health_score(h)}% • "
+                    f"error {int(h['error_count'] or 0)}"
+                )[:100],
+                value=str(h["id"]),
+                emoji="🚨"
+            )
+            for h in problems
+        ]
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Tidak ada host bermasalah",
+                    value="0",
+                    emoji="✅"
+                )
+            ]
+
+        super().__init__(
+            placeholder="Pilih host untuk recovery",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        host_id = int(self.values[0])
+        if not host_id:
+            await safe_reply(interaction, "✅ Tidak ada host bermasalah.")
+            return
+
+        host = get_host(host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await interaction.response.edit_message(
+            embed=host_embed(host),
+            view=OwnerErrorHostActionView(
+                self.viewer_id,
+                host_id
+            )
+        )
+
+
+class OwnerErrorCenterView(OwnerBasicBackView):
+    def __init__(self, viewer_id: int):
+        super().__init__(viewer_id)
+        self.add_item(OwnerErrorHostSelect(viewer_id))
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_error_center_embed(),
+            view=OwnerErrorCenterView(self.viewer_id)
+        )
+
+
+class OwnerErrorHostActionView(OwnerBasicBackView):
+    def __init__(self, viewer_id: int, host_id: int):
+        super().__init__(viewer_id)
+        self.host_id = int(host_id)
+
+    @discord.ui.button(label="Recheck", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def recheck(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+
+        await defer_if_needed(interaction)
+        try:
+            await host_manager_recheck(host)
+            await interaction.followup.send("✅ Recheck selesai.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"❌ Recheck gagal: `{type(exc).__name__}: {exc}`",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="Reset Error", emoji="🧹", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_error(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        reset_host_error_state(self.host_id)
+        add_activity(
+            None,
+            interaction.user.id,
+            "Global Owner Reset Host Error",
+            f"host_id={self.host_id}"
+        )
+        await safe_reply(interaction, "✅ Error/cooldown host direset.")
+
+
+class OwnerRiskModal(discord.ui.Modal):
+    guild_id_input = discord.ui.TextInput(
+        label="Server ID",
+        placeholder="123456789012345678",
+        max_length=25
+    )
+    state = discord.ui.TextInput(
+        label="Status",
+        placeholder="allowed / warning / suspended / blacklist / whitelist",
+        max_length=20
+    )
+
+    def __init__(self, viewer_id: int):
+        super().__init__(title="Atur Risiko Server", timeout=300)
+        self.viewer_id = int(viewer_id)
+
+    async def on_submit(self, interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        raw = self.guild_id_input.value.strip()
+        state = self.state.value.strip().lower()
+
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ Server ID harus angka.")
+            return
+
+        if state not in {"allowed", "warning", "suspended", "blacklist", "whitelist"}:
+            await safe_reply(interaction, "❌ Status tidak valid.")
+            return
+
+        guild_id = int(raw)
+        if not bot.get_guild(guild_id):
+            await safe_reply(interaction, "❌ Server tidak ditemukan di bot.")
+            return
+
+        set_access_state(guild_id, state)
+        add_activity(
+            guild_id,
+            interaction.user.id,
+            "Global Risk State Changed",
+            state
+        )
+        await safe_reply(
+            interaction,
+            f"✅ Server `{guild_id}` → **{access_state_label(state)}**"
+        )
+
+
+class OwnerRiskView(OwnerBasicBackView):
+    @discord.ui.button(label="Atur Status", emoji="🛡️", style=discord.ButtonStyle.primary, row=0)
+    async def set_state(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+        await interaction.response.send_modal(
+            OwnerRiskModal(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_risk_embed(),
+            view=OwnerRiskView(self.viewer_id)
+        )
+
+
+class OwnerEmergencyConfirmView(discord.ui.View):
+    def __init__(self, viewer_id: int, setting: str, enabled: bool):
+        super().__init__(timeout=120)
+        self.viewer_id = int(viewer_id)
+        self.setting = setting
+        self.enabled = bool(enabled)
+
+    @discord.ui.button(label="Konfirmasi", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+
+        set_runtime_setting(
+            self.setting,
+            self.enabled,
+            interaction.user.id
+        )
+        add_activity(
+            None,
+            interaction.user.id,
+            "Emergency Setting",
+            f"{self.setting}={self.enabled}"
+        )
+        await interaction.response.edit_message(
+            embed=owner_emergency_embed(),
+            view=OwnerEmergencyView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Batal", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        await interaction.response.edit_message(
+            embed=owner_emergency_embed(),
+            view=OwnerEmergencyView(self.viewer_id)
+        )
+
+
+class OwnerEmergencyView(OwnerBasicBackView):
+    async def toggle(self, interaction, setting):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        if not is_primary_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+
+        current = runtime_setting_enabled(setting)
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="⚠️ Konfirmasi Emergency",
+                description=(
+                    f"Ubah `{setting}` menjadi **{'ON' if not current else 'OFF'}**?"
+                ),
+                color=discord.Color.red()
+            ),
+            view=OwnerEmergencyConfirmView(
+                self.viewer_id,
+                setting,
+                not current
+            )
+        )
+
+    @discord.ui.button(label="Pause Checker", emoji="⏸️", style=discord.ButtonStyle.danger, row=0)
+    async def checker(self, interaction, button):
+        await self.toggle(interaction, "monitor_paused")
+
+    @discord.ui.button(label="Stop Notif", emoji="🔕", style=discord.ButtonStyle.danger, row=0)
+    async def notif(self, interaction, button):
+        await self.toggle(interaction, "notifications_paused")
+
+    @discord.ui.button(label="Stop Request", emoji="🛑", style=discord.ButtonStyle.danger, row=1)
+    async def requests(self, interaction, button):
+        await self.toggle(interaction, "requests_paused")
+
+    @discord.ui.button(label="Maintenance Global", emoji="🚧", style=discord.ButtonStyle.danger, row=1)
+    async def maintenance(self, interaction, button):
+        await self.toggle(interaction, "maintenance_all")
+
+
+class OwnerBackupCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Backup Sekarang", emoji="💾", style=discord.ButtonStyle.primary, row=0)
+    async def backup_now(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if not await require_owner_level(interaction, "server_admin"):
+            return
+
+        payload, raw = manual_backup_payload_and_bytes()
+        ok, detail = verify_backup_payload(payload)
+        if not ok:
+            await safe_reply(interaction, f"❌ Backup gagal diverifikasi: {detail}")
+            return
+
+        ts = int(time.time())
+        folder = Path(AUTO_BACKUP_DIR)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"hi-notifku-manual-{ts}.json"
+        path.write_bytes(raw)
+
+        with closing(db()) as conn:
+            conn.execute("""
+                INSERT INTO backup_log(path, created_at, guild_count, ok, error)
+                VALUES(?,?,?,?,NULL)
+            """, (
+                str(path),
+                ts,
+                len(payload.get("guilds", [])),
+                1
+            ))
+            conn.commit()
+
+        await interaction.response.send_message(
+            content=f"✅ Manual backup valid. {detail}",
+            file=discord.File(
+                io.BytesIO(raw),
+                filename=f"hi-notifku-manual-{ts}.json"
+            ),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Verify Terakhir", emoji="✅", style=discord.ButtonStyle.secondary, row=0)
+    async def verify_last(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+
+        folder = Path(AUTO_BACKUP_DIR)
+        files = sorted(
+            list(folder.glob("hi-notifku-*.json")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        if not files:
+            await safe_reply(interaction, "ℹ️ Belum ada file backup.")
+            return
+
+        try:
+            payload = json.loads(files[0].read_text(encoding="utf-8"))
+            ok, detail = verify_backup_payload(payload)
+        except Exception as exc:
+            ok, detail = False, f"{type(exc).__name__}: {exc}"
+
+        await safe_reply(
+            interaction,
+            f"{'✅' if ok else '❌'} `{files[0].name}`\n{detail}"
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_backup_center_embed(),
+            view=OwnerBackupCenterView(self.viewer_id)
+        )
+
+
+
+
 class OwnerHomeView(discord.ui.View):
     def __init__(self, viewer_id: Optional[int] = None):
         super().__init__(timeout=900)
@@ -17765,6 +20079,34 @@ class OwnerHomeView(discord.ui.View):
                 interaction.user.id
             ),
             view=OwnerAccessCenterView(
+                interaction.user.id
+            )
+        )
+
+    @discord.ui.button(
+        label="Operations",
+        emoji="🧰",
+        style=discord.ButtonStyle.primary,
+        row=4
+    )
+    async def operations(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid_owner(interaction):
+            return
+
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🧰 Owner Operations",
+                description=(
+                    "Self Test • Error Center • Notification • API/Quota • "
+                    "Audit • Backup • Risk • Emergency"
+                ),
+                color=discord.Color.blurple()
+            ),
+            view=OwnerOpsHomeView(
                 interaction.user.id
             )
         )
@@ -20259,36 +22601,88 @@ class RestoreConfirmView(discord.ui.View):
 # ONE GLOBAL SLASH COMMAND
 # ============================================================
 
+async def require_dm_command(
+    interaction: discord.Interaction
+) -> bool:
+    """
+    All slash-command control surfaces are DM-only.
+
+    The bot may stay in any guild and continue sending notifications,
+    but users cannot operate slash commands from guild channels.
+    """
+    if interaction.guild is None:
+        return True
+
+    await safe_reply(
+        interaction,
+        (
+            "📩 **Command Hi Notifku hanya dapat digunakan melalui DM bot.**\n"
+            "Bot boleh berada di server ini untuk menjalankan notifier, "
+            "tetapi panel/command tidak dapat dijalankan dari channel server.\n\n"
+            "Buka profil **Hi Notifku** → **Message/Kirim Pesan**."
+        )
+    )
+    return False
+
+
+@discord.app_commands.allowed_contexts(
+    guilds=False,
+    dms=True,
+    private_channels=True
+)
 @bot.tree.command(
     name="ping",
     description="Cek status, latency, database, dan storage Hi Notifku."
 )
 async def ping_command(interaction: discord.Interaction):
+    if not await require_dm_command(interaction):
+        return
+
     try:
-        await interaction.response.send_message(
-            embed=bot_status_embed(),
-            ephemeral=True
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True
         )
+
+        ip_info = await current_ip_info()
+        embed = bot_status_embed()
+        apply_ip_fields(
+            embed,
+            ip_info
+        )
+
+        await interaction.edit_original_response(
+            embed=embed,
+            view=PingView(
+                interaction.user.id
+            )
+        )
+
     except Exception as exc:
         log.exception("/ping error")
 
-        if interaction.response.is_done():
+        try:
             await interaction.followup.send(
                 f"❌ Gagal membaca status bot: `{type(exc).__name__}: {exc}`",
                 ephemeral=True
             )
-        else:
-            await interaction.response.send_message(
-                f"❌ Gagal membaca status bot: `{type(exc).__name__}: {exc}`",
-                ephemeral=True
-            )
+        except Exception:
+            pass
 
 
+@discord.app_commands.allowed_contexts(
+    guilds=False,
+    dms=True,
+    private_channels=True
+)
 @bot.tree.command(
     name="start",
     description="Verifikasi join server resmi Hi Notifku."
 )
 async def start_command(interaction: discord.Interaction):
+    if not await require_dm_command(interaction):
+        return
+
     if is_user_blacklisted(interaction.user.id):
         await safe_reply(
             interaction,
@@ -20305,13 +22699,26 @@ async def start_command(interaction: discord.Interaction):
 
     try:
         if is_global_owner(interaction.user.id):
+            verified_count, owned_count = await verify_owned_guilds_for_user(
+                interaction.user.id
+            )
+            embed = start_verify_embed(
+                interaction.user.id,
+                True
+            )
+            if owned_count:
+                embed.add_field(
+                    name="Server Milikmu",
+                    value=(
+                        f"✅ {verified_count}/{owned_count} server diverifikasi.\n"
+                        "`/start` hanya refresh manual; auto-verifikasi tetap berjalan."
+                    ),
+                    inline=False
+                )
             await safe_reply(
                 interaction,
                 "",
-                embed=start_verify_embed(
-                    interaction.user.id,
-                    True
-                )
+                embed=embed
             )
             return
 
@@ -20326,15 +22733,39 @@ async def start_command(interaction: discord.Interaction):
             interaction.user.id
         )
 
-        await safe_reply(
-            interaction,
-            "",
-            embed=start_verify_embed(
+        if verified:
+            verified_count, owned_count = await verify_owned_guilds_for_user(
+                interaction.user.id
+            )
+            embed = start_verify_embed(
                 interaction.user.id,
-                verified
-            ),
-            view=None if verified else StartVerifyView()
-        )
+                True
+            )
+            if owned_count:
+                embed.add_field(
+                    name="Server Milikmu",
+                    value=(
+                        f"✅ **{verified_count}/{owned_count}** server "
+                        "berhasil diverifikasi.\n"
+                        "`/start` hanya refresh manual; auto-verifikasi tetap berjalan."
+                    ),
+                    inline=False
+                )
+            await safe_reply(
+                interaction,
+                "",
+                embed=embed
+            )
+        else:
+            await safe_reply(
+                interaction,
+                "",
+                embed=start_verify_embed(
+                    interaction.user.id,
+                    False
+                ),
+                view=StartVerifyView()
+            )
 
     except Exception as exc:
         log.exception("/start error")
@@ -20344,11 +22775,19 @@ async def start_command(interaction: discord.Interaction):
         )
 
 
+@discord.app_commands.allowed_contexts(
+    guilds=False,
+    dms=True,
+    private_channels=True
+)
 @bot.tree.command(
     name="menu",
     description="Buka menu pengguna Hi Notifku melalui DM."
 )
 async def menu_command(interaction: discord.Interaction):
+    if not await require_dm_command(interaction):
+        return
+
     if is_user_blacklisted(interaction.user.id):
         await safe_reply(
             interaction,
@@ -20360,17 +22799,6 @@ async def menu_command(interaction: discord.Interaction):
         await safe_reply(
             interaction,
             "⏳ Terlalu cepat. Tunggu beberapa detik lalu coba lagi."
-        )
-        return
-
-    # /menu is intentionally DM-only.
-    if interaction.guild is not None:
-        await safe_reply(
-            interaction,
-            (
-                "📩 **`/menu` hanya digunakan melalui DM Hi Notifku.**\n"
-                "Buka profil bot → **Message/Kirim Pesan** → jalankan `/menu` di DM."
-            )
         )
         return
 
@@ -20389,13 +22817,18 @@ async def menu_command(interaction: discord.Interaction):
                 interaction.user.id
             )
 
+            if verified:
+                await verify_owned_guilds_for_user(
+                    interaction.user.id
+                )
+
             if not verified:
                 await safe_reply(
                     interaction,
                     (
                         "🔒 Kamu belum terverifikasi.\n"
-                        "Gunakan **`/start`** terlebih dahulu dan join "
-                        "server resmi Hi Notifku."
+                        "Join **Server Owner/Support** terlebih dahulu. "
+                        "Verifikasi akan aktif otomatis; `/start` hanya untuk refresh manual."
                     ),
                     embed=start_verify_embed(
                         interaction.user.id,
@@ -20460,11 +22893,19 @@ async def menu_command(interaction: discord.Interaction):
             )
 
 
+@discord.app_commands.allowed_contexts(
+    guilds=False,
+    dms=True,
+    private_channels=True
+)
 @bot.tree.command(
     name="owner",
     description="Buka panel khusus Global Owner Bot Hi Notifku."
 )
 async def owner_command(interaction: discord.Interaction):
+    if not await require_dm_command(interaction):
+        return
+
     if not is_global_owner(interaction.user.id):
         owned = user_owned_guilds(
             interaction.user.id
@@ -20795,11 +23236,171 @@ async def on_message(message: discord.Message):
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        if not REQUIRED_GUILD_ID:
+            return
+
+        if int(member.guild.id) != int(REQUIRED_GUILD_ID):
+            return
+
+        updated = await auto_verify_owned_guilds_for_member(
+            member.id,
+            verified=True
+        )
+
+        if updated:
+            log.info(
+                "Auto-verifikasi owner user_id=%s untuk %s guild",
+                member.id,
+                updated
+            )
+
+            await notify_owner_auto_verification(
+                member.id,
+                verified=True,
+                guild_count=updated
+            )
+
+            try:
+                await audit_webhook(
+                    "Owner Auto Verified",
+                    (
+                        f"User {member.id} join Server Owner/Support dan "
+                        f"{updated} server otomatis diverifikasi."
+                    ),
+                    actor_id=member.id
+                )
+            except Exception:
+                pass
+
+    except Exception:
+        log.exception(
+            "on_member_join auto owner verification error"
+        )
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    try:
+        if not REQUIRED_GUILD_ID:
+            return
+
+        if int(member.guild.id) != int(REQUIRED_GUILD_ID):
+            return
+
+        updated = await auto_verify_owned_guilds_for_member(
+            member.id,
+            verified=False
+        )
+
+        if updated:
+            log.info(
+                "Auto-cabut verifikasi owner user_id=%s untuk %s guild",
+                member.id,
+                updated
+            )
+
+            await notify_owner_auto_verification(
+                member.id,
+                verified=False,
+                guild_count=updated
+            )
+
+            try:
+                await audit_webhook(
+                    "Owner Verification Revoked",
+                    (
+                        f"User {member.id} keluar Server Owner/Support dan "
+                        f"{updated} server kembali belum terverifikasi."
+                    ),
+                    actor_id=member.id
+                )
+            except Exception:
+                pass
+
+    except Exception:
+        log.exception(
+            "on_member_remove auto owner verification error"
+        )
+
+
+
+
+@bot.event
+async def on_guild_update(
+    before: discord.Guild,
+    after: discord.Guild
+):
+    try:
+        if int(before.owner_id) == int(after.owner_id):
+            return
+
+        verified = await refresh_guild_owner_verification(
+            after,
+            source="owner_transfer"
+        )
+
+        try:
+            new_owner = (
+                after.owner
+                or await after.fetch_member(after.owner_id)
+            )
+
+            if verified:
+                await new_owner.send(
+                    embed=discord.Embed(
+                        title="✅ Kepemilikan Server Terdeteksi",
+                        description=(
+                            f"Kamu sekarang menjadi Pemilik Server **{after.name}**.\n"
+                            "Karena akunmu sudah berada di Server Owner/Support, "
+                            "verifikasi server otomatis **AKTIF**."
+                        ),
+                        color=discord.Color.green()
+                    )
+                )
+            else:
+                await new_owner.send(
+                    embed=discord.Embed(
+                        title="🔒 Verifikasi Owner Diperlukan",
+                        description=(
+                            f"Kamu sekarang menjadi Pemilik Server **{after.name}**.\n"
+                            "Join Server Owner/Support agar verifikasi server "
+                            "aktif otomatis. Tidak perlu approval manual atau `/start`."
+                        ),
+                        color=discord.Color.orange()
+                    )
+                )
+        except Exception:
+            pass
+
+        log.info(
+            "Guild owner berubah guild=%s old=%s new=%s verified=%s",
+            after.id,
+            before.owner_id,
+            after.owner_id,
+            verified
+        )
+
+    except Exception:
+        log.exception(
+            "on_guild_update owner verification error"
+        )
+
+
+
+
+@bot.event
 async def on_guild_join(guild: discord.Guild):
     try:
         ensure_guild(guild.id)
 
-        if REQUIRED_GUILD_ID and not await guild_owner_verified(guild):
+        verified = await refresh_guild_owner_verification(
+            guild,
+            source="bot_invited"
+        )
+
+        if REQUIRED_GUILD_ID and not verified:
             channel = guild.system_channel
 
             if channel is None:
@@ -20811,10 +23412,13 @@ async def on_guild_join(guild: discord.Guild):
 
             if channel:
                 embed = discord.Embed(
-                    title="🔒 Hi Notifku • Verifikasi Wajib",
+                    title="🔒 Hi Notifku • Verifikasi Pemilik Server Wajib",
                     description=(
                         required_join_text()
-                        + "\n\n📩 Semua pengaturan dilakukan melalui DM bot."
+                        + "\n\n⛔ **Notifier server belum aktif.**"
+                        + "\nPemilik Server wajib join Server Owner/Support, "
+                        + "dan bot akan **otomatis memverifikasi** server ini tanpa approval manual."
+                        + "\n\n📩 Semua command/pengaturan dilakukan melalui DM bot."
                     ),
                     color=discord.Color.orange()
                 )
@@ -20827,11 +23431,20 @@ async def on_guild_join(guild: discord.Guild):
 
         try:
             owner_user = guild.owner or await guild.fetch_member(guild.owner_id)
-            await owner_user.send(
-                "👋 **Setup Hi Notifku**\n"
-                "Gunakan `/start` lalu `/menu` di DM bot. "
-                "Global Owner dapat menjalankan `/owner` → pilih server → **Wizard**."
-            )
+            if verified:
+                await owner_user.send(
+                    "✅ **Hi Notifku berhasil masuk ke servermu.**\n"
+                    "Status Pemilik Server: **TERVERIFIKASI**.\n"
+                    "Gunakan `/menu` di DM untuk mengatur server."
+                )
+            else:
+                await owner_user.send(
+                    "🔒 **Verifikasi Pemilik Server Wajib**\n"
+                    f"Server: **{guild.name}** (`{guild.id}`)\n\n"
+                    + required_join_text()
+                    + "\n\nSetelah join Server Owner/Support, gunakan `/start` hanya jika ingin refresh manual "
+                    "di DM Hi Notifku. Notifier belum aktif sebelum verifikasi berhasil."
+                )
         except Exception:
             pass
 
@@ -20853,9 +23466,131 @@ async def on_guild_join(guild: discord.Guild):
 async def on_guild_remove(guild: discord.Guild):
     try:
         delete_guild_data(guild.id)
+        with closing(db()) as conn:
+            conn.execute(
+                "DELETE FROM guild_owner_verification WHERE guild_id=?",
+                (guild.id,)
+            )
+            conn.commit()
         log.info("Data guild %s dibersihkan.", guild.id)
     except Exception:
         log.exception("Guild cleanup gagal")
+
+
+def startup_integrity_results() -> list[tuple[str, bool, str]]:
+    results = []
+
+    required_tables = {
+        "guild_config",
+        "guild_settings",
+        "hosts",
+        "premium_orders",
+        "server_host_access_requests",
+        "host_creation_requests",
+        "guild_owner_verification",
+        "schema_meta",
+    }
+
+    try:
+        with closing(db()) as conn:
+            actual = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        missing = sorted(required_tables - actual)
+        results.append((
+            "Database schema",
+            not missing,
+            "OK" if not missing else "Missing: " + ", ".join(missing)
+        ))
+    except Exception as exc:
+        results.append((
+            "Database schema",
+            False,
+            f"{type(exc).__name__}: {exc}"
+        ))
+
+    try:
+        path = Path(DB_PATH).expanduser()
+        results.append((
+            "DB path",
+            path.exists(),
+            str(path)
+        ))
+    except Exception as exc:
+        results.append(("DB path", False, str(exc)))
+
+    try:
+        folder = Path(AUTO_BACKUP_DIR)
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / ".startup-check"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        results.append(("Backup storage", True, str(folder)))
+    except Exception as exc:
+        results.append(("Backup storage", False, str(exc)))
+
+    if REQUIRED_GUILD_ID:
+        results.append((
+            "Owner/Support server",
+            bot.get_guild(REQUIRED_GUILD_ID) is not None,
+            str(REQUIRED_GUILD_ID)
+        ))
+    else:
+        results.append((
+            "Owner/Support server",
+            False,
+            "REQUIRED_GUILD_ID kosong"
+        ))
+
+    results.append((
+        "Members Intent",
+        bool(bot.intents.members),
+        "ON" if bot.intents.members else "OFF"
+    ))
+
+    return results
+
+
+async def notify_startup_integrity():
+    results = startup_integrity_results()
+    failed = [
+        item for item in results
+        if not item[1]
+    ]
+
+    lines = [
+        f"{'✅' if ok else '❌'} **{name}** — {detail}"
+        for name, ok, detail in results
+    ]
+
+    log.info(
+        "Startup integrity: %s",
+        " | ".join(
+            f"{name}={'OK' if ok else 'FAIL'}"
+            for name, ok, _ in results
+        )
+    )
+
+    if not failed:
+        return
+
+    embed = discord.Embed(
+        title="🚨 Startup Integrity Warning",
+        description="\n".join(lines),
+        color=discord.Color.red()
+    )
+
+    for owner_id in primary_owner_ids():
+        try:
+            user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+            await user.send(embed=embed)
+        except Exception:
+            pass
+
+
 
 
 @bot.event
@@ -20886,11 +23621,27 @@ async def on_ready():
     except Exception:
         log.exception("Slash command sync gagal")
 
+    try:
+        await notify_startup_integrity()
+    except Exception:
+        log.exception("Startup integrity check gagal")
+
     if not monitor_loop.is_running():
         monitor_loop.start()
 
     if not host_manager_expiry_warning_loop.is_running():
         host_manager_expiry_warning_loop.start()
+
+    if not pending_request_reminder_loop.is_running():
+        pending_request_reminder_loop.start()
+
+    try:
+        await recover_pending_request_views()
+    except Exception:
+        log.exception("Recovery pending request gagal")
+
+    if not owner_verification_reconcile_loop.is_running():
+        owner_verification_reconcile_loop.start()
 
     if not premium_expiry_loop.is_running():
         premium_expiry_loop.start()
