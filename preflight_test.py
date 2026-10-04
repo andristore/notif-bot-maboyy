@@ -79,3 +79,8 @@ print("OK: no duplicate top-level definitions")
 print("OK: Railway variable parity")
 print("OK: basic secret scan")
 print("OK: required files")
+
+# Runtime tuning reader must be safe before DB migrations finish.
+bot_text = BOT.read_text(encoding="utf-8")
+if 'if not table_exists(conn, "runtime_tuning")' not in bot_text:
+    fail("runtime_tuning bootstrap guard missing")

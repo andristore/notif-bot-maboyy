@@ -8064,28 +8064,58 @@ def required_join_text() -> str:
 
 
 def get_runtime_tuning():
-    with closing(db()) as conn:
-        row = conn.execute(
-            "SELECT * FROM runtime_tuning WHERE id=1"
-        ).fetchone()
-    if row:
-        return row
-    with closing(db()) as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO runtime_tuning(
-                id, monitor_concurrency, notification_max_retries,
-                error_alert_threshold, circuit_breaker_minutes
-            )
-            VALUES(1,?,?,?,10)
-        """, (
-            int(MONITOR_CONCURRENCY),
-            int(NOTIFICATION_MAX_RETRIES),
-            int(ERROR_ALERT_THRESHOLD)
-        ))
-        conn.commit()
-        return conn.execute(
-            "SELECT * FROM runtime_tuning WHERE id=1"
-        ).fetchone()
+    """
+    Bootstrap-safe runtime tuning reader.
+
+    This function can be called before migrate_database() runs, because some
+    UI/classes are constructed while the module is being imported. If the
+    runtime_tuning table does not exist yet, return in-memory defaults instead
+    of querying SQLite and crashing startup.
+    """
+    defaults = {
+        "id": 1,
+        "monitor_concurrency": int(MONITOR_CONCURRENCY),
+        "notification_max_retries": int(NOTIFICATION_MAX_RETRIES),
+        "error_alert_threshold": int(ERROR_ALERT_THRESHOLD),
+        "circuit_breaker_minutes": 10,
+        "updated_by": None,
+        "updated_at": None,
+    }
+
+    try:
+        with closing(db()) as conn:
+            if not table_exists(conn, "runtime_tuning"):
+                return defaults
+
+            row = conn.execute(
+                "SELECT * FROM runtime_tuning WHERE id=1"
+            ).fetchone()
+
+            if row:
+                return row
+
+            conn.execute("""
+                INSERT OR IGNORE INTO runtime_tuning(
+                    id, monitor_concurrency, notification_max_retries,
+                    error_alert_threshold, circuit_breaker_minutes
+                )
+                VALUES(1,?,?,?,10)
+            """, (
+                int(MONITOR_CONCURRENCY),
+                int(NOTIFICATION_MAX_RETRIES),
+                int(ERROR_ALERT_THRESHOLD)
+            ))
+            conn.commit()
+
+            row = conn.execute(
+                "SELECT * FROM runtime_tuning WHERE id=1"
+            ).fetchone()
+
+            return row or defaults
+
+    except sqlite3.OperationalError:
+        # Database schema may still be bootstrapping.
+        return defaults
 
 
 def runtime_tuning_int(name: str, fallback: int) -> int:
@@ -8113,6 +8143,11 @@ def update_runtime_tuning(
         "circuit_breaker_minutes": max(1, min(60, int(circuit_breaker_minutes))),
     }
     with closing(db()) as conn:
+        if not table_exists(conn, "runtime_tuning"):
+            raise RuntimeError(
+                "Database belum selesai migrasi. Coba lagi setelah bot Ready."
+            )
+
         conn.execute("""
             UPDATE runtime_tuning
             SET
