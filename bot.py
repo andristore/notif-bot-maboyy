@@ -46,8 +46,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.9.1"
-CURRENT_SCHEMA_VERSION = 23
+APP_VERSION = "1.12.0"
+CURRENT_SCHEMA_VERSION = 25
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -1271,6 +1271,8 @@ def migrate_database():
         add_column_if_missing(conn, "premium_orders", "refunded_at", "INTEGER")
         add_column_if_missing(conn, "premium_orders", "override_reason", "TEXT")
         add_column_if_missing(conn, "premium_orders", "receipt_sent_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "activation_target_expires_at", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "activation_effect_applied", "INTEGER NOT NULL DEFAULT 0")
 
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_premium_orders_payment_reference
@@ -1804,6 +1806,127 @@ def migrate_database():
             ON pending_notifications(host_id, event_key, event_type)
             WHERE event_key IS NOT NULL
         """)
+
+        # Permanent Premium customer database. This is intentionally separate
+        # from premium_orders because old transactional rows may be cleaned up.
+        if not table_exists(conn, "premium_customer_ledger"):
+            conn.execute("""
+                CREATE TABLE premium_customer_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL UNIQUE,
+                    guild_id INTEGER NOT NULL,
+                    requester_id INTEGER NOT NULL,
+                    invoice_ref TEXT,
+                    days INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    activated_at INTEGER NOT NULL,
+                    expires_at INTEGER,
+                    source TEXT,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+
+        if not table_exists(conn, "premium_customers"):
+            conn.execute("""
+                CREATE TABLE premium_customers (
+                    guild_id INTEGER PRIMARY KEY,
+                    guild_name TEXT,
+                    first_buyer_id INTEGER NOT NULL,
+                    last_buyer_id INTEGER NOT NULL,
+                    first_purchased_at INTEGER NOT NULL,
+                    last_purchased_at INTEGER NOT NULL,
+                    current_expires_at INTEGER,
+                    total_orders INTEGER NOT NULL DEFAULT 0,
+                    total_days INTEGER NOT NULL DEFAULT 0,
+                    total_spent INTEGER NOT NULL DEFAULT 0,
+                    last_order_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'expired',
+                    updated_at INTEGER NOT NULL
+                )
+            """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_customer_ledger_guild
+            ON premium_customer_ledger(guild_id, activated_at DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_customer_ledger_user
+            ON premium_customer_ledger(requester_id, activated_at DESC)
+        """)
+
+        # Backfill all successfully activated historical orders. INSERT OR IGNORE
+        # makes this safe to run on every deploy.
+        conn.execute("""
+            INSERT OR IGNORE INTO premium_customer_ledger(
+                order_id, guild_id, requester_id, invoice_ref, days, amount,
+                activated_at, expires_at, source, created_at
+            )
+            SELECT
+                id, guild_id, requester_id, invoice_ref, days, price,
+                COALESCE(activated_at, updated_at, created_at), expires_at,
+                COALESCE(payment_source, 'historical'),
+                COALESCE(activated_at, updated_at, created_at)
+            FROM premium_orders
+            WHERE activated_at IS NOT NULL OR status='active'
+        """)
+
+        # Rebuild the aggregate customer table from the permanent ledger.
+        customer_rows = conn.execute("""
+            SELECT
+                l.guild_id,
+                MIN(l.activated_at) AS first_purchased_at,
+                MAX(l.activated_at) AS last_purchased_at,
+                MAX(l.expires_at) AS current_expires_at,
+                COUNT(*) AS total_orders,
+                SUM(l.days) AS total_days,
+                SUM(l.amount) AS total_spent
+            FROM premium_customer_ledger l
+            GROUP BY l.guild_id
+        """).fetchall()
+        for customer in customer_rows:
+            gid = int(customer["guild_id"])
+            first_row = conn.execute("""
+                SELECT requester_id FROM premium_customer_ledger
+                WHERE guild_id=? ORDER BY activated_at ASC, id ASC LIMIT 1
+            """, (gid,)).fetchone()
+            last_row = conn.execute("""
+                SELECT requester_id, order_id FROM premium_customer_ledger
+                WHERE guild_id=? ORDER BY activated_at DESC, id DESC LIMIT 1
+            """, (gid,)).fetchone()
+            settings_row = conn.execute(
+                "SELECT plan, premium_expires_at, premium_grace_until FROM guild_settings WHERE guild_id=?",
+                (gid,)
+            ).fetchone()
+            expires = int(customer["current_expires_at"] or 0) or None
+            active_now = False
+            if settings_row:
+                effective_until = int(settings_row["premium_grace_until"] or settings_row["premium_expires_at"] or 0)
+                active_now = str(settings_row["plan"]) == "premium" and effective_until > int(time.time())
+            conn.execute("""
+                INSERT INTO premium_customers(
+                    guild_id, guild_name, first_buyer_id, last_buyer_id,
+                    first_purchased_at, last_purchased_at, current_expires_at,
+                    total_orders, total_days, total_spent, last_order_id, status, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    first_buyer_id=excluded.first_buyer_id,
+                    last_buyer_id=excluded.last_buyer_id,
+                    first_purchased_at=excluded.first_purchased_at,
+                    last_purchased_at=excluded.last_purchased_at,
+                    current_expires_at=excluded.current_expires_at,
+                    total_orders=excluded.total_orders,
+                    total_days=excluded.total_days,
+                    total_spent=excluded.total_spent,
+                    last_order_id=excluded.last_order_id,
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+            """, (
+                gid, None, int(first_row["requester_id"]), int(last_row["requester_id"]),
+                int(customer["first_purchased_at"]), int(customer["last_purchased_at"]), expires,
+                int(customer["total_orders"] or 0), int(customer["total_days"] or 0),
+                int(customer["total_spent"] or 0), int(last_row["order_id"]),
+                "active" if active_now else "expired", int(time.time())
+            ))
 
         if not table_exists(conn, "api_usage"):
             conn.execute("""
@@ -3953,6 +4076,7 @@ PLAN_FEATURE_LABELS = {
     "advanced_schedule": "Jadwal & quiet hours",
     "custom_branding": "Custom branding",
     "manager_presets": "Manager permission preset",
+    "data_export": "Export data server",
 }
 
 
@@ -4012,6 +4136,7 @@ def premium_entitlements(guild_id: int) -> dict:
         "advanced_schedule": premium,
         "custom_branding": premium,
         "manager_presets": premium,
+        "data_export": premium,
     }
 
 
@@ -4054,7 +4179,8 @@ def premium_entitlements_text(guild_id: int) -> str:
         f"{'✅' if e['custom_templates'] else '🔒'} Custom pesan • "
         f"{'✅' if e['custom_branding'] else '🔒'} Branding\n"
         f"{'✅' if e['extra_channels'] else '🔒'} Multi-channel • "
-        f"{'✅' if e['webhook'] else '🔒'} Webhook"
+        f"{'✅' if e['webhook'] else '🔒'} Webhook • "
+        f"{'✅' if e['data_export'] else '🔒'} Export"
     )
 
 
@@ -4064,7 +4190,7 @@ def plan_comparison_text() -> str:
         "notifikasi standar.\n"
         f"⭐ **PREMIUM** — hingga {PREMIUM_HOST_LIMIT} host, analytics 30 hari, "
         "priority checker, custom pesan/branding, jadwal & quiet hours, "
-        "multi-channel/role, dan webhook.\n\n"
+        "multi-channel/role, webhook, dan export data.\n\n"
         "Saat Premium berakhir, konfigurasi Premium **tidak dihapus**; fitur dikunci "
         "dan host di atas limit FREE dipause sampai Premium aktif kembali."
     )
@@ -4074,13 +4200,14 @@ def plan_comparison_text() -> str:
 
 def premium_plan_summary_embed(guild: discord.Guild):
     settings = get_guild_settings(guild.id)
-    plan = str(settings["plan"] or "free").lower()
+    plan = "premium" if premium_access_effective(guild.id) else "free"
     hosts = len(get_hosts(guild.id))
     limit = host_limit_for_guild(guild.id)
 
     embed = discord.Embed(
         title=f"⭐ Premium • {guild.name}",
-        description="Kelola Premium server secara ringkas.",
+        description=("Beli atau perpanjang Premium untuk server ini. "
+                     "Pembayaran dapat dilakukan Pemilik Server atau Host Manager aktif."),
         color=discord.Color.gold()
     )
     embed.add_field(
@@ -4114,7 +4241,7 @@ def premium_plan_summary_embed(guild: discord.Guild):
         value=plan_comparison_text()[:1024],
         inline=False
     )
-    embed.set_footer(text="Pilih paket dari dropdown • invoice dibuat setelah konfirmasi")
+    embed.set_footer(text="Premium berlaku untuk seluruh server • pilih paket lalu buat invoice")
     return embed
 
 
@@ -4145,6 +4272,14 @@ def user_premium_history_embed(user_id: int, guild_id: int):
     return discord.Embed(
         title="🧾 Riwayat Premium",
         description="\n".join(lines) if lines else "Belum ada transaksi Premium.",
+        color=discord.Color.gold()
+    )
+
+
+def owner_payment_menu_embed():
+    return discord.Embed(
+        title="💳 Payment Center",
+        description="Request • Riwayat • Premium DB • Pendapatan",
         color=discord.Color.gold()
     )
 
@@ -4215,6 +4350,189 @@ def transaction_history_embed(limit: int = 15):
     embed.description = description
     embed.set_footer(text=f"{len(rows)} transaksi terbaru • tombol Refresh untuk memperbarui")
     return embed
+
+
+def record_premium_customer_activation(order_id: int, *, source: str = "payment") -> None:
+    """Persist an activated Premium purchase in a permanent customer ledger.
+
+    Idempotent by order_id, so retries cannot double-count a purchase.
+    """
+    order = get_premium_order(int(order_id))
+    if not order:
+        raise ValueError("Order Premium tidak ditemukan.")
+
+    activated_at = int(order["activated_at"] or time.time())
+    expires_at = int(order["expires_at"] or 0) or None
+    guild_id = int(order["guild_id"])
+    requester_id = int(order["requester_id"])
+    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(int(order_id))
+    amount = int(order["price"] or 0)
+    guild = bot.get_guild(guild_id)
+    guild_name = guild.name[:120] if guild and guild.name else None
+
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO premium_customer_ledger(
+                order_id, guild_id, requester_id, invoice_ref, days, amount,
+                activated_at, expires_at, source, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            int(order_id), guild_id, requester_id, invoice_ref,
+            int(order["days"]), amount, activated_at, expires_at,
+            str(source or "payment")[:64], int(time.time())
+        ))
+
+        agg = conn.execute("""
+            SELECT MIN(activated_at) AS first_at, MAX(activated_at) AS last_at,
+                   MAX(expires_at) AS max_expires, COUNT(*) AS total_orders,
+                   SUM(days) AS total_days, SUM(amount) AS total_spent
+            FROM premium_customer_ledger WHERE guild_id=?
+        """, (guild_id,)).fetchone()
+        first = conn.execute("""
+            SELECT requester_id FROM premium_customer_ledger
+            WHERE guild_id=? ORDER BY activated_at ASC, id ASC LIMIT 1
+        """, (guild_id,)).fetchone()
+        last = conn.execute("""
+            SELECT requester_id, order_id FROM premium_customer_ledger
+            WHERE guild_id=? ORDER BY activated_at DESC, id DESC LIMIT 1
+        """, (guild_id,)).fetchone()
+        settings = conn.execute("""
+            SELECT plan, premium_expires_at, premium_grace_until
+            FROM guild_settings WHERE guild_id=?
+        """, (guild_id,)).fetchone()
+        effective_until = int(
+            (settings["premium_grace_until"] if settings else 0)
+            or (settings["premium_expires_at"] if settings else 0)
+            or 0
+        )
+        active_now = bool(
+            settings and str(settings["plan"]) == "premium"
+            and effective_until > int(time.time())
+        )
+
+        conn.execute("""
+            INSERT INTO premium_customers(
+                guild_id, guild_name, first_buyer_id, last_buyer_id,
+                first_purchased_at, last_purchased_at, current_expires_at,
+                total_orders, total_days, total_spent, last_order_id, status, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                guild_name=COALESCE(excluded.guild_name, premium_customers.guild_name),
+                first_buyer_id=excluded.first_buyer_id,
+                last_buyer_id=excluded.last_buyer_id,
+                first_purchased_at=excluded.first_purchased_at,
+                last_purchased_at=excluded.last_purchased_at,
+                current_expires_at=excluded.current_expires_at,
+                total_orders=excluded.total_orders,
+                total_days=excluded.total_days,
+                total_spent=excluded.total_spent,
+                last_order_id=excluded.last_order_id,
+                status=excluded.status,
+                updated_at=excluded.updated_at
+        """, (
+            guild_id, guild_name, int(first["requester_id"]), int(last["requester_id"]),
+            int(agg["first_at"]), int(agg["last_at"]), int(agg["max_expires"] or 0) or None,
+            int(agg["total_orders"] or 0), int(agg["total_days"] or 0),
+            int(agg["total_spent"] or 0), int(last["order_id"]),
+            "active" if active_now else "expired", int(time.time())
+        ))
+        conn.commit()
+
+
+def premium_customer_database_rows(limit: int = 15):
+    with closing(db()) as conn:
+        return conn.execute("""
+            SELECT * FROM premium_customers
+            ORDER BY last_purchased_at DESC
+            LIMIT ?
+        """, (max(1, min(25, int(limit))),)).fetchall()
+
+
+def premium_customer_database_embed(limit: int = 15):
+    rows = premium_customer_database_rows(limit)
+    now = int(time.time())
+    with closing(db()) as conn:
+        stats = conn.execute("""
+            SELECT COUNT(*) AS customers,
+                   COALESCE(SUM(total_orders),0) AS orders,
+                   COALESCE(SUM(total_spent),0) AS spent
+            FROM premium_customers
+        """).fetchone()
+
+    embed = discord.Embed(
+        title="⭐ Premium DB",
+        description=(
+            f"Server tercatat: **{int(stats['customers'] or 0)}** • "
+            f"aktivasi: **{int(stats['orders'] or 0)}** • "
+            f"nilai paket: **{rupiah(int(stats['spent'] or 0))}**"
+        ),
+        color=discord.Color.gold()
+    )
+
+    if not rows:
+        embed.add_field(name="Data", value="Belum ada pelanggan Premium.", inline=False)
+        return embed
+
+    lines = []
+    for row in rows:
+        gid = int(row["guild_id"])
+        guild = bot.get_guild(gid)
+        name = (guild.name if guild else row["guild_name"]) or f"Server {gid}"
+        expires = int(row["current_expires_at"] or 0)
+        settings = get_guild_settings(gid)
+        effective_until = int(settings["premium_grace_until"] or settings["premium_expires_at"] or 0) if settings else 0
+        active = bool(settings and str(settings["plan"]) == "premium" and effective_until > now)
+        status = "🟢 Aktif" if active else "⚪ Expired"
+        expiry_text = f"<t:{expires}:d>" if expires else "-"
+        lines.append(
+            f"**{name[:48]}** • {status}\n"
+            f"`{gid}` • pembeli <@{int(row['last_buyer_id'])}> • "
+            f"{int(row['total_orders'])}x • {rupiah(int(row['total_spent']))} • exp {expiry_text}"
+        )
+
+    text = "\n\n".join(lines)
+    embed.description += "\n\n" + (text[:3600] + ("..." if len(text) > 3600 else ""))
+    embed.set_footer(text=f"{len(rows)} pelanggan terbaru • data aktivasi disimpan permanen")
+    return embed
+
+
+class PremiumCustomerDatabaseView(discord.ui.View):
+    def __init__(self, viewer_id: int):
+        super().__init__(timeout=900)
+        self.viewer_id = int(viewer_id)
+
+    async def valid(self, interaction, minimum="read_only"):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_owner_level(interaction, minimum)
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=premium_customer_database_embed(),
+            view=PremiumCustomerDatabaseView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_payment_menu_embed(),
+            view=OwnerPaymentMenuView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_home_embed(),
+            view=OwnerHomeView(self.viewer_id)
+        )
 
 
 def premium_queue_embed():
@@ -5202,47 +5520,50 @@ def create_premium_order(
     days: int,
     price: int
 ) -> int:
+    """Create one active Premium invoice per server.
+
+    The lock is server-wide, not requester-wide. This prevents a Server Owner
+    and Host Manager from accidentally creating two payable invoices for the
+    same server at the same time.
+    """
     if is_user_blacklisted(requester_id):
         raise PermissionError("User diblacklist dari transaksi Premium.")
 
     now = int(time.time())
+    unique_code, expected_amount = generate_collision_free_payment_code(int(price))
+    deadline = now + (INVOICE_EXPIRE_MINUTES * 60)
+    active_statuses = (
+        "pending", "proof_submitted", "amount_mismatch",
+        "underpaid", "overpaid", "amount_verified", "paid", "processing"
+    )
+    placeholders = ",".join("?" for _ in active_statuses)
 
     with closing(db()) as conn:
-        existing = conn.execute("""
-            SELECT id, days, price
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(f"""
+            SELECT id, requester_id, days, price
             FROM premium_orders
             WHERE guild_id=?
-              AND requester_id=?
-              AND status IN (
-                  'pending','proof_submitted','amount_mismatch',
-                  'underpaid','overpaid','amount_verified','paid',
-                  'processing'
-              )
+              AND status IN ({placeholders})
             ORDER BY id DESC
             LIMIT 1
-        """, (
-            guild_id,
-            requester_id
-        )).fetchone()
+        """, (int(guild_id), *active_statuses)).fetchone()
 
         if existing:
             if (
-                int(existing["days"]) == int(days)
+                int(existing["requester_id"]) == int(requester_id)
+                and int(existing["days"]) == int(days)
                 and int(existing["price"]) == int(price)
             ):
+                conn.rollback()
                 return int(existing["id"])
 
+            conn.rollback()
             raise ValueError(
-                "Masih ada invoice aktif untuk server ini. "
-                "Selesaikan atau tunggu invoice tersebut kedaluwarsa."
+                "Server ini masih memiliki invoice Premium aktif. "
+                "Selesaikan atau tunggu invoice tersebut kedaluwarsa sebelum membuat invoice baru."
             )
 
-    unique_code, expected_amount = generate_collision_free_payment_code(
-        int(price)
-    )
-    deadline = now + (INVOICE_EXPIRE_MINUTES * 60)
-
-    with closing(db()) as conn:
         cur = conn.execute("""
             INSERT INTO premium_orders(
                 guild_id, requester_id, days, price,
@@ -5250,24 +5571,13 @@ def create_premium_order(
                 unique_code, expected_amount,
                 amount_verified, invoice_deadline
             )
-            VALUES(
-                ?,?,?,?,
-                'pending',?,?,?,
-                ?,0,?
-            )
+            VALUES(?,?,?,?, 'pending',?,?,?,?,0,?)
         """, (
-            guild_id,
-            requester_id,
-            int(days),
-            int(price),
-            now,
-            now,
-            unique_code,
-            expected_amount,
-            deadline
+            int(guild_id), int(requester_id), int(days), int(price),
+            now, now, unique_code, expected_amount, deadline
         ))
-        conn.commit()
         order_id = int(cur.lastrowid)
+        conn.commit()
 
     ensure_invoice_ref(order_id)
     return order_id
@@ -6262,6 +6572,95 @@ def payment_proof_scan_label(order) -> str:
     )
 
 
+def commit_premium_activation(order_id: int, actor_id: int) -> int:
+    """Atomically apply a Premium order exactly once and return expiry.
+
+    Guild entitlement and order activation are committed in the same SQLite
+    transaction. A process crash therefore cannot activate the server and leave
+    the invoice unactivated, which previously could extend Premium twice on a
+    retry.
+    """
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute(
+            "SELECT * FROM premium_orders WHERE id=?",
+            (int(order_id),)
+        ).fetchone()
+        if not order:
+            conn.rollback()
+            raise ValueError("Order tidak ditemukan.")
+
+        if order["activated_at"] or str(order["status"]) == "active":
+            expiry = int(order["expires_at"] or order["activation_target_expires_at"] or 0)
+            conn.rollback()
+            return expiry
+
+        if str(order["status"]) != "processing":
+            conn.rollback()
+            raise ValueError("Order belum diklaim untuk aktivasi.")
+
+        settings = conn.execute(
+            "SELECT * FROM guild_settings WHERE guild_id=?",
+            (int(order["guild_id"]),)
+        ).fetchone()
+        if not settings:
+            conn.rollback()
+            raise ValueError("Pengaturan server tidak ditemukan.")
+
+        target = int(order["activation_target_expires_at"] or 0)
+        if not target:
+            current_expiry = int(settings["premium_expires_at"] or 0)
+            base = current_expiry if (
+                str(settings["plan"] or "free").lower() == "premium"
+                and current_expiry > now
+            ) else now
+            target = base + max(1, int(order["days"])) * 86400
+            conn.execute(
+                "UPDATE premium_orders SET activation_target_expires_at=? WHERE id=?",
+                (target, int(order_id))
+            )
+
+        conn.execute("""
+            UPDATE guild_settings
+            SET plan='premium',
+                premium_started_at=CASE
+                    WHEN premium_started_at IS NULL THEN ?
+                    ELSE premium_started_at
+                END,
+                premium_expires_at=?,
+                premium_warning_sent=0,
+                premium_grace_until=NULL
+            WHERE guild_id=?
+        """, (now, target, int(order["guild_id"])))
+
+        conn.execute("""
+            UPDATE premium_orders
+            SET status='active',
+                processed_by=COALESCE(?, processed_by),
+                activated_at=COALESCE(activated_at, ?),
+                expires_at=?,
+                activation_effect_applied=1,
+                updated_at=?
+            WHERE id=?
+        """, (int(actor_id), now, target, now, int(order_id)))
+        conn.commit()
+
+    restored = reactivate_plan_paused_hosts(int(order["guild_id"]))
+    if restored:
+        add_activity(
+            int(order["guild_id"]), None, "Premium Host Reactivation",
+            f"{restored} host dipulihkan setelah Premium aktif."
+        )
+
+    record_premium_event(
+        int(order_id), "active", actor_id=int(actor_id),
+        detail="Entitlement Premium diterapkan atomik."
+    )
+    return target
+
+
 async def activate_verified_premium_order(
     order_id: int,
     *,
@@ -6292,6 +6691,12 @@ async def activate_verified_premium_order(
     if scan_status == "rejected":
         return False, "Bukti transfer ditolak screening otomatis."
 
+    if require_proof and scan_status != "passed":
+        return False, (
+            "Bukti pembayaran belum lulus screening otomatis. "
+            "Status review harus diperiksa Payment Admin sebelum Premium diaktifkan."
+        )
+
     if not claim_order_for_activation(
         int(order_id),
         int(actor_id)
@@ -6303,32 +6708,18 @@ async def activate_verified_premium_order(
 
     try:
         guild_id = int(order["guild_id"])
-        existing = get_guild_settings(guild_id)
-        extend = existing["plan"] == "premium"
-
-        set_plan(
-            guild_id,
-            "premium",
-            duration_days=int(order["days"]),
-            extend=extend
-        )
-
-        settings = get_guild_settings(guild_id)
-        expires_at = (
-            int(settings["premium_expires_at"])
-            if settings["premium_expires_at"]
-            else None
-        )
-
+        expires_at = commit_premium_activation(int(order_id), int(actor_id))
         now = int(time.time())
 
-        update_order_status(
-            int(order_id),
-            "active",
-            processed_by=int(actor_id),
-            activated_at=now,
-            expires_at=expires_at
-        )
+        # Permanent, idempotent Premium customer record. A failure here must not
+        # roll back a successfully activated subscription, so log and continue.
+        try:
+            record_premium_customer_activation(int(order_id), source=source)
+        except Exception as customer_exc:
+            log.exception(
+                "Premium customer DB write failed for order %s: %s",
+                order_id, customer_exc
+            )
 
         invoice_ref = (
             order["invoice_ref"]
@@ -7592,6 +7983,64 @@ async def require_server_owner(
         (
             "🔒 Fitur ini khusus **Pemilik Server** terkait.\n"
             "Akses ini berbeda dari **Global Owner Bot**."
+        )
+    )
+    return None
+
+
+def premium_purchase_guild_ids(user_id: int) -> list[int]:
+    """Servers where a user may buy/renew Premium.
+
+    Premium is a server-level product. A server owner or an active Host Manager
+    may pay for the server, while server-management permissions stay unchanged.
+    """
+    result: list[int] = []
+
+    for guild in user_owned_guilds(int(user_id)):
+        guild_id = int(guild.id)
+        if guild_id not in result:
+            result.append(guild_id)
+
+    for guild_id in host_manager_guild_ids(int(user_id)):
+        guild_id = int(guild_id)
+        if bot.get_guild(guild_id) is not None and guild_id not in result:
+            result.append(guild_id)
+
+    return result
+
+
+def can_purchase_premium(user_id: int, guild_id: int) -> bool:
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        return False
+    if int(guild.owner_id) == int(user_id):
+        return True
+    return host_manager_has_guild_access(int(user_id), int(guild_id))
+
+
+def premium_purchase_role_label(user_id: int, guild_id: int) -> str:
+    guild = bot.get_guild(int(guild_id))
+    if guild and int(guild.owner_id) == int(user_id):
+        return "Pemilik Server"
+    if host_manager_has_guild_access(int(user_id), int(guild_id)):
+        return "Host Manager"
+    return "Tidak ada akses"
+
+
+async def require_premium_purchaser(
+    interaction: discord.Interaction,
+    guild_id: int
+) -> Optional[discord.Guild]:
+    guild = bot.get_guild(int(guild_id))
+    if guild and can_purchase_premium(interaction.user.id, guild_id):
+        return guild
+
+    await safe_reply(
+        interaction,
+        (
+            "🔒 Pembelian Premium untuk server ini hanya dapat dilakukan oleh "
+            "**Pemilik Server** atau **Host Manager aktif**.\n"
+            "Premium yang dibeli berlaku untuk server, bukan akun pribadi."
         )
     )
     return None
@@ -11442,7 +11891,7 @@ def host_auto_recovery_allowed(host) -> tuple[bool, str]:
     if keys and not all(feature_enabled(guild_id, key) for key in keys):
         return False, "Platform sedang maintenance."
 
-    if str(settings["plan"] or "free") != "premium":
+    if not premium_access_effective(guild_id):
         active_other = sum(
             1 for item in get_hosts(guild_id)
             if int(item["id"]) != int(host["id"]) and bool(item["enabled"])
@@ -13469,18 +13918,18 @@ def server_embed(guild: discord.Guild):
     embed = discord.Embed(
         title=f"🔔 {guild.name}",
         description=(
-            f"Plan **{settings['plan'].upper()}** • "
+            f"Plan **{'PREMIUM' if premium_access_effective(guild.id) else 'FREE'}** • "
             f"Host **{len(hosts)}/{host_limit_for_guild(guild.id)}** • "
             f"Access **{settings['access_state']}**"
         ),
         color=(
             discord.Color.gold()
-            if settings["plan"] == "premium"
+            if premium_access_effective(guild.id)
             else discord.Color.blue()
         )
     )
 
-    if settings["plan"] == "premium":
+    if premium_access_effective(guild.id):
         embed.add_field(
             name="Premium",
             value=premium_expiry_text(guild.id),
@@ -14863,7 +15312,7 @@ class StartVerifyView(discord.ui.View):
 
 def user_server_embed(guild: discord.Guild):
     settings = get_guild_settings(guild.id)
-    plan = settings["plan"]
+    plan = "premium" if premium_access_effective(guild.id) else "free"
 
     embed = discord.Embed(
         title="🔔 Hi Notifku",
@@ -16273,6 +16722,38 @@ class MenuRoleChoiceView(discord.ui.View):
         )
 
 
+    @discord.ui.button(
+        label="Premium",
+        emoji="⭐",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def premium_menu(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if not await self.valid_user(interaction):
+            return
+
+        guild_ids = premium_purchase_guild_ids(self.user_id)
+        if not guild_ids:
+            await safe_reply(
+                interaction,
+                (
+                    "ℹ️ Premium dapat dibeli oleh **Pemilik Server** atau "
+                    "**Host Manager aktif**.\n"
+                    "Kamu belum memiliki server yang memenuhi akses tersebut."
+                )
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=premium_purchase_home_embed(self.user_id),
+            view=PremiumGuildPickerView(self.user_id)
+        )
+
+
 def server_owner_menu_home_embed(
     user_id: int
 ):
@@ -16455,11 +16936,11 @@ def dm_menu_home_embed(user_id: int):
     embed = discord.Embed(
         title="📩 Hi Notifku • Pilih Akses",
         description=(
-            "Pilih salah satu menu sesuai peranmu.\n\n"
-            "👑 **Pemilik Server** — mengelola server milik sendiri.\n"
-            "🎙️ **Host Manager** — mengelola host yang diberikan kepadamu.\n\n"
-            "🛡️ **Global Owner Bot tidak ada di menu ini** dan tetap hanya "
-            "dapat dibuka melalui `/owner`."
+            "Pilih menu sesuai kebutuhanmu.\n\n"
+            "👑 **Pemilik Server** — kelola server sendiri.\n"
+            "🎙️ **Host Manager** — kelola host yang diberikan.\n"
+            "⭐ **Premium** — beli/perpanjang Premium untuk server yang kamu kelola.\n\n"
+            "🛡️ Global Owner Bot tetap khusus `/owner`."
         ),
         color=discord.Color.blue()
     )
@@ -16474,9 +16955,146 @@ def dm_menu_home_embed(user_id: int):
         inline=True
     )
     embed.set_footer(
-        text="/menu • Pemilik Server dan Host Manager dipisahkan"
+        text="/menu • Server Owner • Host Manager • Premium"
     )
     return embed
+
+
+def premium_purchase_home_embed(user_id: int):
+    guild_ids = premium_purchase_guild_ids(user_id)
+    premium_count = sum(
+        1 for guild_id in guild_ids
+        if premium_access_effective(guild_id)
+    )
+    embed = discord.Embed(
+        title="⭐ Premium Hi Notifku",
+        description=(
+            "Pilih server untuk membeli atau memperpanjang Premium.\n"
+            "**Pemilik Server dan Host Manager aktif dapat melakukan pembayaran.**\n\n"
+            "Premium aktif untuk **seluruh server**, bukan hanya host atau akun pembeli."
+        ),
+        color=discord.Color.gold()
+    )
+    embed.add_field(
+        name="Server tersedia",
+        value=str(len(guild_ids)),
+        inline=True
+    )
+    embed.add_field(
+        name="Premium aktif",
+        value=str(premium_count),
+        inline=True
+    )
+    embed.add_field(
+        name="Paket",
+        value=premium_packages_text()[:1024],
+        inline=False
+    )
+    embed.set_footer(text="Pilih server • pembayaran tidak mengubah hak akses Host Manager")
+    return embed
+
+
+class PremiumGuildSelect(discord.ui.Select):
+    def __init__(self, user_id: int):
+        self.user_id = int(user_id)
+        guild_ids = premium_purchase_guild_ids(self.user_id)[:25]
+        options = []
+        for guild_id in guild_ids:
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+            active = premium_access_effective(guild_id)
+            role = premium_purchase_role_label(self.user_id, guild_id)
+            options.append(
+                discord.SelectOption(
+                    label=guild.name[:100],
+                    value=str(guild_id),
+                    description=(
+                        f"{role} • {'PREMIUM' if active else 'FREE'}"
+                    )[:100],
+                    emoji="⭐" if active else "🆓"
+                )
+            )
+
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="Tidak ada server tersedia",
+                    value="0",
+                    emoji="ℹ️"
+                )
+            ]
+
+        super().__init__(
+            placeholder="Pilih server untuk Premium",
+            options=options,
+            row=0
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+
+        guild_id = int(self.values[0])
+        if not guild_id:
+            await safe_reply(interaction, "ℹ️ Tidak ada server yang dapat dipilih.")
+            return
+
+        guild = await require_premium_purchaser(interaction, guild_id)
+        if not guild:
+            return
+
+        await interaction.response.edit_message(
+            embed=premium_plan_summary_embed(guild),
+            view=UserPremiumView(guild_id, self.user_id)
+        )
+
+
+class PremiumGuildPickerView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+        self.add_item(PremiumGuildSelect(self.user_id))
+
+    @discord.ui.button(
+        label="Kembali",
+        emoji="⬅️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def back(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+
+        # Host-only users return to Host Manager; mixed/owner users return to /menu.
+        if host_manager_guild_ids(self.user_id) and not user_owned_guilds(self.user_id):
+            await interaction.response.edit_message(
+                embed=host_manager_home_embed(self.user_id),
+                view=HostManagerHomeView(self.user_id)
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
+
+    @discord.ui.button(
+        label="Menu Awal",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def home(self, interaction, button):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
+            return
+        await interaction.response.edit_message(
+            embed=dm_menu_home_embed(self.user_id),
+            view=MenuRoleChoiceView(self.user_id)
+        )
 
 
 def pending_server_access_requests(
@@ -17223,7 +17841,7 @@ class UserPremiumPackageSelect(discord.ui.Select):
     def __init__(self, guild_id: int, user_id: int):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
-        renewal = get_guild_settings(self.guild_id)["plan"] == "premium"
+        renewal = premium_access_effective(self.guild_id)
 
         options = [
             discord.SelectOption(
@@ -17253,7 +17871,7 @@ class UserPremiumPackageSelect(discord.ui.Select):
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
             return
 
-        guild = await require_server_owner(interaction, self.guild_id)
+        guild = await require_premium_purchaser(interaction, self.guild_id)
         if not guild:
             return
 
@@ -17299,7 +17917,7 @@ class UserPremiumView(discord.ui.View):
         if int(interaction.user.id) != self.user_id:
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
             return None
-        return await require_server_owner(interaction, self.guild_id)
+        return await require_premium_purchaser(interaction, self.guild_id)
 
     @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
     async def history(self, interaction, button):
@@ -17325,10 +17943,16 @@ class UserPremiumView(discord.ui.View):
         guild = await self.valid(interaction)
         if not guild:
             return
-        await interaction.response.edit_message(
-            embed=user_server_embed(guild),
-            view=UserServerMenuView(self.guild_id)
-        )
+        if is_server_owner(self.user_id, self.guild_id):
+            await interaction.response.edit_message(
+                embed=user_server_embed(guild),
+                view=UserServerMenuView(self.guild_id)
+            )
+        else:
+            await interaction.response.edit_message(
+                embed=premium_purchase_home_embed(self.user_id),
+                view=PremiumGuildPickerView(self.user_id)
+            )
 
     @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
     async def home(self, interaction, button):
@@ -17351,7 +17975,7 @@ class UserPremiumHistoryView(discord.ui.View):
         if int(interaction.user.id) != self.user_id:
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
             return
-        guild = await require_server_owner(interaction, self.guild_id)
+        guild = await require_premium_purchaser(interaction, self.guild_id)
         if not guild:
             return
         await interaction.response.edit_message(
@@ -17395,6 +18019,10 @@ class PremiumPromoModal(discord.ui.Modal):
             await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
             return
 
+        guild = await require_premium_purchaser(interaction, self.guild_id)
+        if not guild:
+            return
+
         code_value = self.code_input.value.strip().upper()
 
         try:
@@ -17405,8 +18033,6 @@ class PremiumPromoModal(discord.ui.Modal):
         except Exception as exc:
             await safe_reply(interaction, f"❌ {exc}")
             return
-
-        guild = bot.get_guild(self.guild_id)
 
         await interaction.response.edit_message(
             embed=discord.Embed(
@@ -17460,7 +18086,7 @@ class UserPremiumConfirmView(discord.ui.View):
             await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
             return
 
-        guild = await require_server_owner(interaction, self.guild_id)
+        guild = await require_premium_purchaser(interaction, self.guild_id)
         if not guild:
             return
 
@@ -17582,7 +18208,7 @@ class UserPremiumConfirmView(discord.ui.View):
         if int(interaction.user.id) != self.user_id:
             await safe_reply(interaction, "🔒 Konfirmasi ini bukan milikmu.")
             return
-        guild = await require_server_owner(interaction, self.guild_id)
+        guild = await require_premium_purchaser(interaction, self.guild_id)
         if not guild:
             return
         await interaction.response.edit_message(
@@ -17618,10 +18244,10 @@ def server_audit_timeline_embed(guild_id: int):
 
 def server_insights_embed(guild_id: int):
     guild = bot.get_guild(int(guild_id))
-    s7 = server_usage_stats(guild_id, 7)
-    s30 = server_usage_stats(guild_id, 30)
+    entitlements = premium_entitlements(int(guild_id))
+    analytics_days = int(entitlements["analytics_days"])
+    stats = server_usage_stats(guild_id, analytics_days)
     score = server_health_score(guild_id)
-    settings = get_guild_settings(guild_id)
 
     embed = discord.Embed(
         title=f"📊 Insights • {guild.name if guild else guild_id}",
@@ -17629,18 +18255,10 @@ def server_insights_embed(guild_id: int):
         color=discord.Color.green() if score >= 80 else discord.Color.orange()
     )
     embed.add_field(
-        name="7 Hari",
+        name=f"{analytics_days} Hari",
         value=(
-            f"Notif **{s7['total']}** • ✅ {s7['sent']} • ❌ {s7['failed']}\n"
-            f"Latency **{s7['latency']} ms**"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="30 Hari",
-        value=(
-            f"Notif **{s30['total']}** • ✅ {s30['sent']} • ❌ {s30['failed']}\n"
-            f"Latency **{s30['latency']} ms**"
+            f"Notif **{stats['total']}** • ✅ {stats['sent']} • ❌ {stats['failed']}\n"
+            f"Latency **{stats['latency']} ms**"
         ),
         inline=False
     )
@@ -17648,8 +18266,8 @@ def server_insights_embed(guild_id: int):
         name="Plan",
         value=(
             f"⭐ PREMIUM • {premium_expiry_text(guild_id)}"
-            if settings["plan"] == "premium"
-            else "🆓 FREE"
+            if entitlements["premium"]
+            else "🆓 FREE • analytics dibatasi 7 hari"
         ),
         inline=False
     )
@@ -17814,6 +18432,10 @@ class ServerInsightsView(discord.ui.View):
     @discord.ui.button(label="Export", emoji="📤", style=discord.ButtonStyle.primary, row=0)
     async def export(self, interaction, button):
         if not await self.valid(interaction):
+            return
+        if not await require_premium_feature(
+            interaction, self.guild_id, "data_export", "Export data server"
+        ):
             return
         json_bytes, csv_bytes = server_export_bytes(self.guild_id)
         await interaction.response.send_message(
@@ -18118,7 +18740,7 @@ class UserAddHostModal(discord.ui.Modal):
         limit = host_limit_for_guild(self.guild_id)
         if current >= limit:
             settings = get_guild_settings(self.guild_id)
-            if settings["plan"] == "premium":
+            if premium_access_effective(self.guild_id):
                 msg = f"❌ Batas host PREMIUM tercapai (**{current}/{limit}**)."
             else:
                 msg = (
@@ -18623,7 +19245,7 @@ class UserServerHostsView(discord.ui.View):
                 interaction,
                 (
                     f"❌ Batas host "
-                    f"{'PREMIUM' if settings['plan']=='premium' else 'FREE'} "
+                    f"{'PREMIUM' if premium_access_effective(self.guild_id) else 'FREE'} "
                     f"sudah tercapai (**{current}/{limit}**)."
                 )
             )
@@ -20668,7 +21290,7 @@ class ServerOwnerHostCreationApprovalView(discord.ui.View):
                 interaction,
                 (
                     f"❌ Batas host "
-                    f"{'PREMIUM' if settings['plan']=='premium' else 'FREE'} "
+                    f"{'PREMIUM' if premium_access_effective(self.guild_id) else 'FREE'} "
                     f"sudah tercapai (**{current}/{limit}**).\n"
                     "Request tetap **PENDING** sampai slot host tersedia."
                 )
@@ -21443,6 +22065,29 @@ class HostManagerHomeView(discord.ui.View):
             embed=host_manager_activity_embed(
                 self.user_id
             )
+        )
+
+    @discord.ui.button(
+        label="Premium",
+        emoji="⭐",
+        style=discord.ButtonStyle.success,
+        row=2
+    )
+    async def premium(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        if interaction.user.id != self.user_id:
+            await safe_reply(interaction, "❌ Panel ini bukan milikmu.")
+            return
+        guild_ids = premium_purchase_guild_ids(self.user_id)
+        if not guild_ids:
+            await safe_reply(interaction, "ℹ️ Tidak ada server Host Manager yang dapat dibeli Premium.")
+            return
+        await interaction.response.edit_message(
+            embed=premium_purchase_home_embed(self.user_id),
+            view=PremiumGuildPickerView(self.user_id)
         )
 
     @discord.ui.button(
@@ -22854,16 +23499,20 @@ class PaymentMethodSelectView(discord.ui.View):
             await safe_reply(interaction, "❌ Request tidak ditemukan.")
             return
 
-        guild = bot.get_guild(int(order["guild_id"]))
+        if int(order["requester_id"]) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Invoice ini bukan milikmu.")
+            return
 
+        guild = await require_premium_purchaser(
+            interaction, int(order["guild_id"])
+        )
         if not guild:
-            await safe_reply(interaction, "❌ Server tidak ditemukan.")
             return
 
         await interaction.response.edit_message(
-            embed=user_server_embed(guild),
+            embed=premium_plan_summary_embed(guild),
             attachments=[],
-            view=UserServerMenuView(guild.id)
+            view=UserPremiumView(guild.id, interaction.user.id)
         )
 
     @discord.ui.button(
@@ -22876,7 +23525,7 @@ class PaymentMethodSelectView(discord.ui.View):
         await interaction.response.edit_message(
             embed=dm_menu_home_embed(interaction.user.id),
             attachments=[],
-            view=DMUserGuildPickerView(interaction.user.id, 0)
+            view=MenuRoleChoiceView(interaction.user.id)
         )
 
 
@@ -23090,7 +23739,7 @@ class PaymentConfirmView(discord.ui.View):
         await interaction.response.edit_message(
             embed=dm_menu_home_embed(interaction.user.id),
             attachments=[],
-            view=DMUserGuildPickerView(interaction.user.id, 0)
+            view=MenuRoleChoiceView(interaction.user.id)
         )
 
 
@@ -26213,6 +26862,15 @@ class OwnerPaymentMenuView(discord.ui.View):
             view=TransactionHistoryView()
         )
 
+    @discord.ui.button(label="Premium DB", emoji="⭐", style=discord.ButtonStyle.secondary, row=0)
+    async def premium_db(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=premium_customer_database_embed(),
+            view=PremiumCustomerDatabaseView(self.viewer_id)
+        )
+
     @discord.ui.button(label="Pendapatan", emoji="💰", style=discord.ButtonStyle.secondary, row=0)
     async def revenue(self, interaction, button):
         if not await self.valid(interaction, "payment_admin"):
@@ -26276,11 +26934,7 @@ class OwnerHomeView(discord.ui.View):
         if not await self.valid_owner(interaction):
             return
         await interaction.response.edit_message(
-            embed=discord.Embed(
-                title="💳 Payment Center",
-                description="Request • Riwayat • Pendapatan",
-                color=discord.Color.gold()
-            ),
+            embed=owner_payment_menu_embed(),
             view=OwnerPaymentMenuView(interaction.user.id)
         )
 
@@ -26975,7 +27629,7 @@ class PlanServerManageView(discord.ui.View):
 
         settings = get_guild_settings(guild_id)
 
-        if settings["plan"] == "premium":
+        if premium_access_effective(guild_id):
             extend = discord.ui.Button(
                 label="Perpanjang Premium",
                 emoji="⏳",
@@ -28116,13 +28770,14 @@ class ServerOwnerView(discord.ui.View):
             return
 
         settings = get_guild_settings(guild.id)
+        effective_plan = "premium" if premium_access_effective(guild.id) else "free"
 
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title=f"⭐ Plan • {guild.name}",
                 description=(
-                    f"Plan **{settings['plan'].upper()}**\n"
-                    f"{premium_expiry_text(guild.id) if settings['plan']=='premium' else 'FREE'}"
+                    f"Plan **{effective_plan.upper()}**\n"
+                    f"{premium_expiry_text(guild.id) if effective_plan=='premium' else 'FREE'}"
                 ),
                 color=discord.Color.gold()
             ),
