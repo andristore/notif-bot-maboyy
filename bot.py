@@ -47,8 +47,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.21.0"
-CURRENT_SCHEMA_VERSION = 33
+APP_VERSION = "1.23.0"
+CURRENT_SCHEMA_VERSION = 34
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -96,6 +96,11 @@ AUTO_BACKUP_KEEP = max(1, min(30, int(os.getenv("AUTO_BACKUP_KEEP", "7"))))
 
 INVOICE_EXPIRE_MINUTES = max(10, int(os.getenv("INVOICE_EXPIRE_MINUTES", "60")))
 PREMIUM_GRACE_HOURS = max(0, int(os.getenv("PREMIUM_GRACE_HOURS", "24")))
+# Premium Trial v2: opt-in. A guild can receive the automatic trial only once.
+AUTO_PREMIUM_TRIAL_ENABLED = os.getenv("AUTO_PREMIUM_TRIAL_ENABLED", "false").lower() == "true"
+PREMIUM_TRIAL_DAYS = max(1, min(30, int(os.getenv("PREMIUM_TRIAL_DAYS", "3"))))
+# While a host is LIVE, check it more often so LIVE-ended detection is faster.
+LIVE_CHECK_INTERVAL = max(60, min(600, int(os.getenv("LIVE_CHECK_INTERVAL", "60"))))
 USER_RATE_LIMIT_SECONDS = max(2, int(os.getenv("USER_RATE_LIMIT_SECONDS", "5")))
 ERROR_ALERT_THRESHOLD = max(2, int(os.getenv("ERROR_ALERT_THRESHOLD", "5")))
 AUTO_PAUSE_ERRORS = max(ERROR_ALERT_THRESHOLD, int(os.getenv("AUTO_PAUSE_ERRORS", "20")))
@@ -2194,6 +2199,24 @@ def migrate_database():
             ON bot_update_history(sent_at DESC)
         """)
 
+        # Premium trial ledger. This table intentionally survives guild removal
+        # so leaving/rejoining cannot claim the automatic trial repeatedly.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_trials (
+                guild_id INTEGER PRIMARY KEY,
+                owner_id INTEGER,
+                started_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'auto_join',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_trials_expires
+            ON premium_trials(expires_at DESC)
+        """)
+
         if not table_exists(conn, "api_usage"):
             conn.execute("""
                 CREATE TABLE api_usage (
@@ -2398,6 +2421,133 @@ def premium_expiry_text(guild_id: int) -> str:
         return "Premium tanpa batas waktu"
 
     return f"<t:{int(expires_at)}:F> • <t:{int(expires_at)}:R>"
+
+
+def premium_trial_row(guild_id: int):
+    try:
+        with closing(db()) as conn:
+            return conn.execute(
+                "SELECT * FROM premium_trials WHERE guild_id=?",
+                (int(guild_id),)
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def premium_trial_active(guild_id: int) -> bool:
+    row = premium_trial_row(int(guild_id))
+    if not row:
+        return False
+    now = int(time.time())
+    return (
+        str(row["status"] or "") == "active"
+        and int(row["started_at"] or 0) <= now < int(row["expires_at"] or 0)
+        and get_guild_settings(int(guild_id))["plan"] == "premium"
+    )
+
+
+def maybe_activate_premium_trial(
+    guild_id: int,
+    owner_id: Optional[int],
+    source: str = "auto_join"
+) -> Optional[int]:
+    """Activate the one-time automatic trial. Returns expiry when granted."""
+    if not AUTO_PREMIUM_TRIAL_ENABLED:
+        return None
+
+    guild_id = int(guild_id)
+    ensure_guild(guild_id)
+    settings = get_guild_settings(guild_id)
+    if str(settings["plan"] or "free") == "premium":
+        return None
+
+    now = int(time.time())
+    expires_at = now + PREMIUM_TRIAL_DAYS * 86400
+
+    with closing(db()) as conn:
+        existing = conn.execute(
+            "SELECT guild_id FROM premium_trials WHERE guild_id=?",
+            (guild_id,)
+        ).fetchone()
+        if existing:
+            return None
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO premium_trials(
+                guild_id, owner_id, started_at, expires_at, source, status, created_at
+            ) VALUES(?,?,?,?,?,'active',?)
+        """, (
+            guild_id,
+            int(owner_id) if owner_id else None,
+            now,
+            expires_at,
+            str(source)[:40],
+            now
+        ))
+        conn.commit()
+        if not cur.rowcount:
+            return None
+
+    try:
+        set_plan(guild_id, "premium", duration_days=PREMIUM_TRIAL_DAYS, extend=False)
+        add_activity(
+            guild_id,
+            int(owner_id) if owner_id else None,
+            "Premium Trial Activated",
+            f"{PREMIUM_TRIAL_DAYS} hari • source={source}"
+        )
+        return expires_at
+    except Exception:
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE premium_trials SET status='failed' WHERE guild_id=?",
+                (guild_id,)
+            )
+            conn.commit()
+        raise
+
+
+def premium_trial_stats() -> dict:
+    now = int(time.time())
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) total,
+                    SUM(CASE WHEN status='active' AND expires_at>? THEN 1 ELSE 0 END) active,
+                    SUM(CASE WHEN status='active' AND expires_at<=? THEN 1 ELSE 0 END) ended,
+                    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
+                FROM premium_trials
+            """, (now, now)).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "active": int(row["active"] or 0),
+            "ended": int(row["ended"] or 0),
+            "failed": int(row["failed"] or 0),
+        }
+    except sqlite3.OperationalError:
+        return {"total": 0, "active": 0, "ended": 0, "failed": 0}
+
+
+def premium_trial_embed():
+    stats = premium_trial_stats()
+    state = "🟢 AKTIF" if AUTO_PREMIUM_TRIAL_ENABLED else "⚪ NONAKTIF"
+    embed = discord.Embed(
+        title="🎁 Premium Trial",
+        description=(
+            f"Auto Trial: **{state}**\n"
+            f"Durasi: **{PREMIUM_TRIAL_DAYS} hari**\n\n"
+            "Trial otomatis hanya diberikan **1x per server**. "
+            "Keluar lalu mengundang bot kembali tidak mereset hak trial."
+        ),
+        color=discord.Color.gold() if AUTO_PREMIUM_TRIAL_ENABLED else discord.Color.light_grey()
+    )
+    embed.add_field(name="Sedang Aktif", value=f"**{stats['active']}**", inline=True)
+    embed.add_field(name="Pernah Diberikan", value=f"**{stats['total']}**", inline=True)
+    embed.add_field(name="Selesai", value=f"**{stats['ended']}**", inline=True)
+    if stats["failed"]:
+        embed.add_field(name="Gagal Aktivasi", value=f"**{stats['failed']}**", inline=True)
+    embed.set_footer(text="Atur AUTO_PREMIUM_TRIAL_ENABLED dan PREMIUM_TRIAL_DAYS di Railway Variables")
+    return embed
 
 
 def mark_premium_warning_sent(guild_id: int, sent: bool = True):
@@ -4440,7 +4590,8 @@ def premium_status_snapshot(guild_id: int) -> dict:
     if not expires:
         return {"state": "active", "label": "⭐ PREMIUM AKTIF", "expires_at": 0, "grace_until": grace, "remaining": None}
     if now <= expires:
-        return {"state": "active", "label": "⭐ PREMIUM AKTIF", "expires_at": expires, "grace_until": grace, "remaining": expires-now}
+        label = "🎁 PREMIUM TRIAL" if premium_trial_active(int(guild_id)) else "⭐ PREMIUM AKTIF"
+        return {"state": "active", "label": label, "expires_at": expires, "grace_until": grace, "remaining": expires-now}
     effective_grace = grace or (expires + PREMIUM_GRACE_HOURS * 3600 if PREMIUM_GRACE_HOURS > 0 else 0)
     if effective_grace and now < effective_grace:
         return {"state": "grace", "label": "⚠️ GRACE PERIOD", "expires_at": expires, "grace_until": effective_grace, "remaining": effective_grace-now}
@@ -10031,6 +10182,12 @@ def verify_backup_payload(payload: dict) -> tuple[bool, str]:
     if not isinstance(guilds, list):
         return False, "Field guilds tidak valid."
 
+    checksum = str(payload.get("checksum_sha256") or "").strip().lower()
+    if checksum:
+        expected = backup_payload_checksum(payload)
+        if not hmac.compare_digest(checksum, expected):
+            return False, "Checksum backup tidak cocok. File mungkin berubah/rusak."
+
     for index, item in enumerate(guilds[:1000]):
         if not isinstance(item, dict):
             return False, f"Guild index {index} bukan object."
@@ -10937,6 +11094,85 @@ def queue_quiet_notification(
     )
 
 
+def notification_link_view(host, source_url: Optional[str], event_type: str = "") -> Optional[discord.ui.View]:
+    """Build URL buttons for notification cards. URL buttons survive retries because
+    they are reconstructed from source_url instead of being stored as View state.
+    """
+    if not source_url or not str(source_url).startswith(("http://", "https://")):
+        return None
+
+    view = discord.ui.View(timeout=None)
+    event_type = str(event_type or "").lower()
+    is_live = "live" in event_type and "end" not in event_type
+    platform = str(host["platform"] or "").lower() if host else ""
+
+    view.add_item(discord.ui.Button(
+        label="Tonton LIVE" if is_live else "Buka Konten",
+        emoji="▶️" if is_live else "🔗",
+        style=discord.ButtonStyle.link,
+        url=str(source_url)[:512]
+    ))
+
+    try:
+        profile_url = host_public_url(host, live=False)
+    except Exception:
+        profile_url = ""
+
+    if profile_url and profile_url != source_url and profile_url.startswith(("http://", "https://")):
+        platform_label = {
+            "tiktok": "Profil TikTok",
+            "youtube": "Channel YouTube",
+            "twitch": "Channel Twitch",
+            "kick": "Channel Kick",
+            "instagram": "Profil Instagram",
+            "facebook": "Halaman Facebook",
+        }.get(platform, "Buka Profil")
+        view.add_item(discord.ui.Button(
+            label=platform_label,
+            emoji="👤",
+            style=discord.ButtonStyle.link,
+            url=str(profile_url)[:512]
+        ))
+
+    return view
+
+
+def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *, test: bool = False) -> discord.Embed:
+    """Rich TikTok LIVE card inspired by modern notifier layouts.
+
+    Uses the live thumbnail/cover as both author avatar and large image when
+    TikTok/yt-dlp exposes it. If TikTok blocks metadata, the card gracefully
+    falls back to text-only instead of failing the notification.
+    """
+    data = data or {}
+    live_url = str(data.get("url") or f"https://www.tiktok.com/@{username}/live")
+    profile_url = f"https://www.tiktok.com/@{username}"
+    live_title = str(data.get("title") or "Sedang LIVE sekarang!").strip()
+    thumbnail = str(data.get("thumbnail") or "").strip()
+    display_name = str(data.get("uploader") or host["display_name"] or f"@{username}").strip()
+
+    embed = discord.Embed(
+        title=(f"{live_title} • TEST" if test else live_title)[:256],
+        url=live_url,
+        description=f"**@{username}** sedang LIVE di TikTok!",
+        color=discord.Color.from_rgb(254, 44, 85)
+    )
+
+    author_name = display_name
+    if display_name.lower().lstrip("@") != username.lower():
+        author_name = f"{display_name}  •  @{username}"
+    elif not author_name.startswith("@"):
+        author_name = f"@{username}"
+
+    if thumbnail.startswith(("http://", "https://")):
+        embed.set_author(name=author_name[:256], url=profile_url, icon_url=thumbnail)
+        embed.set_image(url=thumbnail)
+    else:
+        embed.set_author(name=author_name[:256], url=profile_url)
+
+    return embed
+
+
 async def _deliver_notification_now(
     host,
     embed: discord.Embed,
@@ -10966,6 +11202,7 @@ async def _deliver_notification_now(
     content = "\n".join(content_parts) if content_parts else None
     success_any = False
     start_ts = time.perf_counter()
+    link_view = notification_link_view(host, source_url, event_type)
     attempt_no = 1
     if event_key:
         try:
@@ -11007,6 +11244,7 @@ async def _deliver_notification_now(
                 await webhook.send(
                     content=content,
                     embed=embed,
+                    view=link_view,
                     username="Hi Notifku",
                     allowed_mentions=discord.AllowedMentions(
                         roles=True,
@@ -11067,6 +11305,7 @@ async def _deliver_notification_now(
                 message = await channel.send(
                     content=content,
                     embed=embed,
+                    view=link_view,
                     allowed_mentions=discord.AllowedMentions(
                         roles=True,
                         users=False,
@@ -11156,9 +11395,12 @@ async def resend_notification_record(record_id: int) -> bool:
         embed = discord.Embed.from_dict(
             json.loads(row["embed_json"])
         )
+        host = get_host(int(row["host_id"])) if row["host_id"] else None
+        link_view = notification_link_view(host, row["source_url"], row["event_type"]) if host else None
         await channel.send(
             content=row["content"],
             embed=embed,
+            view=link_view,
             allowed_mentions=discord.AllowedMentions(
                 roles=True,
                 users=False,
@@ -11720,18 +11962,18 @@ async def check_youtube_live(host):
             return
         creator = snippet.get("channelTitle", name)
 
+        live_title = snippet.get("title", "Live sekarang")
         embed = discord.Embed(
-            title="🔴 YouTube LIVE",
-            description=f"**{creator}** sedang live!",
+            title=str(live_title)[:256],
+            description=f"**{creator}** sedang LIVE di YouTube!",
             url=url,
             color=discord.Color.red()
         )
-
-        embed.add_field(
-            name="Judul",
-            value=snippet.get("title", "Live sekarang")[:1024],
-            inline=False
-        )
+        embed.set_author(name=str(creator)[:256], url=host_public_url(host, live=False))
+        thumbs = snippet.get("thumbnails", {}) or {}
+        thumb = (thumbs.get("maxres") or thumbs.get("standard") or thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}).get("url")
+        if thumb:
+            embed.set_image(url=thumb)
 
         custom = render_template(
             premium_host_template(host, "custom_live_message"),
@@ -11787,11 +12029,21 @@ def _tiktok_live_fallback_sync(username: str):
     if not is_live:
         return None
 
+    thumbnails = info.get("thumbnails") or []
+    thumbnail = info.get("thumbnail")
+    if not thumbnail and thumbnails:
+        for candidate in reversed(thumbnails):
+            if isinstance(candidate, dict) and candidate.get("url"):
+                thumbnail = candidate.get("url")
+                break
+
     return {
         "id": str(info.get("id") or username),
-        "title": info.get("title") or f"@{username} LIVE",
+        "title": info.get("title") or info.get("description") or f"@{username} LIVE",
         "url": info.get("webpage_url")
-        or f"https://www.tiktok.com/@{username}/live"
+        or f"https://www.tiktok.com/@{username}/live",
+        "thumbnail": thumbnail,
+        "uploader": info.get("uploader") or info.get("channel") or info.get("creator"),
     }
 
 
@@ -11840,7 +12092,9 @@ def _youtube_live_fallback_sync(channel_id: str):
         "id": str(info.get("id") or channel_id),
         "title": info.get("title") or "YouTube LIVE",
         "url": info.get("webpage_url")
-        or f"https://www.youtube.com/channel/{channel_id}/live"
+        or f"https://www.youtube.com/channel/{channel_id}/live",
+        "thumbnail": info.get("thumbnail"),
+        "uploader": info.get("uploader") or info.get("channel"),
     }
 
 
@@ -11867,17 +12121,16 @@ async def check_youtube_live_fallback(host):
     if previous and previous["is_live"] and previous["live_key"] == data["id"]:
         return True
 
+    creator = data.get("uploader") or host['display_name'] or host['target']
     embed = discord.Embed(
-        title="🔴 YouTube LIVE",
-        description=f"**{host['display_name'] or host['target']}** sedang live!",
+        title=str(data.get("title") or "YouTube LIVE")[:256],
+        description=f"**{creator}** sedang LIVE di YouTube!",
         url=data["url"],
         color=discord.Color.red()
     )
-    embed.add_field(
-        name="Judul",
-        value=data["title"][:1024],
-        inline=False
-    )
+    embed.set_author(name=str(creator)[:256], url=host_public_url(host, live=False))
+    if data.get("thumbnail"):
+        embed.set_image(url=data["thumbnail"])
 
     await send_notification(
         host,
@@ -12013,22 +12266,20 @@ async def check_generic_live(host):
     if not live_transition_confirmed(host, True, data["id"]):
         return True
 
+    creator_name = host['display_name'] or host['target']
     embed = discord.Embed(
-        title=f"🔴 {platform_display_name(platform)} LIVE",
-        description=(
-            f"**{host['display_name'] or host['target']}** sedang LIVE!"
-        ),
+        title=str(data.get("title") or f"{platform_display_name(platform)} LIVE")[:256],
+        description=f"**{creator_name}** sedang LIVE di {platform_display_name(platform)}!",
         url=data["url"],
         color=discord.Color.red()
     )
-    embed.add_field(
-        name="Judul",
-        value=str(data["title"])[:1024],
-        inline=False
-    )
+    try:
+        embed.set_author(name=str(creator_name)[:256], url=host_public_url(host, live=False))
+    except Exception:
+        pass
 
     if data.get("thumbnail"):
-        embed.set_thumbnail(url=data["thumbnail"])
+        embed.set_image(url=data["thumbnail"])
 
     await send_notification(
         host,
@@ -12227,14 +12478,15 @@ async def check_tiktok_live(host):
 
     record_api_call("tiktok", "TikTokLiveClient.is_live")
 
+    live_data = None
     try:
         live = await asyncio.wait_for(
             client.is_live(),
             timeout=25
         )
     except Exception:
-        fallback = await check_tiktok_live_fallback(host)
-        live = bool(fallback)
+        live_data = await check_tiktok_live_fallback(host)
+        live = bool(live_data)
 
     if live:
         if (not previous or not previous["is_live"]) and not live_transition_confirmed(host, True, username):
@@ -12242,12 +12494,18 @@ async def check_tiktok_live(host):
         if not previous or not previous["is_live"]:
             url = f"https://www.tiktok.com/@{username}/live"
 
-            embed = discord.Embed(
-                title="🔴 TikTok LIVE",
-                description=f"**@{username}** sedang LIVE!",
-                url=url,
-                color=discord.Color.from_rgb(0, 170, 255)
-            )
+            # Fetch rich metadata once at the LIVE transition. This is optional:
+            # notification delivery still works when TikTok blocks the metadata request.
+            if live_data is None:
+                try:
+                    live_data = await check_tiktok_live_fallback(host)
+                except Exception:
+                    log.debug("TikTok rich metadata tidak tersedia @%s", username, exc_info=True)
+
+            if live_data and live_data.get("url"):
+                url = live_data["url"]
+
+            embed = build_tiktok_live_embed(host, username, live_data)
 
             custom = render_template(
                 premium_host_template(host, "custom_live_message"),
@@ -12255,13 +12513,16 @@ async def check_tiktok_live(host):
                 url=url,
                 platform="TikTok"
             )
+            if not custom:
+                custom = f"**@{username}** sedang LIVE!"
 
+            live_key = (live_data or {}).get("id") or username
             await send_notification(
                 host,
                 embed,
                 custom,
                 event_type="tiktok_live",
-                event_key=f"tiktok:live:{username}:{int(time.time() // 60)}",
+                event_key=f"tiktok:live:{username}:{live_key}",
                 source_url=url
             )
 
@@ -12845,6 +13106,19 @@ def host_due(host, now: int) -> bool:
     try:
         if premium_entitlements(int(host["guild_id"]))["priority_polling"]:
             interval = max(60, int(interval * 0.75))
+    except Exception:
+        pass
+
+    # Smart polling v2: a currently LIVE host is checked more often so
+    # LIVE-ended notifications react faster without increasing idle traffic.
+    try:
+        state = get_live_state(
+            int(host["guild_id"]),
+            str(host["platform"]),
+            str(host["target"])
+        )
+        if state and int(state["is_live"] or 0):
+            interval = min(interval, LIVE_CHECK_INTERVAL)
     except Exception:
         pass
 
@@ -14129,15 +14403,32 @@ async def before_loop_lag_metrics():
 # AUTOMATIC BACKUP
 # ============================================================
 
+def backup_payload_checksum(payload: dict) -> str:
+    canonical = {
+        "version": int(payload.get("version") or 0),
+        "created_at": int(payload.get("created_at") or 0),
+        "guilds": payload.get("guilds") or [],
+    }
+    raw = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def create_full_backup_payload():
-    return {
-        "version": 5,
+    payload = {
+        "version": 6,
         "created_at": int(time.time()),
         "guilds": [
             export_guild_backup(guild.id)
             for guild in bot.guilds
         ],
     }
+    payload["checksum_sha256"] = backup_payload_checksum(payload)
+    return payload
 
 
 def prune_auto_backups():
@@ -25770,6 +26061,7 @@ def owner_dashboard_embed():
         ),
         inline=True
     )
+    trial_stats = premium_trial_stats()
     embed.add_field(
         name="Premium",
         value=(
@@ -25777,6 +26069,7 @@ def owner_dashboard_embed():
             f"Bukti: **{orders['proof_submitted']}**\n"
             f"Nominal Sesuai: **{orders['amount_verified']}**\n"
             f"Dibayar: **{orders['paid']}**\n"
+            f"Trial aktif: **{trial_stats['active']}**\n"
             f"Expired ≤7 hari: **{expiring_7d}**"
         ),
         inline=True
@@ -29215,6 +29508,15 @@ class OwnerPaymentMenuView(discord.ui.View):
             return
         await interaction.response.edit_message(embed=premium_usage_embed(), view=OwnerPaymentMenuView(self.viewer_id))
 
+    @discord.ui.button(label="Trial", emoji="🎁", style=discord.ButtonStyle.secondary, row=1)
+    async def premium_trial(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=premium_trial_embed(),
+            view=OwnerPaymentMenuView(self.viewer_id)
+        )
+
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction, button):
         if not await self.valid(interaction):
@@ -31728,23 +32030,31 @@ class HostCardView(discord.ui.View):
         if not host:
             return
 
-        url = f"https://www.tiktok.com/@{host['target']}/live"
+        username = str(host['target']).lstrip("@")
+        url = f"https://www.tiktok.com/@{username}/live"
+        live_data = None
+        try:
+            live_data = await check_tiktok_live_fallback(host)
+        except Exception:
+            log.debug("Metadata test TikTok tidak tersedia @%s", username, exc_info=True)
+        if live_data and live_data.get("url"):
+            url = live_data["url"]
 
-        embed = discord.Embed(
-            title="🔴 TikTok LIVE • TEST",
-            description=f"**@{host['target']}** sedang LIVE!",
-            url=url,
-            color=discord.Color.from_rgb(0, 170, 255)
-        )
+        embed = build_tiktok_live_embed(host, username, live_data, test=True)
 
         custom = render_template(
             premium_host_template(host, "custom_live_message"),
-            creator=f"@{host['target']}",
+            creator=f"@{username}",
             url=url,
             platform="TikTok"
-        )
+        ) or f"**@{username}** sedang LIVE!"
 
-        ok = await send_notification(host, embed, custom)
+        ok = await send_notification(
+            host, embed, custom,
+            event_type="tiktok_live_test",
+            source_url=url,
+            dedupe=False
+        )
 
         await safe_reply(
             interaction,
@@ -33047,6 +33357,9 @@ async def on_guild_update(
 async def on_guild_join(guild: discord.Guild):
     try:
         ensure_guild(guild.id)
+        trial_expires_at = maybe_activate_premium_trial(
+            guild.id, guild.owner_id, source="auto_join"
+        )
 
         verified = await refresh_guild_owner_verification(
             guild,
@@ -33086,10 +33399,15 @@ async def on_guild_join(guild: discord.Guild):
         try:
             owner_user = guild.owner or await guild.fetch_member(guild.owner_id)
             if verified:
+                trial_text = (
+                    f"\n🎁 Premium Trial **{PREMIUM_TRIAL_DAYS} hari** aktif sampai <t:{trial_expires_at}:F>."
+                    if trial_expires_at else ""
+                )
                 await owner_user.send(
                     "✅ **Hi Notifku berhasil masuk ke servermu.**\n"
                     "Status Pemilik Server: **TERVERIFIKASI**.\n"
                     "Gunakan `/menu` di DM untuk mengatur server."
+                    + trial_text
                 )
             else:
                 await owner_user.send(
