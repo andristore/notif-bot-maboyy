@@ -1,0 +1,8 @@
+{
+  "version": "2.3",
+  "changes": [
+    "Info Update otomatis setelah versi baru dijalankan.",
+    "Pengaturan channel dan pratinjau pengumuman khusus owner.",
+    "Pencatatan versi untuk mencegah pengumuman berulang saat restart."
+  ]
+}
