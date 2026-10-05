@@ -12,11 +12,61 @@ import sqlite3
 import shutil
 import socket
 import traceback
+import re
+import tempfile
+import zipfile
+from urllib.parse import quote, urlparse
 from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
+
+APP_VERSION = "1.25.3"
+CURRENT_SCHEMA_VERSION = 36
+
+# Shared helpers are bundled here so uploading bot.py needs no package folder.
+
+def core_redact_text(value, secret_values=()) -> str:
+    text = str(value or "")
+    for secret in secret_values:
+        secret = str(secret or "")
+        if len(secret) >= 6:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*(?:bot\s+)?)\S+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(token|secret|api[_-]?key|password)(\s*[:=]\s*)[^\s,;]+", r"\1\2[REDACTED]", text)
+    return text
+
+def core_current_rss_mb() -> float:
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8", errors="ignore")
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    return 0.0
+
+def core_files_status(base_dir=".") -> dict:
+    base = Path(base_dir)
+    required = ["bot.py", "requirements.txt", "Procfile"]
+    missing = [item for item in required if not (base / item).exists()]
+    return {"ok": not missing, "missing": missing, "total": len(required)}
+
+def deployment_checks(*, discord_token: str, owner_ids, db_path: str, backup_dir: str, qris_dir: str, required_guild_id: int, youtube_api_key: str):
+    checks = []
+    checks.append(("Discord token", bool(discord_token), "terisi" if discord_token else "DISCORD_TOKEN kosong"))
+    checks.append(("Global owner", bool(owner_ids), f"{len(owner_ids)} owner" if owner_ids else "OWNER_IDS kosong"))
+    checks.append(("Support server", bool(required_guild_id), str(required_guild_id) if required_guild_id else "REQUIRED_GUILD_ID kosong"))
+    checks.append(("YouTube API", bool(youtube_api_key), "terisi" if youtube_api_key else "kosong; YouTube API dapat terbatas"))
+    persistent = str(Path(db_path)).startswith("/data/")
+    checks.append(("Database persistent", persistent, str(db_path)))
+    backup_persistent = str(Path(backup_dir)).startswith("/data/")
+    checks.append(("Backup persistent", backup_persistent, str(backup_dir)))
+    qris_persistent = str(Path(qris_dir)).startswith("/data/")
+    checks.append(("QRIS persistent", qris_persistent, str(qris_dir)))
+    return checks
+
 
 import aiohttp
 from aiohttp import web
@@ -47,8 +97,6 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.24.0"
-CURRENT_SCHEMA_VERSION = 35
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -353,28 +401,63 @@ def normalize_social_target(platform: str, target: str) -> str:
     return target
 
 
+def canonical_tiktok_username(value: str) -> str:
+    """Return a clean TikTok username safe for public profile/LIVE URLs."""
+    raw = str(value or "").strip()
+    raw = re.sub(r"^https?://(?:www\.)?tiktok\.com/@", "", raw, flags=re.I)
+    raw = raw.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
+    raw = raw.lstrip("@").strip()
+    # TikTok usernames use letters, numbers, underscore and dot. Removing other
+    # characters prevents Discord link buttons from receiving malformed URLs.
+    return re.sub(r"[^A-Za-z0-9._]", "", raw)
+
+
+def canonical_tiktok_url(value: str, *, live: bool = False) -> str:
+    username = canonical_tiktok_username(value)
+    if not username:
+        return ""
+    encoded = quote(username, safe="._")
+    suffix = "/live" if live else ""
+    return f"https://www.tiktok.com/@{encoded}{suffix}"
+
+
+def valid_public_http_url(value: str) -> str:
+    """Validate URLs before they are attached to Discord link buttons."""
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 512:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if any(ch in raw for ch in ("\n", "\r", "\t", " ")):
+        return ""
+    return raw
+
+
 def host_public_url(host, *, live: bool = False) -> str:
-    platform = host["platform"]
-    target = str(host["target"]).strip()
+    platform = str(host["platform"] or "").lower().strip()
+    target = str(host["target"] or "").strip()
 
     if platform == "youtube":
         return f"https://www.youtube.com/channel/{target}/live" if live else f"https://www.youtube.com/channel/{target}"
 
     if platform == "tiktok":
-        username = target.lstrip("@")
-        return f"https://www.tiktok.com/@{username}/live" if live else f"https://www.tiktok.com/@{username}"
+        return canonical_tiktok_url(target, live=live)
 
     if platform == "twitch":
-        return f"https://www.twitch.tv/{target.lstrip('@')}"
+        return f"https://www.twitch.tv/{quote(target.lstrip('@'), safe='._-')}"
 
     if platform == "kick":
-        return f"https://kick.com/{target.lstrip('@')}"
+        return f"https://kick.com/{quote(target.lstrip('@'), safe='._-')}"
 
     if platform == "instagram":
-        return f"https://www.instagram.com/{target.lstrip('@')}/"
+        return f"https://www.instagram.com/{quote(target.lstrip('@'), safe='._')}/"
 
     if platform == "facebook":
-        return target if target.startswith(("http://", "https://")) else f"https://www.facebook.com/{target.lstrip('@')}"
+        return target if target.startswith(("http://", "https://")) else f"https://www.facebook.com/{quote(target.lstrip('@'), safe='._-')}"
 
     return target
 
@@ -2285,6 +2368,10 @@ def migrate_database():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_notification_history_guild
             ON notification_history(guild_id, created_at DESC)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_notification_history_event_delivery
+            ON notification_history(host_id, event_key, event_type, status)
         """)
 
         conn.execute("""
@@ -5763,10 +5850,16 @@ async def process_verified_payment_event(
     except Exception:
         raise ValueError("amount wajib berupa integer.")
 
+    if isinstance(payload.get("amount"), (bool, float)) or amount < 0:
+        raise ValueError("amount wajib berupa integer non-negatif.")
+
     if not event_id or not invoice_ref or not reference_id:
         raise ValueError(
             "event_id, invoice_ref, dan reference_id wajib diisi."
         )
+
+    if any(len(value) > 160 for value in (event_id, invoice_ref, reference_id)):
+        raise ValueError("ID callback maksimal 160 karakter.")
 
     paid_states = {"paid", "success", "settled", "completed"}
     failed_states = {"failed", "cancelled", "canceled", "expired"}
@@ -5801,15 +5894,38 @@ async def process_verified_payment_event(
             "message": "Status pembayaran bukan sukses."
         }
 
-    expected = int(order["expected_amount"] or order["price"])
-    matched = amount == expected
-    late = bool(
-        order["invoice_deadline"]
-        and now > int(order["invoice_deadline"])
-        and not order["activated_at"]
-    )
-
     with closing(db()) as conn:
+        # Re-read under the write lock: callbacks must not overwrite activation
+        # or an owner's rejection/refund while another delivery is awaiting I/O.
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute(
+            "SELECT * FROM premium_orders WHERE id=?", (int(order["id"]),)
+        ).fetchone()
+        if not order:
+            raise ValueError("Invoice callback tidak ditemukan.")
+        status = str(order["status"])
+        if status in {"rejected", "refunded", "refund_pending", "refund_failed", "expired"}:
+            return {"ok": True, "activated": False,
+                    "message": "Invoice sudah ditutup; callback diabaikan."}
+        if order["activated_at"] or status == "active":
+            return {"ok": True, "activated": status == "active",
+                    "message": "Invoice sudah diaktivasi; callback tidak mengubahnya."}
+        if status == "processing":
+            raise ValueError("Invoice sedang diaktivasi; callback perlu dicoba ulang.")
+
+        expected = int(order["expected_amount"] or order["price"])
+        matched = amount == expected
+        late = bool(order["invoice_deadline"] and now > int(order["invoice_deadline"]))
+        next_status = (
+            "late_payment" if late and matched else
+            "amount_verified" if matched else
+            "underpaid" if amount < expected else "overpaid"
+        )
+        # A verified 'paid' invoice is already in the next stage of the workflow.
+        if status == "paid" and matched:
+            next_status = "paid"
+        if not payment_transition_allowed(status, next_status):
+            raise ValueError(f"Transisi callback tidak valid: {status} → {next_status}")
         conn.execute("""
             UPDATE premium_orders
             SET
@@ -5833,15 +5949,7 @@ async def process_verified_payment_event(
             source,
             now,
             1 if late else 0,
-            (
-                "late_payment"
-                if late and matched
-                else "amount_verified"
-                if matched
-                else "underpaid"
-                if amount < expected
-                else "overpaid"
-            ),
+            next_status,
             now,
             int(order["id"])
         ))
@@ -5876,6 +5984,10 @@ async def process_verified_payment_event(
             "activated": False,
             "message": "Late payment menunggu review."
         }
+
+    if not AUTO_ACTIVATE_VERIFIED_PAYMENTS:
+        return {"ok": True, "activated": False,
+                "message": "Pembayaran terverifikasi; aktivasi otomatis dinonaktifkan."}
 
     ok, message = await activate_verified_premium_order(
         int(order["id"]),
@@ -5921,6 +6033,12 @@ async def payment_webhook_handler(request: web.Request):
         reference_id = str(payload.get("reference_id") or "").strip()
         amount = int(payload.get("amount"))
         payment_status = str(payload.get("status") or "").strip()
+        if isinstance(payload.get("amount"), (bool, float)) or amount < 0:
+            raise ValueError("Invalid amount")
+        if any(not value or len(value) > 160 for value in (event_id, invoice_ref, reference_id)):
+            raise ValueError("Invalid callback ID")
+        if payment_status.lower() not in {"paid", "success", "settled", "completed", "failed", "cancelled", "canceled", "expired"}:
+            raise ValueError("Invalid callback status")
     except Exception:
         return web.json_response(
             {"ok": False, "error": "invalid_payload"},
@@ -5940,10 +6058,16 @@ async def payment_webhook_handler(request: web.Request):
     )
 
     if not inserted:
-        return web.json_response(
-            {"ok": True, "duplicate": True},
-            status=200
-        )
+        with closing(db()) as conn:
+            existing = conn.execute(
+                "SELECT payload_hash, process_status FROM payment_callback_events WHERE event_id=?",
+                (event_id,)
+            ).fetchone()
+        if not existing or existing["payload_hash"] != payload_hash:
+            return web.json_response({"ok": False, "error": "event_id_conflict"}, status=409)
+        if existing["process_status"] == "processed":
+            return web.json_response({"ok": True, "duplicate": True}, status=200)
+        # A callback recorded just before a crash can still be completed on redelivery.
 
     try:
         result = await process_verified_payment_event(payload)
@@ -8598,16 +8722,10 @@ def make_error_id() -> str:
 
 
 def redact_secrets(value) -> str:
-    text = str(value or "")
-    secret_values = [DISCORD_TOKEN, YOUTUBE_API_KEY, PAYMENT_WEBHOOK_SECRET, BACKUP_ENCRYPTION_PASSWORD, AUDIT_WEBHOOK_URL]
-    for secret in secret_values:
-        if secret and len(secret) >= 6:
-            text = text.replace(secret, "[REDACTED]")
-    # Discord bot tokens commonly have dot-separated token segments.
-    import re
-    text = re.sub(r"(?i)(authorization\s*[:=]\s*(?:bot\s+)?)\S+", r"\1[REDACTED]", text)
-    text = re.sub(r"(?i)(token|secret|api[_-]?key|password)(\s*[:=]\s*)[^\s,;]+", r"\1\2[REDACTED]", text)
-    return text
+    return core_redact_text(
+        value,
+        [DISCORD_TOKEN, YOUTUBE_API_KEY, PAYMENT_WEBHOOK_SECRET, BACKUP_ENCRYPTION_PASSWORD, AUDIT_WEBHOOK_URL]
+    )
 
 
 async def report_interaction_error(
@@ -11192,46 +11310,66 @@ def queue_quiet_notification(
 
 
 def notification_link_view(host, source_url: Optional[str], event_type: str = "") -> Optional[discord.ui.View]:
-    """Build URL buttons for notification cards. URL buttons survive retries because
-    they are reconstructed from source_url instead of being stored as View state.
+    """Build validated, unique URL buttons for notification cards.
+
+    v1.25.2 fixes TikTok profile buttons by always rebuilding the profile URL
+    from the stored username instead of trusting a possibly malformed target.
     """
-    if not source_url or not str(source_url).startswith(("http://", "https://")):
+    source = valid_public_http_url(source_url)
+    event_type = str(event_type or "").lower()
+    is_live = "live" in event_type and "end" not in event_type
+    platform = str(host["platform"] or "").lower().strip() if host else ""
+
+    # Prefer canonical platform URLs. TikTok metadata can occasionally return a
+    # redirect/tracking URL; the canonical URL is more reliable in Discord mobile.
+    if host and platform == "tiktok":
+        canonical_live = valid_public_http_url(host_public_url(host, live=is_live))
+        if is_live and canonical_live:
+            source = canonical_live
+
+    if not source:
         return None
 
     view = discord.ui.View(timeout=None)
-    event_type = str(event_type or "").lower()
-    is_live = "live" in event_type and "end" not in event_type
-    platform = str(host["platform"] or "").lower() if host else ""
+    added_urls = set()
 
-    view.add_item(discord.ui.Button(
-        label="Tonton LIVE" if is_live else "Buka Konten",
-        emoji="▶️" if is_live else "🔗",
-        style=discord.ButtonStyle.link,
-        url=str(source_url)[:512]
-    ))
+    def add_link(label: str, emoji: str, url: str) -> None:
+        clean = valid_public_http_url(url)
+        if not clean:
+            return
+        fingerprint = clean.rstrip("/").lower()
+        if fingerprint in added_urls:
+            return
+        added_urls.add(fingerprint)
+        view.add_item(discord.ui.Button(
+            label=label,
+            emoji=emoji,
+            style=discord.ButtonStyle.link,
+            url=clean
+        ))
+
+    add_link(
+        "Tonton LIVE" if is_live else "Buka Konten",
+        "▶️" if is_live else "🔗",
+        source
+    )
 
     try:
         profile_url = host_public_url(host, live=False)
     except Exception:
         profile_url = ""
 
-    if profile_url and profile_url != source_url and profile_url.startswith(("http://", "https://")):
-        platform_label = {
-            "tiktok": "Profil TikTok",
-            "youtube": "Channel YouTube",
-            "twitch": "Channel Twitch",
-            "kick": "Channel Kick",
-            "instagram": "Profil Instagram",
-            "facebook": "Halaman Facebook",
-        }.get(platform, "Buka Profil")
-        view.add_item(discord.ui.Button(
-            label=platform_label,
-            emoji="👤",
-            style=discord.ButtonStyle.link,
-            url=str(profile_url)[:512]
-        ))
+    platform_label = {
+        "tiktok": "Profil TikTok",
+        "youtube": "Channel YouTube",
+        "twitch": "Channel Twitch",
+        "kick": "Channel Kick",
+        "instagram": "Profil Instagram",
+        "facebook": "Halaman Facebook",
+    }.get(platform, "Buka Profil")
+    add_link(platform_label, "👤", profile_url)
 
-    return view
+    return view if view.children else None
 
 
 def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *, test: bool = False) -> discord.Embed:
@@ -11242,16 +11380,20 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
     falls back to text-only instead of failing the notification.
     """
     data = data or {}
-    live_url = str(data.get("url") or f"https://www.tiktok.com/@{username}/live")
-    profile_url = f"https://www.tiktok.com/@{username}"
-    live_title = str(data.get("title") or "Sedang LIVE sekarang!").strip()
+    username = canonical_tiktok_username(username)
+    live_url = canonical_tiktok_url(username, live=True)
+    profile_url = canonical_tiktok_url(username, live=False)
+    # v1.25.1: one piece of information gets one visual location.
+    # Creator identity lives in the author row, LIVE state lives in Status,
+    # and the title is reserved for the actual stream title. This prevents
+    # @username / LIVE text from being repeated inside the same card.
+    live_title = str(data.get("title") or "TikTok LIVE").strip()
     thumbnail = str(data.get("thumbnail") or "").strip()
     display_name = str(data.get("uploader") or host["display_name"] or f"@{username}").strip()
 
     embed = discord.Embed(
         title=(f"{live_title} • TEST" if test else live_title)[:256],
         url=live_url,
-        description=f"**@{username}** sedang LIVE di TikTok!",
         color=discord.Color.from_rgb(254, 44, 85)
     )
 
@@ -11285,6 +11427,40 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
     return embed
 
 
+def suppress_redundant_live_content(host, content: Optional[str], event_type: str) -> Optional[str]:
+    """Hide only stock LIVE text that repeats the identity already in the card.
+
+    Role mentions are assembled separately, and genuinely custom Premium text is
+    preserved. This targets the old default forms such as
+    '@user sedang LIVE!' / '@user sedang LIVE di TikTok!'.
+    """
+    if not content or "live" not in str(event_type or "").lower():
+        return content
+    platform = str(host["platform"] or "").lower().strip() if host else ""
+    if platform != "tiktok":
+        return content
+    username = canonical_tiktok_username(host["target"] if host else "")
+    if not username:
+        return content
+    text = str(content).strip()
+    # Strip the canonical LIVE/profile URLs before comparing old stock templates.
+    for url in (canonical_tiktok_url(username, live=True), canonical_tiktok_url(username, live=False)):
+        text = text.replace(url, "").strip()
+    normalized = re.sub(r"[*_`~]", "", text).strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    candidates = {
+        f"@{username.lower()} sedang live!",
+        f"{username.lower()} sedang live!",
+        f"@{username.lower()} sedang live",
+        f"{username.lower()} sedang live",
+        f"@{username.lower()} sedang live di tiktok!",
+        f"{username.lower()} sedang live di tiktok!",
+        f"@{username.lower()} sedang live di tiktok",
+        f"{username.lower()} sedang live di tiktok",
+    }
+    return None if normalized in candidates else content
+
+
 async def _deliver_notification_now(
     host,
     embed: discord.Embed,
@@ -11292,9 +11468,11 @@ async def _deliver_notification_now(
     *,
     event_type: str,
     event_key: Optional[str],
-    source_url: Optional[str]
+    source_url: Optional[str],
+    skip_sent: bool = False
 ) -> bool:
     apply_host_embed_branding(host, embed)
+    content_override = suppress_redundant_live_content(host, content_override, event_type)
 
     role_ids = host_mention_roles(host)
     content_parts = [f"<@&{rid}>" for rid in role_ids]
@@ -11313,6 +11491,17 @@ async def _deliver_notification_now(
 
     content = "\n".join(content_parts) if content_parts else None
     success_any = False
+    success_all = True
+    sent_channels = set()
+    webhook_sent = False
+    if skip_sent and event_key:
+        with closing(db()) as conn:
+            receipts = conn.execute("""
+                SELECT channel_id FROM notification_history
+                WHERE host_id=? AND event_key=? AND event_type=? AND status='sent'
+            """, (int(host["id"]), str(event_key)[:300], str(event_type)[:80])).fetchall()
+        sent_channels = {int(row["channel_id"]) for row in receipts if row["channel_id"] is not None}
+        webhook_sent = any(row["channel_id"] is None for row in receipts)
     start_ts = time.perf_counter()
     link_view = notification_link_view(host, source_url, event_type)
     attempt_no = 1
@@ -11341,8 +11530,14 @@ async def _deliver_notification_now(
     channels = host_delivery_channels(host)
     primary_channel = channels[0] if channels else None
 
+    if webhook_sent and webhook_url:
+        success_any = True
+        channels = channels[1:]
+
     if (
         webhook_url
+        and not webhook_sent
+        and primary_channel not in sent_channels
         and premium_feature_enabled(int(host["guild_id"]), "webhook")
         and http is not None
         and not http.closed
@@ -11392,9 +11587,13 @@ async def _deliver_notification_now(
             channels = channels[1:]
 
     for channel_id in channels:
+        if channel_id in sent_channels:
+            success_any = True
+            continue
         channel = await resolve_channel(channel_id)
 
         if not channel:
+            success_all = False
             runtime_metrics["notifications_failed"] += 1
             record_notification_history(
                 guild_id=int(host["guild_id"]),
@@ -11445,6 +11644,7 @@ async def _deliver_notification_now(
                 embed=embed
             )
         except Exception:
+            success_all = False
             runtime_metrics["notifications_failed"] += 1
             log.exception(
                 "Delivery gagal host_id=%s channel_id=%s",
@@ -11486,11 +11686,11 @@ async def _deliver_notification_now(
     record_delivery_attempt(
         guild_id=int(host["guild_id"]), host_id=int(host["id"]),
         event_type=event_type, event_key=event_key, attempt_no=attempt_no,
-        status="sent" if success_any else "failed",
-        error=None if success_any else "Semua jalur delivery gagal.",
+        status="sent" if success_any and success_all else "partial" if success_any else "failed",
+        error=None if success_any and success_all else "Satu atau lebih jalur delivery gagal.",
         latency_ms=total_latency
     )
-    return success_any
+    return success_any and success_all
 
 
 async def resend_notification_record(record_id: int) -> bool:
@@ -11794,6 +11994,14 @@ def notifier_stats_embed(guild_id: int) -> discord.Embed:
     return embed
 
 
+def notifications_paused() -> bool:
+    return bool(
+        runtime_setting_enabled("notifications_paused")
+        or runtime_setting_enabled("maintenance_all")
+        or feature_maintenance_enabled("notifications")
+    )
+
+
 async def send_notification(
     host,
     embed: discord.Embed,
@@ -11804,16 +12012,17 @@ async def send_notification(
     source_url: Optional[str] = None,
     dedupe: bool = True
 ):
-    if (
-        runtime_setting_enabled("notifications_paused")
-        or runtime_setting_enabled("maintenance_all")
-        or feature_maintenance_enabled("notifications")
-    ):
+    paused = notifications_paused()
+    if paused:
         log.warning(
             "Notifikasi ditahan oleh Emergency Mode host_id=%s",
             host["id"]
         )
-        return False
+
+    # Give keyless notifications an identity so channel-level retries can skip
+    # successful destinations without disabling explicit manual resends.
+    if not event_key:
+        event_key = f"delivery:{host['id']}:{time.time_ns()}"
 
     if dedupe and event_key:
         if not reserve_notification_event(
@@ -11827,6 +12036,19 @@ async def send_notification(
                 event_key
             )
             return True
+
+    if paused:
+        try:
+            queue_notification_retry(
+                host, embed, content_override,
+                event_type=event_type, event_key=event_key, source_url=source_url,
+                last_error="Delivery ditahan oleh Emergency Mode."
+            )
+            return True
+        except Exception:
+            if dedupe:
+                release_notification_event(int(host["id"]), event_key, event_type)
+            raise
 
     if host_quiet_now(host):
         try:
@@ -11867,6 +12089,10 @@ async def send_notification(
                     int(host["id"]), event_key, event_type
                 )
             raise
+
+        # The event has been accepted durably even when Discord delivery is
+        # deferred. Checkers can advance their platform state safely.
+        return True
 
     return delivered
 
@@ -12603,6 +12829,7 @@ async def check_tiktok_live(host):
         live = bool(live_data)
 
     if live:
+        live_key = str(previous["live_key"] or username) if previous else username
         if (not previous or not previous["is_live"]) and not live_transition_confirmed(host, True, username):
             return
         if not previous or not previous["is_live"]:
@@ -12627,10 +12854,15 @@ async def check_tiktok_live(host):
                 url=url,
                 platform="TikTok"
             )
+            # Default notification does not repeat the creator above the embed.
+            # A custom Premium message is still respected when the server set one.
             if not custom:
-                custom = f"**@{username}** sedang LIVE!"
+                custom = None
 
-            live_key = (live_data or {}).get("id") or username
+            # Without a room ID, give each confirmed LIVE session a new key.
+            # A username alone incorrectly suppresses every subsequent session.
+            metadata_key = str((live_data or {}).get("id") or "")
+            live_key = metadata_key if metadata_key and metadata_key.lstrip("@") != username else f"{username}:{time.time_ns()}"
             await send_notification(
                 host,
                 embed,
@@ -12645,7 +12877,7 @@ async def check_tiktok_live(host):
             "tiktok",
             username,
             True,
-            username
+            live_key
         )
 
     else:
@@ -14337,6 +14569,8 @@ async def before_monitor():
 
 @tasks.loop(minutes=1)
 async def pending_notification_loop():
+    if notifications_paused():
+        return
     now = int(time.time())
 
     with closing(db()) as conn:
@@ -14350,6 +14584,8 @@ async def pending_notification_loop():
         """, (now, now - NOTIFICATION_CLAIM_TIMEOUT_SECONDS, RUNTIME_SESSION_ID)).fetchall()
 
     for row in rows:
+        if notifications_paused():
+            break
         if not claim_pending_notification(int(row["id"])):
             continue
         host = get_host(int(row["host_id"]))
@@ -14380,7 +14616,8 @@ async def pending_notification_loop():
                 row["content"],
                 event_type=row["event_type"] or "queued",
                 event_key=row["event_key"],
-                source_url=row["source_url"]
+                source_url=row["source_url"],
+                skip_sent=True
             )
 
             if ok:
@@ -14470,7 +14707,13 @@ async def event_cleanup_loop():
             (cutoff,)
         )
         conn.execute(
-            "DELETE FROM notification_history WHERE created_at<?",
+            """DELETE FROM notification_history WHERE created_at<?
+               AND NOT EXISTS (
+                   SELECT 1 FROM pending_notifications p
+                   WHERE p.host_id=notification_history.host_id
+                     AND p.event_key=notification_history.event_key
+                     AND p.event_type=notification_history.event_type
+               )""",
             (cutoff,)
         )
         conn.execute(
@@ -14561,6 +14804,19 @@ def prune_auto_backups():
                 pass
     except Exception:
         log.exception("Gagal membersihkan backup lama")
+
+
+def prune_system_backups():
+    """Keep the newest full backups across encrypted and plain formats."""
+    folder = Path(AUTO_BACKUP_DIR)
+    files = sorted(
+        [*folder.glob("hi-notifku-system-*.zip"),
+         *folder.glob("hi-notifku-system-*.hnbak")],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+    for old in files[AUTO_BACKUP_KEEP:]:
+        old.unlink()
 
 
 
@@ -14949,148 +15205,109 @@ def export_guild_backup(guild_id: int) -> dict:
 
 
 def restore_guild_backup(data: dict, target_guild_id: int):
+    """Merge a guild snapshot atomically, preserving subscription timestamps."""
     if not isinstance(data, dict):
         raise ValueError("Backup JSON tidak valid.")
-
     cfg = data.get("guild_config") or {}
     settings = data.get("guild_settings") or {}
     hosts = data.get("hosts") or []
+    if not isinstance(cfg, dict) or not isinstance(settings, dict) or not isinstance(hosts, list):
+        raise ValueError("Struktur backup tidak valid.")
+    plan = settings.get("plan", "free")
+    if plan not in {"free", "premium"}:
+        raise ValueError("Paket pada backup tidak valid.")
+    if plan == "premium" and "premium_expires_at" not in settings:
+        raise ValueError("Backup Premium tidak memiliki tanggal expiry; gunakan backup terbaru.")
+    ZoneInfo(settings.get("timezone") or "Asia/Jakarta")
 
-    ensure_guild(target_guild_id)
-
-    set_default_channel(
-        target_guild_id,
-        "youtube",
-        cfg.get("youtube_channel_id")
+    host_fields = (
+        "display_name", "extra", "channel_id", "role_id", "check_interval",
+        "notify_live_end", "custom_live_message", "custom_post_message",
+        "custom_end_message", "enabled", "extra_channel_ids", "extra_role_ids",
+        "schedule_days", "quiet_start", "quiet_end", "timezone", "language",
+        "webhook_url", "mention_everyone", "embed_title", "embed_footer",
+        "embed_color", "auto_pause_threshold"
     )
-    set_default_channel(
-        target_guild_id,
-        "tiktok",
-        cfg.get("tiktok_channel_id")
-    )
-    set_default_role(
-        target_guild_id,
-        cfg.get("mention_role_id")
-    )
-    set_log_channel(
-        target_guild_id,
-        cfg.get("log_channel_id")
-    )
-
-    set_plan(
-        target_guild_id,
-        settings.get("plan", "free")
-    )
-    set_access_state(
-        target_guild_id,
-        settings.get("access_state", "allowed")
-    )
-
-    set_guild_notifier_settings(
-        target_guild_id,
-        timezone_name=settings.get("timezone") or "Asia/Jakarta",
-        language=settings.get("language") or "id",
-        maintenance_mode=bool(settings.get("maintenance_mode", 0))
-    )
-
-    if settings.get("feature_flags"):
-        with closing(db()) as conn:
-            conn.execute(
-                "UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
-                (settings.get("feature_flags"), target_guild_id)
-            )
-            conn.commit()
-
-    restored = 0
-
+    prepared = []
     for raw in hosts:
-        if raw.get("platform") not in SUPPORTED_PLATFORMS:
-            continue
-
-        target = str(raw.get("target") or "").strip()
+        if not isinstance(raw, dict):
+            raise ValueError("Data host pada backup tidak valid.")
+        platform_name = raw.get("platform")
+        if platform_name not in SUPPORTED_PLATFORMS:
+            raise ValueError("Platform host pada backup tidak didukung.")
+        target = normalize_social_target(platform_name, str(raw.get("target") or ""))
         if not target:
-            continue
+            raise ValueError("Target host pada backup kosong.")
+        if raw.get("timezone"):
+            ZoneInfo(raw["timezone"])
+        values = {key: raw.get(key) for key in host_fields}
+        values.update(
+            check_interval=max(60, int(raw.get("check_interval") or DEFAULT_CHECK_INTERVAL)),
+            enabled=int(bool(raw.get("enabled", 1))),
+            notify_live_end=int(bool(raw.get("notify_live_end"))),
+            mention_everyone=int(bool(raw.get("mention_everyone"))),
+            schedule_days=raw.get("schedule_days") or "0,1,2,3,4,5,6"
+        )
+        prepared.append((platform_name, target, values))
 
+    guild_id = int(target_guild_id)
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            add_host(
-                target_guild_id,
-                raw["platform"],
-                target,
-                raw.get("display_name"),
-                raw.get("extra")
-            )
-        except ValueError:
-            break
+            conn.execute("INSERT OR IGNORE INTO guild_config(guild_id) VALUES(?)", (guild_id,))
+            conn.execute("INSERT OR IGNORE INTO guild_settings(guild_id,plan) VALUES(?,'free')", (guild_id,))
+            conn.execute("""
+                UPDATE guild_config SET youtube_channel_id=?, tiktok_channel_id=?,
+                    mention_role_id=?, log_channel_id=? WHERE guild_id=?
+            """, (cfg.get("youtube_channel_id"), cfg.get("tiktok_channel_id"),
+                  cfg.get("mention_role_id"), cfg.get("log_channel_id"), guild_id))
+            conn.execute("""
+                UPDATE guild_settings SET plan=?, premium_started_at=?,
+                    premium_expires_at=?, premium_warning_sent=?, premium_grace_until=?,
+                    access_state=?, timezone=?, language=?, maintenance_mode=?
+                WHERE guild_id=?
+            """, (plan,
+                  settings.get("premium_started_at") if plan == "premium" else None,
+                  settings.get("premium_expires_at") if plan == "premium" else None,
+                  int(bool(settings.get("premium_warning_sent"))),
+                  settings.get("premium_grace_until") if plan == "premium" else None,
+                  settings.get("access_state") or "allowed",
+                  settings.get("timezone") or "Asia/Jakarta",
+                  settings.get("language") if settings.get("language") in {"id", "en"} else "id",
+                  int(bool(settings.get("maintenance_mode"))), guild_id))
+            if settings.get("feature_flags"):
+                conn.execute("UPDATE guild_settings SET feature_flags=? WHERE guild_id=?",
+                             (settings["feature_flags"], guild_id))
 
-        with closing(db()) as conn:
-            row = conn.execute("""
-                SELECT id FROM hosts
-                WHERE guild_id=? AND platform=? AND target=?
-            """, (
-                target_guild_id,
-                raw["platform"],
-                target
-            )).fetchone()
+            field_names = ",".join(host_fields)
+            placeholders = ",".join("?" for _ in host_fields)
+            updates = ",".join(f"{key}=excluded.{key}" for key in host_fields)
+            for platform_name, target, values in prepared:
+                conn.execute(f"""
+                    INSERT INTO hosts(guild_id,platform,target,{field_names})
+                    VALUES(?,?,?,{placeholders})
+                    ON CONFLICT(guild_id,platform,target) DO UPDATE SET {updates}
+                """, (guild_id, platform_name, target, *(values[key] for key in host_fields)))
+                conn.execute("""INSERT OR IGNORE INTO live_state(
+                    guild_id,platform,target,is_live,live_key) VALUES(?,?,?,0,NULL)""",
+                             (guild_id, platform_name, target))
 
-        if row:
-            host_id = row["id"]
-            set_host_channel(host_id, raw.get("channel_id"))
-            set_host_role(host_id, raw.get("role_id"))
-            set_host_interval(
-                host_id,
-                int(raw.get("check_interval") or DEFAULT_CHECK_INTERVAL)
-            )
-            set_host_notify_end(
-                host_id,
-                bool(raw.get("notify_live_end"))
-            )
-
-            with closing(db()) as conn:
-                conn.execute("""
-                    UPDATE hosts SET
-                        custom_live_message=?,
-                        custom_post_message=?,
-                        custom_end_message=?,
-                        enabled=?,
-                        extra_channel_ids=?,
-                        extra_role_ids=?,
-                        schedule_days=?,
-                        quiet_start=?,
-                        quiet_end=?,
-                        timezone=?,
-                        language=?,
-                        webhook_url=?,
-                        mention_everyone=?,
-                        embed_title=?,
-                        embed_footer=?,
-                        embed_color=?,
-                        auto_pause_threshold=?
-                    WHERE id=?
-                """, (
-                    raw.get("custom_live_message"),
-                    raw.get("custom_post_message"),
-                    raw.get("custom_end_message"),
-                    1 if raw.get("enabled", 1) else 0,
-                    raw.get("extra_channel_ids"),
-                    raw.get("extra_role_ids"),
-                    raw.get("schedule_days") or "0,1,2,3,4,5,6",
-                    raw.get("quiet_start"),
-                    raw.get("quiet_end"),
-                    raw.get("timezone"),
-                    raw.get("language"),
-                    raw.get("webhook_url"),
-                    1 if raw.get("mention_everyone") else 0,
-                    raw.get("embed_title"),
-                    raw.get("embed_footer"),
-                    raw.get("embed_color"),
-                    raw.get("auto_pause_threshold"),
-                    host_id
-                ))
-                conn.commit()
-
-            restored += 1
-
-    return restored
+            # FREE snapshots may contain paused hosts beyond the active allowance.
+            if plan == "free":
+                excess = conn.execute("""SELECT id FROM hosts WHERE guild_id=?
+                    AND enabled=1 ORDER BY id LIMIT -1 OFFSET ?""",
+                                      (guild_id, FREE_HOST_LIMIT)).fetchall()
+                for host in excess:
+                    conn.execute("UPDATE hosts SET enabled=0 WHERE id=?", (host["id"],))
+                    conn.execute("""INSERT INTO host_plan_pause(host_id,guild_id,paused_at,reason)
+                        VALUES(?,?,?,'free_limit') ON CONFLICT(host_id) DO UPDATE SET
+                        guild_id=excluded.guild_id,paused_at=excluded.paused_at,reason=excluded.reason""",
+                                 (host["id"], guild_id, int(time.time())))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return len(prepared)
 
 
 # ============================================================
@@ -15703,14 +15920,7 @@ def schema_history_rows(limit: int = 10):
 
 
 def current_rss_mb() -> float:
-    try:
-        status = Path("/proc/self/status").read_text(encoding="utf-8", errors="ignore")
-        for line in status.splitlines():
-            if line.startswith("VmRSS:"):
-                return round(int(line.split()[1]) / 1024, 1)
-    except Exception:
-        pass
-    return 0.0
+    return core_current_rss_mb()
 
 
 def resource_snapshot() -> dict:
@@ -28613,6 +28823,15 @@ def owner_system_health_embed():
         ),
         inline=False
     )
+    core_state = core_files_status(Path(__file__).resolve().parent)
+    embed.add_field(
+        name="Modular Core v1.25",
+        value=(
+            f"{'✅ READY' if core_state['ok'] else '❌ INCOMPLETE'} • **{core_state['total']}** core module\n"
+            + ("Version • Security • Runtime • Validation dipisahkan dari bot.py" if core_state['ok'] else "Missing: " + ", ".join(core_state['missing'])[:700])
+        ),
+        inline=False
+    )
     embed.set_footer(text=release_info_text())
     return embed
 
@@ -28867,6 +29086,8 @@ def diagnostic_bundle_bytes() -> bytes:
         "wal_warn_mb": WAL_WARN_MB,
         "user_burst_limit": USER_BURST_LIMIT,
         "resource_snapshot": resource_snapshot(),
+        "modular_core": core_files_status(Path(__file__).resolve().parent),
+        "app_version": APP_VERSION,
     }
 
     loops = {
@@ -29417,7 +29638,10 @@ async def run_scheduled_system_backup():
     folder = Path(AUTO_BACKUP_DIR)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"hi-notifku-system-{now}.{ext}"
-    path.write_bytes(data)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_bytes(data)
+    temporary_path.replace(path)
+    prune_system_backups()
 
     sent = 0
     if len(data) <= 24 * 1024 * 1024:
@@ -32274,8 +32498,8 @@ class HostCardView(discord.ui.View):
         if not host:
             return
 
-        username = str(host['target']).lstrip("@")
-        url = f"https://www.tiktok.com/@{username}/live"
+        username = canonical_tiktok_username(host['target'])
+        url = canonical_tiktok_url(username, live=True)
         live_data = None
         try:
             live_data = await check_tiktok_live_fallback(host)
@@ -32291,7 +32515,7 @@ class HostCardView(discord.ui.View):
             creator=f"@{username}",
             url=url,
             platform="TikTok"
-        ) or f"**@{username}** sedang LIVE!"
+        ) or None
 
         ok = await send_notification(
             host, embed, custom,
@@ -32310,7 +32534,7 @@ class HostCardView(discord.ui.View):
         if not host:
             return
 
-        url = f"https://www.tiktok.com/@{host['target']}"
+        url = canonical_tiktok_url(host['target'], live=False)
 
         embed = discord.Embed(
             title="🆕 TikTok Post • TEST",
@@ -33910,6 +34134,26 @@ def startup_integrity_results() -> list[tuple[str, bool, str]]:
         "ON" if bot.intents.members else "OFF"
     ))
 
+    core_state = core_files_status(Path(__file__).resolve().parent)
+    results.append((
+        "Modular Core",
+        bool(core_state["ok"]),
+        f"{core_state['total']} module OK" if core_state["ok"] else "Missing: " + ", ".join(core_state["missing"])
+    ))
+
+    for name, ok, detail in deployment_checks(
+        discord_token=DISCORD_TOKEN,
+        owner_ids=OWNER_IDS,
+        db_path=DB_PATH,
+        backup_dir=AUTO_BACKUP_DIR,
+        qris_dir=QRIS_STORAGE_DIR,
+        required_guild_id=REQUIRED_GUILD_ID,
+        youtube_api_key=YOUTUBE_API_KEY,
+    ):
+        # YouTube key is optional for deployments that do not use YouTube; show it as informational.
+        effective_ok = True if name == "YouTube API" else ok
+        results.append((f"Config: {name}", effective_ok, detail))
+
     return results
 
 
@@ -34297,4 +34541,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
