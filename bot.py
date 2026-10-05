@@ -47,7 +47,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.19.0"
+APP_VERSION = "1.20.0"
 CURRENT_SCHEMA_VERSION = 32
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
@@ -15411,6 +15411,163 @@ class BulkImportModal(discord.ui.Modal):
         )
 
 
+
+def selectable_text_channels(guild: discord.Guild):
+    """Text/announcement channels the bot can actually deliver embeds to."""
+    if not guild:
+        return []
+    me = guild.me
+    channels = []
+    for channel in sorted(guild.text_channels, key=lambda c: (getattr(c, "position", 0), c.id)):
+        if me:
+            perms = channel.permissions_for(me)
+            if not (perms.view_channel and perms.send_messages and perms.embed_links):
+                continue
+        channels.append(channel)
+    return channels
+
+
+class ChannelPickerSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        channels = parent_view.page_channels()
+        options = [
+            discord.SelectOption(
+                label=(f"#{channel.name}")[:100],
+                description=(getattr(channel.category, "name", None) or "Tanpa kategori")[:100],
+                value=str(channel.id),
+                emoji="📣",
+            )
+            for channel in channels
+        ]
+        if not options:
+            options = [discord.SelectOption(label="Tidak ada channel tersedia", value="0", emoji="ℹ️")]
+        super().__init__(
+            placeholder=f"Pilih channel • Halaman {parent_view.page + 1}",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "0":
+            await safe_reply(interaction, "❌ Tidak ada channel yang dapat dipilih.")
+            return
+        await self.parent_view.handle_channel(interaction, int(self.values[0]))
+
+
+class ChannelPickerView(discord.ui.View):
+    """Reusable DM-safe channel picker; users choose a name instead of typing IDs."""
+    def __init__(
+        self,
+        guild_id: int,
+        viewer_id: int,
+        kind: str,
+        host_id: int | None = None,
+        page: int = 0,
+    ):
+        super().__init__(timeout=900)
+        self.guild_id = int(guild_id)
+        self.viewer_id = int(viewer_id)
+        self.kind = str(kind)
+        self.host_id = int(host_id) if host_id else None
+        self.page = max(0, int(page))
+        self.add_item(ChannelPickerSelect(self))
+
+    def channels(self):
+        return selectable_text_channels(bot.get_guild(self.guild_id))
+
+    def page_channels(self):
+        start = self.page * 25
+        return self.channels()[start:start + 25]
+
+    async def valid(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Menu pemilihan channel ini bukan milikmu.")
+            return False
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
+            return False
+        if self.kind in {"user_add_host"}:
+            if int(guild.owner_id) != self.viewer_id:
+                await safe_reply(interaction, "🔒 Hanya Pemilik Server yang dapat memilih channel ini.")
+                return False
+        elif self.kind in {"hm_add_host"}:
+            if not host_manager_has_guild_access(self.viewer_id, self.guild_id):
+                await safe_reply(interaction, "🔒 Akses Host Manager server sudah tidak aktif.")
+                return False
+        elif self.kind in {"update_channel", "support_channel"}:
+            if not await require_owner_level(interaction, "server_admin"):
+                return False
+        elif self.kind in {"default_tiktok_channel", "default_youtube_channel", "log_channel", "host_channel"}:
+            # These views are only opened from already-authorized server/global-owner panels.
+            if not (is_global_owner(self.viewer_id) or int(guild.owner_id) == self.viewer_id):
+                await safe_reply(interaction, "🔒 Kamu tidak memiliki akses mengubah channel server ini.")
+                return False
+        return True
+
+    async def handle_channel(self, interaction: discord.Interaction, channel_id: int):
+        if not await self.valid(interaction):
+            return
+        guild = bot.get_guild(self.guild_id)
+        channel = guild.get_channel(int(channel_id)) if guild else None
+        if not isinstance(channel, discord.TextChannel):
+            await safe_reply(interaction, "❌ Channel tidak valid atau sudah dihapus.")
+            return
+        if channel not in selectable_text_channels(guild):
+            await safe_reply(interaction, "❌ Bot belum memiliki izin View Channel + Send Messages + Embed Links di channel itu.")
+            return
+
+        if self.kind == "user_add_host":
+            await interaction.response.send_modal(UserAddHostModal(self.guild_id, self.viewer_id, channel.id))
+            return
+        if self.kind == "hm_add_host":
+            await interaction.response.send_modal(HostManagerAddHostRequestModal(self.viewer_id, self.guild_id, channel.id))
+            return
+        if self.kind == "default_tiktok_channel":
+            set_default_channel(self.guild_id, "tiktok", channel.id)
+        elif self.kind == "default_youtube_channel":
+            set_default_channel(self.guild_id, "youtube", channel.id)
+        elif self.kind == "host_channel":
+            host = get_host(self.host_id) if self.host_id else None
+            if not host or int(host["guild_id"]) != self.guild_id:
+                await safe_reply(interaction, "❌ Host tidak ditemukan.")
+                return
+            set_host_channel(self.host_id, channel.id)
+        elif self.kind == "log_channel":
+            set_log_channel(self.guild_id, channel.id)
+        elif self.kind == "update_channel":
+            current = get_bot_update_settings()
+            set_bot_update_channel(channel.id, interaction.user.id, bool(current.get("auto_announce", 1)))
+        elif self.kind == "support_channel":
+            set_support_channel(channel.id, interaction.user.id)
+            add_activity(None, interaction.user.id, "Support Channel Changed", str(channel.id))
+        else:
+            await safe_reply(interaction, "❌ Jenis pengaturan channel tidak dikenal.")
+            return
+
+        if self.kind in {"default_tiktok_channel", "default_youtube_channel", "host_channel", "log_channel"}:
+            await log_action(self.guild_id, interaction.user.id, "Ubah Channel", f"{self.kind} → {channel.id}")
+        await safe_reply(interaction, f"✅ Channel dipilih: {channel.mention}.")
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(view=ChannelPickerView(self.guild_id, self.viewer_id, self.kind, self.host_id, self.page))
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        max_page = max(0, (len(self.channels()) - 1) // 25)
+        self.page = min(max_page, self.page + 1)
+        await interaction.response.edit_message(view=ChannelPickerView(self.guild_id, self.viewer_id, self.kind, self.host_id, self.page))
+
+
 class IdModal(discord.ui.Modal):
     value_input = discord.ui.TextInput(
         label="ID Discord",
@@ -20210,11 +20367,6 @@ class UserAddHostModal(discord.ui.Modal):
         placeholder="Contoh: username atau UCxxxx / URL Facebook",
         max_length=300
     )
-    channel_id_input = discord.ui.TextInput(
-        label="Channel Discord tujuan",
-        placeholder="ID channel Discord",
-        max_length=25
-    )
     role_id_input = discord.ui.TextInput(
         label="Role mention (opsional)",
         placeholder="ID role Discord, boleh kosong",
@@ -20222,197 +20374,66 @@ class UserAddHostModal(discord.ui.Modal):
         max_length=25
     )
 
-    def __init__(self, guild_id: int, user_id: int):
-        super().__init__(
-            title="Tambah Host Server",
-            timeout=300
-        )
+    def __init__(self, guild_id: int, user_id: int, channel_id: int):
+        super().__init__(title="Tambah Host Server", timeout=300)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
+        self.channel_id = int(channel_id)
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await safe_reply(
-                interaction,
-                "🔒 Form ini bukan milikmu."
-            )
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
             return
-
         guild = bot.get_guild(self.guild_id)
-        if (
-            guild is None
-            or int(guild.owner_id) != int(interaction.user.id)
-        ):
-            await safe_reply(
-                interaction,
-                "🔒 Hanya **Pemilik Server** yang dapat menambah host."
-            )
+        if guild is None or int(guild.owner_id) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Hanya **Pemilik Server** yang dapat menambah host.")
             return
-
+        channel = guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel) or channel not in selectable_text_channels(guild):
+            await safe_reply(interaction, "❌ Channel tujuan sudah tidak tersedia atau izin bot berubah. Pilih ulang channel.")
+            return
         current = len(get_hosts(self.guild_id))
         limit = host_limit_for_guild(self.guild_id)
         if current >= limit:
-            settings = get_guild_settings(self.guild_id)
-            if premium_access_effective(self.guild_id):
-                msg = f"❌ Batas host PREMIUM tercapai (**{current}/{limit}**)."
-            else:
-                msg = (
-                    f"❌ Batas host FREE tercapai (**{current}/{limit}**).\n"
-                    "Upgrade Premium jika membutuhkan lebih banyak host."
-                )
-            await safe_reply(interaction, msg)
+            await safe_reply(interaction, f"❌ Batas host {'PREMIUM' if premium_access_effective(self.guild_id) else 'FREE'} tercapai (**{current}/{limit}**).")
             return
-
         platform = self.platform.value.strip().lower()
         target_raw = self.target.value.strip()
-
         if platform not in SUPPORTED_PLATFORMS:
-            await safe_reply(
-                interaction,
-                (
-                    "❌ Platform tidak didukung.\n"
-                    "Gunakan `youtube`, `tiktok`, `twitch`, `kick`, "
-                    "`instagram`, atau `facebook`."
-                )
-            )
+            await safe_reply(interaction, "❌ Platform tidak didukung. Gunakan `youtube`, `tiktok`, `twitch`, `kick`, `instagram`, atau `facebook`.")
             return
-
-        channel_raw = self.channel_id_input.value.strip()
-        if not channel_raw.isdigit():
-            await safe_reply(
-                interaction,
-                "❌ Channel Discord harus berupa ID angka."
-            )
-            return
-
-        channel = guild.get_channel(int(channel_raw))
-        if not isinstance(
-            channel,
-            (discord.TextChannel, discord.Thread)
-        ):
-            await safe_reply(
-                interaction,
-                "❌ Channel tujuan tidak ditemukan di server tersebut."
-            )
-            return
-
-        me = guild.me
-        if isinstance(channel, discord.TextChannel) and me:
-            perms = channel.permissions_for(me)
-            if not (
-                perms.view_channel
-                and perms.send_messages
-                and perms.embed_links
-            ):
-                await safe_reply(
-                    interaction,
-                    (
-                        "❌ Bot belum punya izin **View Channel + "
-                        "Send Messages + Embed Links** di channel tersebut."
-                    )
-                )
-                return
-
         role_id = None
         role_raw = self.role_id_input.value.strip()
         if role_raw:
-            if not role_raw.isdigit():
-                await safe_reply(
-                    interaction,
-                    "❌ Role Discord harus berupa ID angka."
-                )
-                return
-            role = guild.get_role(int(role_raw))
-            if role is None:
-                await safe_reply(
-                    interaction,
-                    "❌ Role tidak ditemukan di server tersebut."
-                )
+            if not role_raw.isdigit() or guild.get_role(int(role_raw)) is None:
+                await safe_reply(interaction, "❌ Role tidak ditemukan di server tersebut.")
                 return
             role_id = int(role_raw)
-
-        target = normalize_social_target(
-            platform,
-            target_raw
-        )
+        target = normalize_social_target(platform, target_raw)
         if not target:
-            await safe_reply(
-                interaction,
-                "❌ Username/target tidak valid."
-            )
+            await safe_reply(interaction, "❌ Username/target tidak valid.")
             return
-
         await defer_if_needed(interaction)
-
         try:
-            display_name = (
-                f"@{target}"
-                if not target.startswith(("http://", "https://"))
-                else target
-            )
+            display_name = f"@{target}" if not target.startswith(("http://", "https://")) else target
             extra = None
-
             if platform == "youtube":
                 display_name, extra = await resolve_youtube_channel(target)
-
-            add_host(
-                self.guild_id,
-                platform,
-                target,
-                display_name,
-                extra
-            )
-
+            add_host(self.guild_id, platform, target, display_name, extra)
             with closing(db()) as conn:
-                row = conn.execute("""
-                    SELECT id
-                    FROM hosts
-                    WHERE guild_id=? AND platform=? AND target=?
-                """, (
-                    self.guild_id,
-                    platform,
-                    target
-                )).fetchone()
-
+                row = conn.execute("SELECT id FROM hosts WHERE guild_id=? AND platform=? AND target=?", (self.guild_id, platform, target)).fetchone()
             if not row:
                 raise RuntimeError("Host berhasil diproses tetapi ID host tidak ditemukan.")
-
-            set_host_channel(
-                int(row["id"]),
-                int(channel_raw)
-            )
-            set_host_role(
-                int(row["id"]),
-                role_id
-            )
-
-            await log_action(
-                self.guild_id,
-                interaction.user.id,
-                "Server Owner Tambah Host",
-                (
-                    f"{platform_display_name(platform)} {target} "
-                    f"channel={channel_raw}"
-                )
-            )
-
+            set_host_channel(int(row["id"]), self.channel_id)
+            set_host_role(int(row["id"]), role_id)
+            await log_action(self.guild_id, interaction.user.id, "Server Owner Tambah Host", f"{platform_display_name(platform)} {target} channel={self.channel_id}")
             refreshed_count = len(get_hosts(self.guild_id))
             await interaction.followup.send(
-                (
-                    f"✅ {platform_icon(platform)} **{platform_display_name(platform)}** "
-                    f"`{display_name}` berhasil ditambahkan.\n"
-                    f"📣 Channel: <#{channel_raw}>\n"
-                    f"📊 Host: **{refreshed_count}/{limit}**"
-                ),
-                ephemeral=True
+                f"✅ {platform_icon(platform)} **{platform_display_name(platform)}** `{display_name}` berhasil ditambahkan.\n📣 Channel: {channel.mention}\n📊 Host: **{refreshed_count}/{limit}**",
+                ephemeral=True,
             )
-
         except Exception as exc:
-            await interaction.followup.send(
-                f"❌ Gagal menambahkan host: `{type(exc).__name__}: {exc}`",
-                ephemeral=True
-            )
-
+            await interaction.followup.send(f"❌ Gagal menambahkan host: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 class UserServerHostSelect(discord.ui.Select):
     def __init__(
@@ -20764,11 +20785,14 @@ class UserServerHostsView(discord.ui.View):
             )
             return
 
-        await interaction.response.send_modal(
-            UserAddHostModal(
-                self.guild_id,
-                self.user_id
-            )
+        channels = selectable_text_channels(guild)
+        if not channels:
+            await safe_reply(interaction, "❌ Tidak ada channel yang dapat dipakai. Pastikan bot punya View Channel + Send Messages + Embed Links.")
+            return
+        await interaction.response.send_message(
+            "📣 **Pilih channel tujuan host** dari daftar di bawah.",
+            view=ChannelPickerView(self.guild_id, self.user_id, "user_add_host"),
+            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -22524,11 +22548,6 @@ class HostManagerAddHostRequestModal(discord.ui.Modal):
         placeholder="Contoh: username, UCxxxx, atau URL",
         max_length=300
     )
-    channel_id_input = discord.ui.TextInput(
-        label="Channel Discord tujuan",
-        placeholder="ID channel Discord",
-        max_length=25
-    )
     role_id_input = discord.ui.TextInput(
         label="Role mention (opsional)",
         placeholder="ID role Discord, boleh kosong",
@@ -22536,188 +22555,58 @@ class HostManagerAddHostRequestModal(discord.ui.Modal):
         max_length=25
     )
 
-    def __init__(
-        self,
-        user_id: int,
-        guild_id: int
-    ):
-        super().__init__(
-            title="Ajukan Host Baru",
-            timeout=300
-        )
+    def __init__(self, user_id: int, guild_id: int, channel_id: int):
+        super().__init__(title="Ajukan Host Baru", timeout=300)
         self.user_id = int(user_id)
         self.guild_id = int(guild_id)
+        self.channel_id = int(channel_id)
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
+    async def on_submit(self, interaction: discord.Interaction):
         if int(interaction.user.id) != self.user_id:
-            await safe_reply(
-                interaction,
-                "🔒 Form ini bukan milikmu."
-            )
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
             return
-
-        if not host_manager_has_guild_access(
-            self.user_id,
-            self.guild_id
-        ):
-            await safe_reply(
-                interaction,
-                "🔒 Akses Host Manager server sudah tidak aktif."
-            )
+        if not host_manager_has_guild_access(self.user_id, self.guild_id):
+            await safe_reply(interaction, "🔒 Akses Host Manager server sudah tidak aktif.")
             return
-
-        guild = bot.get_guild(
-            self.guild_id
-        )
+        guild = bot.get_guild(self.guild_id)
         if not guild:
-            await safe_reply(
-                interaction,
-                "❌ Server tidak ditemukan."
-            )
+            await safe_reply(interaction, "❌ Server tidak ditemukan.")
             return
-
+        channel = guild.get_channel(self.channel_id)
+        if not isinstance(channel, discord.TextChannel) or channel not in selectable_text_channels(guild):
+            await safe_reply(interaction, "❌ Channel tujuan sudah tidak tersedia atau izin bot berubah. Pilih ulang channel.")
+            return
         platform = self.platform.value.strip().lower()
         if platform not in SUPPORTED_PLATFORMS:
-            await safe_reply(
-                interaction,
-                (
-                    "❌ Platform tidak didukung. Gunakan `youtube`, `tiktok`, "
-                    "`twitch`, `kick`, `instagram`, atau `facebook`."
-                )
-            )
+            await safe_reply(interaction, "❌ Platform tidak didukung. Gunakan `youtube`, `tiktok`, `twitch`, `kick`, `instagram`, atau `facebook`.")
             return
-
-        target = normalize_social_target(
-            platform,
-            self.target.value.strip()
-        )
+        target = normalize_social_target(platform, self.target.value.strip())
         if not target:
-            await safe_reply(
-                interaction,
-                "❌ Target/username tidak valid."
-            )
+            await safe_reply(interaction, "❌ Target/username tidak valid.")
             return
-
-        channel_raw = self.channel_id_input.value.strip()
-        if not channel_raw.isdigit():
-            await safe_reply(
-                interaction,
-                "❌ Channel Discord harus berupa ID angka."
-            )
-            return
-
-        channel = guild.get_channel(
-            int(channel_raw)
-        )
-        if not isinstance(
-            channel,
-            (discord.TextChannel, discord.Thread)
-        ):
-            await safe_reply(
-                interaction,
-                "❌ Channel tujuan tidak ditemukan di server ini."
-            )
-            return
-
-        me = guild.me
-        if isinstance(channel, discord.TextChannel) and me:
-            perms = channel.permissions_for(me)
-            if not (
-                perms.view_channel
-                and perms.send_messages
-                and perms.embed_links
-            ):
-                await safe_reply(
-                    interaction,
-                    (
-                        "❌ Bot belum punya izin **View Channel + Send Messages "
-                        "+ Embed Links** di channel tersebut."
-                    )
-                )
-                return
-
         role_id = None
         role_raw = self.role_id_input.value.strip()
         if role_raw:
-            if not role_raw.isdigit():
-                await safe_reply(
-                    interaction,
-                    "❌ Role Discord harus berupa ID angka."
-                )
-                return
-
-            role = guild.get_role(
-                int(role_raw)
-            )
-            if role is None:
-                await safe_reply(
-                    interaction,
-                    "❌ Role tidak ditemukan di server ini."
-                )
+            if not role_raw.isdigit() or guild.get_role(int(role_raw)) is None:
+                await safe_reply(interaction, "❌ Role tidak ditemukan di server ini.")
                 return
             role_id = int(role_raw)
-
-        # Do not create an active host here. Only create PENDING request.
-        request_id = create_host_creation_request(
-            self.guild_id,
-            self.user_id,
-            platform,
-            target,
-            int(channel_raw),
-            role_id
-        )
-
+        request_id = create_host_creation_request(self.guild_id, self.user_id, platform, target, self.channel_id, role_id)
         try:
-            owner = (
-                guild.owner
-                or await bot.fetch_user(
-                    int(guild.owner_id)
-                )
-            )
+            owner = guild.owner or await bot.fetch_user(int(guild.owner_id))
             await owner.send(
-                embed=host_creation_request_embed(
-                    request_id
-                ),
-                view=ServerOwnerHostCreationApprovalView(
-                    request_id,
-                    self.guild_id,
-                    self.user_id
-                )
+                embed=host_creation_request_embed(request_id),
+                view=ServerOwnerHostCreationApprovalView(request_id, self.guild_id, self.user_id),
             )
             sent = True
         except Exception:
             sent = False
-
-        log_host_manager_action(
-            0,
-            self.user_id,
-            "request_new_host",
-            (
-                f"guild={self.guild_id} request={request_id} "
-                f"platform={platform} target={target}"
-            )
-        )
-
+        log_host_manager_action(0, self.user_id, "request_new_host", f"guild={self.guild_id} request={request_id} platform={platform} target={target}")
         await safe_reply(
             interaction,
-            (
-                f"✅ Host baru diajukan sebagai request **#{request_id}**.\n"
-                "Status: **PENDING**.\n"
-                "Host **belum aktif** sampai Pemilik Server menyetujuinya."
-                + (
-                    "\n📨 Permintaan sudah dikirim ke DM Pemilik Server."
-                    if sent
-                    else (
-                        "\n⚠️ Request tersimpan tetapi DM Pemilik Server gagal. "
-                        "Kemungkinan DM owner tertutup."
-                    )
-                )
-            )
+            f"✅ Host baru diajukan sebagai request **#{request_id}**.\n📣 Channel: {channel.mention}\nStatus: **PENDING**.\nHost **belum aktif** sampai Pemilik Server menyetujuinya."
+            + ("\n📨 Permintaan sudah dikirim ke DM Pemilik Server." if sent else "\n⚠️ Request tersimpan tetapi DM Pemilik Server gagal."),
         )
-
 
 class ServerOwnerHostCreationApprovalView(discord.ui.View):
     def __init__(
@@ -23397,11 +23286,14 @@ class HostManagerGuildDashboardView(discord.ui.View):
         if not await self.valid(interaction):
             return
 
-        await interaction.response.send_modal(
-            HostManagerAddHostRequestModal(
-                self.user_id,
-                self.guild_id
-            )
+        guild = bot.get_guild(self.guild_id)
+        if not guild or not selectable_text_channels(guild):
+            await safe_reply(interaction, "❌ Tidak ada channel yang dapat dipakai. Minta Pemilik Server mengecek izin bot.")
+            return
+        await interaction.response.send_message(
+            "📣 **Pilih channel tujuan host** dari daftar di bawah.",
+            view=ChannelPickerView(self.guild_id, self.user_id, "hm_add_host"),
+            ephemeral=True,
         )
 
     @discord.ui.button(
@@ -27570,53 +27462,7 @@ async def announce_current_version_if_needed():
         log.exception("Auto update announcement error")
 
 
-class OwnerUpdateChannelModal(discord.ui.Modal, title="Pilih Channel Update"):
-    channel_id_input = discord.ui.TextInput(
-        label="Channel ID",
-        placeholder="Contoh: 123456789012345678",
-        max_length=24,
-    )
-    auto_input = discord.ui.TextInput(
-        label="Auto info versi baru?",
-        placeholder="ya / tidak",
-        default="ya",
-        max_length=8,
-    )
-
-    def __init__(self, viewer_id: int):
-        super().__init__()
-        self.viewer_id = int(viewer_id)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "server_admin"):
-            return
-        if not REQUIRED_GUILD_ID:
-            await safe_reply(interaction, "❌ `REQUIRED_GUILD_ID` belum diisi. Server owner bot belum ditentukan.")
-            return
-        raw = str(self.channel_id_input.value).strip().replace("<#", "").replace(">", "")
-        if not raw.isdigit():
-            await safe_reply(interaction, "❌ Channel ID tidak valid.")
-            return
-        guild = bot.get_guild(int(REQUIRED_GUILD_ID))
-        if not guild:
-            await safe_reply(interaction, "❌ Bot tidak menemukan server owner bot dari `REQUIRED_GUILD_ID`.")
-            return
-        channel = guild.get_channel(int(raw))
-        if not isinstance(channel, discord.TextChannel):
-            await safe_reply(interaction, "❌ Channel harus text/announcement channel di server owner bot.")
-            return
-        me = guild.me
-        perms = channel.permissions_for(me) if me else None
-        if not perms or not (perms.view_channel and perms.send_messages and perms.embed_links):
-            await safe_reply(interaction, "❌ Bot belum punya izin View Channel + Send Messages + Embed Links di channel tersebut.")
-            return
-        auto = str(self.auto_input.value).strip().lower() in {"ya", "yes", "y", "1", "true", "aktif", "on"}
-        set_bot_update_channel(channel.id, interaction.user.id, auto_announce=auto)
-        await interaction.response.edit_message(
-            embed=owner_update_center_embed(),
-            view=OwnerUpdateCenterView(self.viewer_id)
-        )
-
+# Channel update dipilih melalui ChannelPickerView (tanpa input ID).
 
 class OwnerUpdateAnnouncementModal(discord.ui.Modal):
     def __init__(self, viewer_id: int):
@@ -27675,7 +27521,14 @@ class OwnerUpdateCenterView(OwnerBasicBackView):
     async def set_channel(self, interaction, button):
         if not await self.valid(interaction, "server_admin"):
             return
-        await interaction.response.send_modal(OwnerUpdateChannelModal(self.viewer_id))
+        if not REQUIRED_GUILD_ID or not bot.get_guild(int(REQUIRED_GUILD_ID)):
+            await safe_reply(interaction, "❌ Server owner bot belum tersedia (`REQUIRED_GUILD_ID`).")
+            return
+        await interaction.response.send_message(
+            "📢 Pilih **channel info update**:",
+            view=ChannelPickerView(int(REQUIRED_GUILD_ID), self.viewer_id, "update_channel"),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Kirim Update", emoji="📢", style=discord.ButtonStyle.success, row=0)
     async def send_update(self, interaction, button):
@@ -27911,39 +27764,21 @@ def owner_support_embed():
     return embed
 
 
-class OwnerSupportChannelModal(discord.ui.Modal, title="Set Channel Support"):
-    channel_id_input = discord.ui.TextInput(label="Channel ID", max_length=24)
-    def __init__(self, viewer_id: int):
-        super().__init__()
-        self.viewer_id = int(viewer_id)
-    async def on_submit(self, interaction: discord.Interaction):
-        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "server_admin"):
-            return
-        raw = str(self.channel_id_input.value).strip().replace("<#", "").replace(">", "")
-        if not raw.isdigit() or not REQUIRED_GUILD_ID:
-            await safe_reply(interaction, "❌ Channel ID / REQUIRED_GUILD_ID tidak valid.")
-            return
-        guild = bot.get_guild(int(REQUIRED_GUILD_ID))
-        channel = guild.get_channel(int(raw)) if guild else None
-        if not isinstance(channel, discord.TextChannel):
-            await safe_reply(interaction, "❌ Pilih text channel di server owner bot.")
-            return
-        me = guild.me
-        perms = channel.permissions_for(me) if me else None
-        if not perms or not (perms.view_channel and perms.send_messages and perms.embed_links):
-            await safe_reply(interaction, "❌ Bot perlu View Channel + Send Messages + Embed Links.")
-            return
-        set_support_channel(channel.id, interaction.user.id)
-        add_activity(None, interaction.user.id, "Support Channel Changed", str(channel.id))
-        await interaction.response.edit_message(embed=owner_support_embed(), view=OwnerSupportCenterView(self.viewer_id))
-
+# Channel support dipilih melalui ChannelPickerView (tanpa input ID).
 
 class OwnerSupportCenterView(OwnerBasicBackView):
     @discord.ui.button(label="Set Channel", emoji="📍", style=discord.ButtonStyle.primary, row=0)
     async def set_channel_button(self, interaction, button):
         if not await self.valid(interaction) or not await require_owner_level(interaction, "server_admin"):
             return
-        await interaction.response.send_modal(OwnerSupportChannelModal(self.viewer_id))
+        if not REQUIRED_GUILD_ID or not bot.get_guild(int(REQUIRED_GUILD_ID)):
+            await safe_reply(interaction, "❌ Server owner bot belum tersedia (`REQUIRED_GUILD_ID`).")
+            return
+        await interaction.response.send_message(
+            "🆘 Pilih **channel support**:",
+            view=ChannelPickerView(int(REQUIRED_GUILD_ID), self.viewer_id, "support_channel"),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def refresh(self, interaction, button):
@@ -29968,12 +29803,99 @@ class PlanServerManageView(discord.ui.View):
 
 
 
+class HostDeliveryChannelMultiSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        page_channels = parent_view.page_channels()
+        options = []
+        for ch in page_channels:
+            options.append(discord.SelectOption(
+                label=(f"#{ch.name}")[:100],
+                description=(getattr(ch.category, "name", None) or "Tanpa kategori")[:100],
+                value=str(ch.id),
+                default=ch.id in parent_view.selected_ids,
+                emoji="📣",
+            ))
+        if not options:
+            options=[discord.SelectOption(label="Tidak ada channel tersedia", value="0", emoji="ℹ️")]
+        super().__init__(
+            placeholder=f"Channel tambahan • Halaman {parent_view.page + 1}",
+            options=options,
+            min_values=1,
+            max_values=len(options),
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.parent_view.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        current_ids={ch.id for ch in self.parent_view.page_channels()}
+        self.parent_view.selected_ids -= current_ids
+        self.parent_view.selected_ids |= {int(v) for v in self.values if v != "0"}
+        await interaction.response.edit_message(
+            content=f"📣 Dipilih **{len(self.parent_view.selected_ids)}** channel tambahan. Tekan **Lanjut** jika selesai.",
+            view=HostDeliveryChannelPickerView(self.parent_view.host_id, self.parent_view.viewer_id, self.parent_view.page, self.parent_view.selected_ids),
+        )
+
+
+class HostDeliveryChannelPickerView(discord.ui.View):
+    def __init__(self, host_id: int, viewer_id: int, page: int = 0, selected_ids=None):
+        super().__init__(timeout=900)
+        self.host_id=int(host_id)
+        self.viewer_id=int(viewer_id)
+        self.page=max(0,int(page))
+        host=get_host(self.host_id)
+        self.guild_id=int(host["guild_id"]) if host else 0
+        if selected_ids is None and host:
+            selected_ids=set(parse_id_csv(host["extra_channel_ids"] or ""))
+        self.selected_ids=set(int(x) for x in (selected_ids or set()))
+        self.add_item(HostDeliveryChannelMultiSelect(self))
+
+    def channels(self):
+        return selectable_text_channels(bot.get_guild(self.guild_id))
+
+    def page_channels(self):
+        start=self.page*25
+        return self.channels()[start:start+25]
+
+    async def valid(self, interaction):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        host=get_host(self.host_id)
+        if not host or int(host["guild_id"]) != self.guild_id:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return False
+        return await require_premium_feature(interaction, self.guild_id, "extra_channels", "Delivery lanjutan")
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.edit_message(view=HostDeliveryChannelPickerView(self.host_id,self.viewer_id,max(0,self.page-1),self.selected_ids))
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction, button):
+        if not await self.valid(interaction): return
+        max_page=max(0,(len(self.channels())-1)//25)
+        await interaction.response.edit_message(view=HostDeliveryChannelPickerView(self.host_id,self.viewer_id,min(max_page,self.page+1),self.selected_ids))
+
+    @discord.ui.button(label="Kosongkan", emoji="🧹", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_channels(self, interaction, button):
+        if not await self.valid(interaction): return
+        self.selected_ids.clear()
+        await interaction.response.edit_message(
+            content="🧹 Channel tambahan dikosongkan. Tekan **Lanjut** untuk menyimpan.",
+            view=HostDeliveryChannelPickerView(self.host_id, self.viewer_id, self.page, self.selected_ids),
+        )
+
+    @discord.ui.button(label="Lanjut", emoji="✅", style=discord.ButtonStyle.success, row=1)
+    async def done(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.send_modal(HostDeliveryModal(self.host_id, sorted(self.selected_ids)))
+
+
 class HostDeliveryModal(discord.ui.Modal):
-    extra_channels = discord.ui.TextInput(
-        label="Channel Tambahan (ID, koma)",
-        required=False,
-        max_length=800
-    )
     extra_roles = discord.ui.TextInput(
         label="Role Tambahan (ID, koma)",
         required=False,
@@ -29990,13 +29912,12 @@ class HostDeliveryModal(discord.ui.Modal):
         max_length=1000
     )
 
-    def __init__(self, host_id: int):
+    def __init__(self, host_id: int, selected_channel_ids=None):
         self.host_id = int(host_id)
+        self.selected_channel_ids = [int(x) for x in (selected_channel_ids or [])]
         host = get_host(self.host_id)
         super().__init__(title="Delivery Host", timeout=300)
-
         if host:
-            self.extra_channels.default = host["extra_channel_ids"] or ""
             self.extra_roles.default = host["extra_role_ids"] or ""
             self.everyone.default = "yes" if host["mention_everyone"] else "no"
             self.webhook_url.default = host["webhook_url"] or ""
@@ -30006,45 +29927,26 @@ class HostDeliveryModal(discord.ui.Modal):
         if not host:
             await safe_reply(interaction, "❌ Host tidak ditemukan.")
             return
-
-        if not await require_premium_feature(
-            interaction, int(host["guild_id"]), "extra_channels", "Delivery lanjutan"
-        ):
+        if not await require_premium_feature(interaction, int(host["guild_id"]), "extra_channels", "Delivery lanjutan"):
             return
-
-        channels = ",".join(
-            str(x) for x in parse_id_csv(self.extra_channels.value)
-        )
-        roles = ",".join(
-            str(x) for x in parse_id_csv(self.extra_roles.value)
-        )
-        everyone = self.everyone.value.strip().lower() in {
-            "yes", "y", "1", "true", "on"
-        }
-
-        webhook = self.webhook_url.value.strip()
-        if webhook and not webhook.startswith(
-            ("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")
-        ):
+        guild=bot.get_guild(int(host["guild_id"]))
+        valid_channel_ids={ch.id for ch in selectable_text_channels(guild)}
+        if any(cid not in valid_channel_ids for cid in self.selected_channel_ids):
+            await safe_reply(interaction, "❌ Salah satu channel tambahan sudah tidak tersedia/izin bot berubah. Pilih ulang channel.")
+            return
+        channels=",".join(str(x) for x in self.selected_channel_ids)
+        roles=",".join(str(x) for x in parse_id_csv(self.extra_roles.value))
+        everyone=self.everyone.value.strip().lower() in {"yes","y","1","true","on"}
+        webhook=self.webhook_url.value.strip()
+        if webhook and not webhook.startswith(("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")):
             await safe_reply(interaction, "❌ Webhook URL Discord tidak valid.")
             return
-
         with closing(db()) as conn:
-            conn.execute("""
-                UPDATE hosts
-                SET extra_channel_ids=?, extra_role_ids=?,
-                    mention_everyone=?, webhook_url=?
-                WHERE id=?
-            """, (
-                channels or None,
-                roles or None,
-                1 if everyone else 0,
-                webhook or None,
-                self.host_id
+            conn.execute("UPDATE hosts SET extra_channel_ids=?, extra_role_ids=?, mention_everyone=?, webhook_url=? WHERE id=?", (
+                channels or None, roles or None, 1 if everyone else 0, webhook or None, self.host_id
             ))
             conn.commit()
-
-        await safe_reply(interaction, "✅ Delivery host diperbarui.")
+        await safe_reply(interaction, f"✅ Delivery host diperbarui. Channel tambahan: **{len(self.selected_channel_ids)}**.")
 
 
 class HostScheduleModal(discord.ui.Modal):
@@ -30221,8 +30123,16 @@ class HostAdvancedView(discord.ui.View):
 
     @discord.ui.button(label="Delivery", emoji="📣", style=discord.ButtonStyle.secondary, row=0)
     async def delivery(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            HostDeliveryModal(self.host_id)
+        host = get_host(self.host_id)
+        if not host:
+            await safe_reply(interaction, "❌ Host tidak ditemukan.")
+            return
+        if not await require_premium_feature(interaction, int(host["guild_id"]), "extra_channels", "Delivery lanjutan"):
+            return
+        await interaction.response.send_message(
+            "📣 Pilih **channel tambahan**. Bisa memilih lebih dari satu, lalu tekan **Lanjut**.",
+            view=HostDeliveryChannelPickerView(self.host_id, interaction.user.id),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="Jadwal", emoji="🕒", style=discord.ButtonStyle.secondary, row=0)
@@ -31300,22 +31210,18 @@ class DefaultConfigView(discord.ui.View):
 
     @discord.ui.button(label="TikTok Channel", emoji="🎵", style=discord.ButtonStyle.primary)
     async def tt(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            IdModal(
-                "Default TikTok Channel",
-                "default_tiktok_channel",
-                self.guild_id
-            )
+        await interaction.response.send_message(
+            "🎵 Pilih **channel TikTok/default**:",
+            view=ChannelPickerView(self.guild_id, interaction.user.id, "default_tiktok_channel"),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="YouTube Channel", emoji="📺", style=discord.ButtonStyle.primary)
     async def yt(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            IdModal(
-                "Default YouTube Channel",
-                "default_youtube_channel",
-                self.guild_id
-            )
+        await interaction.response.send_message(
+            "📺 Pilih **channel YouTube**:",
+            view=ChannelPickerView(self.guild_id, interaction.user.id, "default_youtube_channel"),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="Mention Role", emoji="🔔", style=discord.ButtonStyle.secondary)
@@ -31330,12 +31236,10 @@ class DefaultConfigView(discord.ui.View):
 
     @discord.ui.button(label="Log Channel", emoji="🧾", style=discord.ButtonStyle.secondary)
     async def logs(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            IdModal(
-                "Activity Log Channel",
-                "log_channel",
-                self.guild_id
-            )
+        await interaction.response.send_message(
+            "🧾 Pilih **channel activity log**:",
+            view=ChannelPickerView(self.guild_id, interaction.user.id, "log_channel"),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="Matikan Role", emoji="🔕", style=discord.ButtonStyle.secondary)
@@ -31367,22 +31271,18 @@ class WizardView(discord.ui.View):
 
     @discord.ui.button(label="1. TikTok Channel", emoji="🎵", style=discord.ButtonStyle.primary)
     async def tt(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            IdModal(
-                "Wizard • TikTok Channel",
-                "default_tiktok_channel",
-                self.guild_id
-            )
+        await interaction.response.send_message(
+            "🎵 Pilih **channel TikTok/default**:",
+            view=ChannelPickerView(self.guild_id, interaction.user.id, "default_tiktok_channel"),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="2. YouTube Channel", emoji="📺", style=discord.ButtonStyle.primary)
     async def yt(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(
-            IdModal(
-                "Wizard • YouTube Channel",
-                "default_youtube_channel",
-                self.guild_id
-            )
+        await interaction.response.send_message(
+            "📺 Pilih **channel YouTube**:",
+            view=ChannelPickerView(self.guild_id, interaction.user.id, "default_youtube_channel"),
+            ephemeral=True,
         )
 
     @discord.ui.button(label="3. Mention Role", emoji="🔔", style=discord.ButtonStyle.secondary)
@@ -31657,13 +31557,10 @@ class HostCardView(discord.ui.View):
     async def channel(self, interaction):
         host = await self.valid_host(interaction)
         if host:
-            await interaction.response.send_modal(
-                IdModal(
-                    "Channel Khusus Host",
-                    "host_channel",
-                    self.guild_id,
-                    self.host_id
-                )
+            await interaction.response.send_message(
+                "📣 Pilih **channel khusus host**:",
+                view=ChannelPickerView(self.guild_id, interaction.user.id, "host_channel", self.host_id),
+                ephemeral=True,
             )
 
     async def role(self, interaction):

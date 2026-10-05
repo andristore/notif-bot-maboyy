@@ -342,7 +342,6 @@ for required_text in {
     'CREATE TABLE IF NOT EXISTS bot_update_settings',
     'CREATE TABLE IF NOT EXISTS bot_update_history',
     'class OwnerUpdateCenterView',
-    'class OwnerUpdateChannelModal',
     'class OwnerUpdateAnnouncementModal',
     'label="Update Info"',
     'label="Set Channel"',
@@ -358,12 +357,35 @@ for required_text in {
     if required_text not in bot_text:
         fail(f"v1.17 update center guard missing: {required_text}")
 
-if 'APP_VERSION = "1.19.0"' not in bot_text:
-    fail("v1.19 APP_VERSION missing")
+if 'APP_VERSION = "1.20.0"' not in bot_text:
+    fail("v1.20 APP_VERSION missing")
 if 'CURRENT_SCHEMA_VERSION = 32' not in bot_text:
     fail("v1.19 schema version missing")
 
 print("OK: Owner Update Info Center v1.17 guards")
+
+# Channel picker UX v1.20: Discord channel inputs must use named selects, not raw IDs.
+for required_text in {
+    "class ChannelPickerView",
+    "class ChannelPickerSelect",
+    "selectable_text_channels",
+    'kind="user_add_host"' if False else '"user_add_host"',
+    '"hm_add_host"',
+    '"update_channel"',
+    '"support_channel"',
+    "class HostDeliveryChannelPickerView",
+}:
+    if required_text not in bot_text:
+        fail(f"v1.20 channel picker guard missing: {required_text}")
+for forbidden in {
+    'label="Channel Discord tujuan"',
+    'placeholder="ID channel Discord"',
+    'label="Channel ID"',
+    'label="Channel Tambahan (ID, koma)"',
+}:
+    if forbidden in bot_text:
+        fail(f"v1.20 raw Discord channel ID input still present: {forbidden}")
+print("OK: Channel picker UX v1.20 guards")
 
 # Operations & Support hardening v1.18 guards.
 for required_def in {
