@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTP Shop Admin</title>
+<style>
+body{font-family:system-ui;margin:0;background:#0b1020;color:#eef2ff}main{max-width:1000px;margin:auto;padding:28px}
+.card{background:#151c33;border:1px solid #293252;border-radius:16px;padding:20px;margin:14px 0}
+input,button{padding:11px;border-radius:10px;border:1px solid #394568;margin:5px;background:#0d1428;color:white}
+button{cursor:pointer;background:#5267ff;border:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+small{color:#aeb8d5}.ok{color:#7ee2a8}.bad{color:#ff899f}
+</style></head><body><main>
+<h1>OTP Shop • Admin</h1><p><small>Kelola katalog dan cek koneksi provider.</small></p>
+<div class="card"><h3>Login Admin</h3><input id="pw" type="password" placeholder="Admin password" autocomplete="current-password"><button onclick="login()">Login</button><span id="loginmsg" role="status"></span></div>
+<div id="panel" style="display:none">
+<div class="card"><h3>Provider</h3><button onclick="checkHealth()">Tes koneksi API</button><pre id="health" role="status"></pre></div>
+<div class="card"><h3>Tambah Produk</h3><div class="grid">
+<input id="name" placeholder="Nama produk"><input id="country" placeholder="Country code, contoh ID">
+<input id="service" placeholder="Service, contoh WhatsApp"><input id="price" type="number" placeholder="Harga">
+</div><button onclick="add()">Tambah</button><span id="productmsg" role="status"></span></div>
+<div class="card"><h3>Katalog</h3><div id="products"></div></div>
+</div>
+<script>
+const element=id=>document.getElementById(id);
+async function api(url,body){
+ const r=await fetch(url,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ let data;try{data=await r.json();}catch{throw Error('Respons server tidak valid.');}
+ if(!r.ok)throw Error(data.error||'Permintaan gagal ('+r.status+').');return data;
+}
+async function login(){
+ try{await api('/api/admin/login',{password:element('pw').value});element('loginmsg').textContent=' Login berhasil';element('pw').value='';element('panel').style.display='block';await load();}
+ catch(e){element('loginmsg').textContent=' '+e.message;}
+}
+async function load(){
+ try{const rows=await api('/api/admin/products');if(!Array.isArray(rows))throw Error('Katalog belum tersedia.');
+ const container=element('products');container.replaceChildren();
+ for(const x of rows){const line=document.createElement('div');line.style.padding='10px';line.style.borderBottom='1px solid #293252';line.textContent='#'+x.id+' '+x.name+' — '+x.country+'/'+x.service+' — '+Number(x.price).toLocaleString('id-ID')+' IDR — '+(x.enabled?'aktif':'nonaktif');container.appendChild(line);}
+ }catch(e){element('products').textContent=e.message;}
+}
+async function add(){
+ try{await api('/api/admin/products',{name:element('name').value,country:element('country').value,service:element('service').value,price:element('price').value});element('productmsg').textContent=' Produk berhasil ditambahkan.';await load();}
+ catch(e){element('productmsg').textContent=' '+e.message;}
+}
+async function checkHealth(){
+ try{element('health').textContent=JSON.stringify(await api('/api/admin/health'),null,2);}
+ catch(e){element('health').textContent=e.message;}
+}
+</script></main></body></html>
