@@ -15,14 +15,14 @@ import traceback
 import re
 import tempfile
 import zipfile
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 
-APP_VERSION = "1.25.3"
+APP_VERSION = "1.25.4"
 CURRENT_SCHEMA_VERSION = 36
 
 # Shared helpers are bundled here so uploading bot.py needs no package folder.
@@ -376,9 +376,7 @@ def normalize_social_target(platform: str, target: str) -> str:
         return target
 
     if platform == "tiktok":
-        target = target.replace("https://www.tiktok.com/@", "")
-        target = target.replace("https://tiktok.com/@", "")
-        return target.split("/")[0].lstrip("@").strip()
+        return canonical_tiktok_username(target)
 
     if platform == "twitch":
         target = target.replace("https://www.twitch.tv/", "")
@@ -404,12 +402,22 @@ def normalize_social_target(platform: str, target: str) -> str:
 def canonical_tiktok_username(value: str) -> str:
     """Return a clean TikTok username safe for public profile/LIVE URLs."""
     raw = str(value or "").strip()
-    raw = re.sub(r"^https?://(?:www\.)?tiktok\.com/@", "", raw, flags=re.I)
-    raw = raw.split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
+    if re.match(r"^(?:www\.|m\.)?tiktok\.com/", raw, flags=re.I):
+        raw = "https://" + raw
+    if "://" in raw:
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            return ""
+        if parsed.scheme.lower() not in {"http", "https"} or parsed.hostname not in {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}:
+            return ""
+        path = unquote(parsed.path).lstrip("/")
+        if not path.startswith("@"):
+            return ""  # Share URLs require resolution, not a guessed username.
+        raw = path
+    raw = unquote(raw).split("?", 1)[0].split("#", 1)[0].split("/", 1)[0]
     raw = raw.lstrip("@").strip()
-    # TikTok usernames use letters, numbers, underscore and dot. Removing other
-    # characters prevents Discord link buttons from receiving malformed URLs.
-    return re.sub(r"[^A-Za-z0-9._]", "", raw)
+    return raw if re.fullmatch(r"[A-Za-z0-9._]+", raw) else ""
 
 
 def canonical_tiktok_url(value: str, *, live: bool = False) -> str:
@@ -11312,7 +11320,7 @@ def queue_quiet_notification(
 def notification_link_view(host, source_url: Optional[str], event_type: str = "") -> Optional[discord.ui.View]:
     """Build validated, unique URL buttons for notification cards.
 
-    v1.25.2 fixes TikTok profile buttons by always rebuilding the profile URL
+    v1.25.4 fixes TikTok profile buttons by always rebuilding the profile URL
     from the stored username instead of trusting a possibly malformed target.
     """
     source = valid_public_http_url(source_url)
@@ -11327,6 +11335,12 @@ def notification_link_view(host, source_url: Optional[str], event_type: str = ""
         if is_live and canonical_live:
             source = canonical_live
 
+    try:
+        profile_url = valid_public_http_url(host_public_url(host, live=False))
+    except Exception:
+        profile_url = ""
+    if not source:
+        source = profile_url
     if not source:
         return None
 
@@ -11345,19 +11359,9 @@ def notification_link_view(host, source_url: Optional[str], event_type: str = ""
             label=label,
             emoji=emoji,
             style=discord.ButtonStyle.link,
-            url=clean
+            url=clean,
+            disabled=False
         ))
-
-    add_link(
-        "Tonton LIVE" if is_live else "Buka Konten",
-        "▶️" if is_live else "🔗",
-        source
-    )
-
-    try:
-        profile_url = host_public_url(host, live=False)
-    except Exception:
-        profile_url = ""
 
     platform_label = {
         "tiktok": "Profil TikTok",
@@ -11367,9 +11371,30 @@ def notification_link_view(host, source_url: Optional[str], event_type: str = ""
         "instagram": "Profil Instagram",
         "facebook": "Halaman Facebook",
     }.get(platform, "Buka Profil")
+    only_profile = not is_live and source == profile_url
+    add_link(
+        platform_label if only_profile else ("Tonton LIVE" if is_live else "Buka Konten"),
+        "👤" if only_profile else ("▶️" if is_live else "🔗"),
+        source
+    )
     add_link(platform_label, "👤", profile_url)
 
     return view if view.children else None
+
+
+def tiktok_live_card_title(value: str, username: str, display_name: str) -> str:
+    """Keep real stream titles; replace stock titles that repeat the creator."""
+    title = str(value or "").strip()
+    normalize = lambda text: re.sub(r"\s+", " ", re.sub(r"[*_`~]", "", str(text))).strip().lower()
+    identities = {normalize(username).lstrip("@"), normalize(display_name).lstrip("@")}
+    candidates = set()
+    for identity in identities - {""}:
+        for prefix in (identity, "@" + identity):
+            candidates.add(prefix)
+            for suffix in ("live", "is live", "sedang live", "sedang live di tiktok", "tiktok live"):
+                candidates.add(prefix + " " + suffix)
+    normalized = normalize(title).rstrip("!.")
+    return "TikTok LIVE" if not title or normalized in candidates else title
 
 
 def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *, test: bool = False) -> discord.Embed:
@@ -11387,9 +11412,9 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
     # Creator identity lives in the author row, LIVE state lives in Status,
     # and the title is reserved for the actual stream title. This prevents
     # @username / LIVE text from being repeated inside the same card.
-    live_title = str(data.get("title") or "TikTok LIVE").strip()
     thumbnail = str(data.get("thumbnail") or "").strip()
     display_name = str(data.get("uploader") or host["display_name"] or f"@{username}").strip()
+    live_title = tiktok_live_card_title(data.get("title"), username, display_name)
 
     embed = discord.Embed(
         title=(f"{live_title} • TEST" if test else live_title)[:256],
@@ -11398,9 +11423,7 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
     )
 
     author_name = display_name
-    if display_name.lower().lstrip("@") != username.lower():
-        author_name = f"{display_name}  •  @{username}"
-    elif not author_name.startswith("@"):
+    if display_name.lower().lstrip("@") == username.lower():
         author_name = f"@{username}"
 
     if thumbnail.startswith(("http://", "https://")):
@@ -11446,19 +11469,8 @@ def suppress_redundant_live_content(host, content: Optional[str], event_type: st
     # Strip the canonical LIVE/profile URLs before comparing old stock templates.
     for url in (canonical_tiktok_url(username, live=True), canonical_tiktok_url(username, live=False)):
         text = text.replace(url, "").strip()
-    normalized = re.sub(r"[*_`~]", "", text).strip().lower()
-    normalized = re.sub(r"\s+", " ", normalized)
-    candidates = {
-        f"@{username.lower()} sedang live!",
-        f"{username.lower()} sedang live!",
-        f"@{username.lower()} sedang live",
-        f"{username.lower()} sedang live",
-        f"@{username.lower()} sedang live di tiktok!",
-        f"{username.lower()} sedang live di tiktok!",
-        f"@{username.lower()} sedang live di tiktok",
-        f"{username.lower()} sedang live di tiktok",
-    }
-    return None if normalized in candidates else content
+    display_name = str(host["display_name"] or username)
+    return None if tiktok_live_card_title(text, username, display_name) == "TikTok LIVE" else content
 
 
 async def _deliver_notification_now(
@@ -12377,7 +12389,7 @@ def _tiktok_live_fallback_sync(username: str):
 
     return {
         "id": str(info.get("id") or username),
-        "title": info.get("title") or info.get("description") or f"@{username} LIVE",
+        "title": info.get("title") or info.get("description") or "TikTok LIVE",
         "url": info.get("webpage_url")
         or f"https://www.tiktok.com/@{username}/live",
         "thumbnail": thumbnail,
