@@ -1,0 +1,33 @@
+Hi Notifku v1.25.7 — panduan pembaruan
+
+1. Simpan backup database/QRIS/bukti pembayaran dari instalasi lama.
+2. Gunakan file v1.25.7 dari paket ini sebelum deploy Railway.
+3. Upload bot.py baru ke root repository. Semua helper sudah ada di bot.py;
+   tidak perlu menambahkan folder hi_notifku_core. Folder lama boleh dibiarkan.
+4. Pertahankan Railway Volume lama dengan mount /data.
+5. Pertahankan DB_PATH, QRIS_STORAGE_DIR, AUTO_BACKUP_DIR dan seluruh secret.
+6. Tidak ada variable baru. Schema 36 menambah index riwayat notifikasi;
+   migrasi dijalankan otomatis saat startup dan tidak menghapus data lama.
+7. Cek /ping, /owner > System Health, Test LIVE dan backup setelah deploy.
+8. Uji pembayaran dengan invoice pengujian sebelum menerima pembayaran baru.
+
+Restore konfigurasi mempertahankan tanggal Premium; tidak membuat masa
+langganan 30 hari baru. Restore adalah merge: host lain tidak dihapus.
+Backup Premium lama tanpa field premium_expires_at harus diperbarui dari
+instalasi asal atau diperiksa owner sebelum restore.
+
+Restore database dari ZIP/HNBAK hanya ketika bot dihentikan. Jangan menimpa
+database aktif. Simpan salinan database sebelum rollback kode/migrasi.
+
+Penting untuk verifikasi v1.25.7:
+- REQUIRED_GUILD_ID harus berisi ID server support resmi.
+- REQUIRED_GUILD_INVITE harus HTTPS Discord invite ke server yang sama.
+- Bot harus menjadi member server support dan bisa fetch member.
+- ID kosong / pemeriksaan API gagal menahan setup dan notifier, termasuk server
+  lama. Jangan deploy sebelum konfigurasi existing tersebut sudah benar.
+- Uji bot baru masuk server: owner belum join -> tombol Join/Verifikasi muncul.
+- Uji akun lain menekan verifikasi public -> ditolak. Uji owner sudah join ->
+  verifikasi berhasil. Uji owner keluar support -> notifier tertahan.
+- Setelah deploy /ping harus v1.25.7. Buka menu Premium -> Transaksi Terakhir;
+  uji Cek Status, Invoice, pembayaran pengujian dan Kuitansi setelah konfirmasi.
+- Pertahankan database, Railway Volume dan secret lama; tidak ada schema baru.

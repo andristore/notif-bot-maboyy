@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
 
-APP_VERSION = "1.25.4"
+APP_VERSION = "1.25.7"
 CURRENT_SCHEMA_VERSION = 36
 
 # Shared helpers are bundled here so uploading bot.py needs no package folder.
@@ -82,11 +82,12 @@ except Exception:
     AESGCM = None
 
 try:
-    from PIL import Image, ImageDraw, ImageStat
+    from PIL import Image, ImageDraw, ImageStat, ImageFont
 except Exception:
     Image = None
     ImageDraw = None
     ImageStat = None
+    ImageFont = None
 
 load_dotenv()
 
@@ -5642,55 +5643,108 @@ def payment_event_dlq_count() -> int:
     return int(row["total"] or 0)
 
 
-def payment_receipt_embed(order):
-    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
-    paid_at = (
-        int(order["paid_at"])
-        if "paid_at" in order.keys() and order["paid_at"]
-        else int(order["payment_verified_at"])
-        if "payment_verified_at" in order.keys() and order["payment_verified_at"]
-        else int(order["activated_at"] or time.time())
-    )
+def payment_receipt_eligible(order) -> bool:
+    if not order:
+        return False
+    def val(key):
+        return order[key] if key in order.keys() else None
+    status = str(val("status") or "")
+    if status not in {"active", "expired", "paid", "processing", "amount_verified"}:
+        return False
+    if status in {"active", "expired"} and int(val("activated_at") or 0) > 0:
+        return True
+    return bool(int(val("amount_verified") or 0) and (val("paid_at") or val("payment_verified_at")))
 
+
+def payment_checkout_state(order) -> dict:
+    status = str(order["status"] or "pending")
+    deadline = int(order["invoice_deadline"] or 0)
+    overdue = status == "pending" and bool(deadline and deadline <= int(time.time()))
+    effective = "invoice_expired" if overdue else status
+    steps = {
+        "pending": (0, "Pilih metode, bayar sesuai total, lalu kirim bukti."),
+        "proof_submitted": (1, "Bukti diterima. Tunggu pemeriksaan; jangan bayar ulang."),
+        "amount_verified": (2, "Nominal diverifikasi. Aktivasi Premium belum selesai."),
+        "paid": (2, "Pembayaran terkonfirmasi. Premium menunggu aktivasi."),
+        "processing": (2, "Aktivasi sedang diproses. Jangan membuat pembayaran kedua."),
+        "active": (3, "Premium sudah aktif. Kuitansi dapat diunduh."),
+    }
+    index, instruction = steps.get(effective, (-1, "Periksa status transaksi dan hubungi admin jika membutuhkan bantuan."))
+    labels = ("Pembayaran", "Verifikasi", "Konfirmasi", "Premium aktif")
+    timeline = "\n".join(("✅" if effective == "active" or i < index else "🔵" if i == index else "▫️") + " " + label for i, label in enumerate(labels))
+    return {"status": effective, "step": index, "timeline": timeline,
+            "instruction": instruction, "can_pay": effective == "pending",
+            "can_receipt": payment_receipt_eligible(order)}
+
+
+def payment_checkout_embed(order, method=None):
+    data = invoice_display_details(order)
+    state = payment_checkout_state(order)
+    guild = bot.get_guild(int(order["guild_id"]))
+    guild_name = guild.name if guild else f"Server {order['guild_id']}"
     embed = discord.Embed(
-        title="🧾 Receipt • Hi Notifku",
-        description=f"Invoice `{invoice_ref}`",
-        color=discord.Color.green()
+        title="💳 Pusat Pembayaran • Hi Notifku",
+        description=f"**{discord.utils.escape_markdown(guild_name)}**\nInvoice `{data['reference']}`",
+        color=discord.Color.from_rgb(57, 213, 235)
     )
-    embed.add_field(
-        name="Paket",
-        value=f"⭐ {int(order['days'])} hari",
-        inline=True
-    )
-    embed.add_field(
-        name="Total",
-        value=rupiah(int(order["expected_amount"] or order["price"])),
-        inline=True
-    )
-    embed.add_field(
-        name="Dibayar",
-        value=f"<t:{paid_at}:F>",
-        inline=False
-    )
+    embed.add_field(name="Paket Premium", value=f"**{data['days']} hari**\nHarga {rupiah(data['price'])} • kode unik `{data['unique_code']:03d}`", inline=False)
+    embed.add_field(name="Total pembayaran tepat", value=f"## {rupiah(data['total'])}", inline=False)
+    embed.add_field(name="Status transaksi", value=invoice_status_label(state["status"]), inline=True)
+    embed.add_field(name="Batas pembayaran", value=invoice_deadline_text(order), inline=True)
+    embed.add_field(name="Proses", value=state["timeline"], inline=False)
+    embed.add_field(name="Langkah berikutnya", value=state["instruction"], inline=False)
+    embed.add_field(name="Metode pembayaran", value=data["method"][:1024], inline=False)
+    if method and state["can_pay"]:
+        if method["method_type"] != "qris":
+            if method["account_name"]:
+                embed.add_field(name="Atas nama", value=str(method["account_name"])[:1024], inline=True)
+            if method["account_number"]:
+                embed.add_field(name="Tujuan pembayaran", value=f"`{str(method['account_number'])[:1000]}`", inline=True)
+        if method["payment_note"]:
+            embed.add_field(name="Petunjuk metode", value=str(method["payment_note"])[:1024], inline=False)
+        if method["method_type"] == "qris" and method["qris_image_url"]:
+            embed.set_image(url=str(method["qris_image_url"]))
+    if data["received"] is not None:
+        embed.add_field(name="Nominal masuk tercatat", value=rupiah(int(data["received"])), inline=True)
     if order["expires_at"]:
-        embed.add_field(
-            name="Premium sampai",
-            value=f"<t:{int(order['expires_at'])}:F>",
-            inline=False
-        )
-    if "payment_reference" in order.keys() and order["payment_reference"]:
-        embed.add_field(
-            name="Referensi",
-            value=f"`{str(order['payment_reference'])[:120]}`",
-            inline=False
-        )
-    embed.set_footer(text="Simpan receipt ini sebagai bukti transaksi.")
+        embed.add_field(name="Premium sampai", value=f"<t:{int(order['expires_at'])}:F>", inline=True)
+    embed.set_footer(text=f"Hi Notifku • Pembayaran & Aktivasi • v{APP_VERSION}")
     return embed
 
 
+def payment_receipt_embed(order):
+    if not payment_receipt_eligible(order):
+        raise ValueError("Kuitansi tersedia setelah pembayaran terkonfirmasi.")
+    data = invoice_display_details(order)
+    def val(key):
+        return order[key] if key in order.keys() else None
+    paid_at = int(val("paid_at") or val("payment_verified_at") or val("activated_at"))
+    embed = discord.Embed(title="🧾 Kuitansi Pembayaran • Hi Notifku", description=f"Invoice `{data['reference']}`", color=discord.Color.from_rgb(57, 213, 235))
+    embed.add_field(name="Server", value=f"`{data['guild_id']}`", inline=True)
+    embed.add_field(name="Pemesan", value=f"<@{data['requester_id']}>", inline=True)
+    embed.add_field(name="Paket", value=f"Premium **{data['days']} hari**", inline=True)
+    embed.add_field(name="Total tagihan", value=rupiah(data["total"]), inline=True)
+    if data["received"] is not None:
+        embed.add_field(name="Nominal diterima", value=rupiah(int(data["received"])), inline=True)
+    embed.add_field(name="Metode", value=data["method"][:1024], inline=True)
+    embed.add_field(name="Pembayaran tercatat", value=f"<t:{paid_at}:F>", inline=False)
+    embed.add_field(name="Status", value=invoice_status_label(data["status"]), inline=False)
+    if val("expires_at"):
+        embed.add_field(name="Premium sampai", value=f"<t:{int(val('expires_at'))}:F>", inline=False)
+    if val("payment_reference"):
+        embed.add_field(name="Referensi transaksi", value=f"`{str(val('payment_reference'))[:160]}`", inline=False)
+    embed.set_footer(text=f"Simpan kuitansi untuk bantuan transaksi • v{APP_VERSION}")
+    return embed
+
+
+def payment_receipt_image_bytes(order) -> bytes:
+    if not payment_receipt_eligible(order):
+        raise ValueError("Pembayaran belum terkonfirmasi; kuitansi belum tersedia.")
+    return invoice_image_bytes(order, receipt=True)
+
 async def send_payment_receipt(order_id: int) -> bool:
     order = get_premium_order(order_id)
-    if not order:
+    if not payment_receipt_eligible(order):
         return False
 
     if "receipt_sent_at" in order.keys() and order["receipt_sent_at"]:
@@ -5700,7 +5754,13 @@ async def send_payment_receipt(order_id: int) -> bool:
         user = bot.get_user(int(order["requester_id"])) or await bot.fetch_user(
             int(order["requester_id"])
         )
-        await user.send(embed=payment_receipt_embed(order))
+        kwargs = {"embed": payment_receipt_embed(order)}
+        try:
+            png = await asyncio.to_thread(payment_receipt_image_bytes, order)
+            kwargs["file"] = discord.File(io.BytesIO(png), filename=f"kuitansi-{int(order_id)}.png")
+        except Exception:
+            log.warning("Gambar kuitansi tidak tersedia order_id=%s; kirim embed", order_id)
+        await user.send(**kwargs)
 
         with closing(db()) as conn:
             conn.execute("""
@@ -7217,6 +7277,8 @@ def payment_methods_ready() -> bool:
 
 
 def payment_method_embed(method, order=None):
+    if order:
+        return payment_checkout_embed(order, method)
     embed = discord.Embed(
         title=f"💳 {method['method_name']}",
         color=discord.Color.gold()
@@ -7353,19 +7415,23 @@ def assign_order_payment_method(order_id: int, method_id: int):
         raise ValueError("Metode pembayaran belum siap digunakan.")
 
     with closing(db()) as conn:
-        conn.execute("""
+        updated = conn.execute("""
             UPDATE premium_orders
             SET
                 payment_method_id=?,
                 payment_method_name=?,
                 updated_at=?
-            WHERE id=?
+            WHERE id=? AND status='pending'
+              AND (invoice_deadline IS NULL OR invoice_deadline=0 OR invoice_deadline>?)
         """, (
             int(method_id),
             method["method_name"],
             int(time.time()),
-            int(order_id)
+            int(order_id),
+            int(time.time())
         ))
+        if updated.rowcount != 1:
+            raise ValueError("Invoice sudah diproses atau kedaluwarsa; metode tidak dapat diubah.")
         conn.commit()
 
 
@@ -7402,6 +7468,8 @@ def save_payment_proof_details(
     if not order:
         raise ValueError("Order tidak ditemukan.")
 
+    if not payment_checkout_state(order)["can_pay"]:
+        raise ValueError("Invoice sudah diproses atau kedaluwarsa.")
     expected = int(order["expected_amount"] or order["price"])
     if int(declared_amount) != expected:
         raise ValueError(
@@ -7409,10 +7477,13 @@ def save_payment_proof_details(
         )
 
     reference_value = str(reference).strip()
+    if len(reference_value) > 160:
+        raise ValueError("Nomor referensi maksimal 160 karakter.")
     if not reference_value:
         raise ValueError("Nomor referensi transaksi wajib diisi.")
 
     with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         duplicate_ref = conn.execute("""
             SELECT id
             FROM premium_orders
@@ -7429,8 +7500,7 @@ def save_payment_proof_details(
                 f"Nomor referensi sudah dipakai pada invoice #{duplicate_ref['id']}."
             )
 
-    with closing(db()) as conn:
-        conn.execute("""
+        updated = conn.execute("""
             UPDATE premium_orders
             SET
                 proof_sender_name=?,
@@ -7441,7 +7511,8 @@ def save_payment_proof_details(
                 proof_note=?,
                 proof_details_submitted_at=?,
                 updated_at=?
-            WHERE id=?
+            WHERE id=? AND status='pending'
+              AND (invoice_deadline IS NULL OR invoice_deadline=0 OR invoice_deadline>?)
         """, (
             str(sender_name).strip()[:120],
             str(sender_account).strip()[:120],
@@ -7451,8 +7522,11 @@ def save_payment_proof_details(
             str(note).strip()[:500],
             int(time.time()),
             int(time.time()),
-            int(order_id)
+            int(order_id),
+            int(time.time())
         ))
+        if updated.rowcount != 1:
+            raise ValueError("Invoice sudah diproses atau kedaluwarsa.")
         conn.commit()
 
 
@@ -8851,50 +8925,156 @@ def ensure_invoice_ref(order_id: int) -> str:
     return ref
 
 
-def invoice_image_bytes(order) -> bytes:
-    if Image is None or ImageDraw is None:
+def invoice_display_details(order) -> dict:
+    """Read stored billing values without changing the order or payment state."""
+    def value(key, default=None):
+        return order[key] if key in order.keys() and order[key] is not None else default
+
+    def date_text(timestamp):
+        if not timestamp:
+            return "Belum ditentukan"
+        return datetime.fromtimestamp(int(timestamp), tz=ZoneInfo("Asia/Jakarta")).strftime("%d/%m/%Y %H:%M WIB")
+
+    status = str(value("status", "pending"))
+    price = int(value("price", 0))
+    return {
+        "reference": str(value("invoice_ref", "") or ensure_invoice_ref(order["id"])),
+        "order_id": str(value("id", "-")),
+        "guild_id": str(value("guild_id", "-")),
+        "requester_id": str(value("requester_id", "-")),
+        "days": int(value("days", 0)),
+        "price": price,
+        "unique_code": int(value("unique_code", 0)),
+        "total": int(value("expected_amount", price)),
+        "received": value("received_amount"),
+        "method": str(value("payment_method_name", "") or "Belum dipilih"),
+        "created": date_text(value("created_at")),
+        "deadline": date_text(value("invoice_deadline")),
+        "status": status,
+        "status_label": re.sub(r"^[^\w]+", "", invoice_status_label(status)),
+    }
+
+
+def invoice_image_bytes(order, *, receipt: bool = False) -> bytes:
+    """Render a mobile-readable branded invoice; no payment state is mutated."""
+    if Image is None or ImageDraw is None or ImageFont is None:
         raise RuntimeError("Pillow belum tersedia.")
-
-    invoice_ref = order["invoice_ref"] or ensure_invoice_ref(order["id"])
-    image = Image.new("RGB", (900, 650), "white")
+    data = invoice_display_details(order)
+    if receipt:
+        if not payment_receipt_eligible(order):
+            raise ValueError("Pembayaran belum terkonfirmasi.")
+        paid_at = next((order[key] for key in ("paid_at", "payment_verified_at", "activated_at") if key in order.keys() and order[key]), None)
+        data["created"] = datetime.fromtimestamp(int(paid_at), tz=ZoneInfo("Asia/Jakarta")).strftime("%d/%m/%Y %H:%M WIB")
+        expires_at = order["expires_at"] if "expires_at" in order.keys() else None
+        data["deadline"] = datetime.fromtimestamp(int(expires_at), tz=ZoneInfo("Asia/Jakarta")).strftime("%d/%m/%Y %H:%M WIB") if expires_at else "Aktivasi belum selesai"
+    width, height = 1200, 1560
+    image = Image.new("RGB", (width, height))
     draw = ImageDraw.Draw(image)
+    for y in range(height):
+        t = y / height
+        draw.line((0, y, width, y), fill=(int(10 + 6*t), int(19 + 9*t), int(36 + 10*t)))
 
-    deadline = "-"
-    if order["invoice_deadline"]:
-        deadline = datetime.fromtimestamp(
-            int(order["invoice_deadline"]),
-            tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M UTC")
+    white, muted, cyan = "#F2F7FF", "#A9BBD2", "#39D5EB"
+    font_cache = {}
 
-    lines = [
-        ("HI NOTIFKU - PREMIUM INVOICE", 40, 35),
-        (invoice_ref, 40, 90),
-        ("Server ID: " + str(order["guild_id"]), 40, 160),
-        ("Paket: " + str(order["days"]) + " hari", 40, 210),
-        ("Harga: " + rupiah(order["price"]), 40, 260),
-        ("Kode unik: " + f"{int(order['unique_code'] or 0):03d}", 40, 310),
-        (
-            "TOTAL TRANSFER: "
-            + rupiah(int(order["expected_amount"] or order["price"])),
-            40,
-            370
-        ),
-        (
-            "Metode: " + str(order["payment_method_name"] or "Belum dipilih"),
-            40,
-            440
-        ),
-        ("Deadline: " + deadline, 40, 495),
-        ("Bayar sesuai nominal tepat. Jangan dibulatkan.", 40, 560),
-    ]
+    def font(size, bold=False):
+        key = (size, bold)
+        if key not in font_cache:
+            filenames = ("DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf") if bold else ("DejaVuSans.ttf", "LiberationSans-Regular.ttf")
+            for filename in filenames:
+                try:
+                    font_cache[key] = ImageFont.truetype(filename, size)
+                    break
+                except OSError:
+                    continue
+            else:
+                font_cache[key] = ImageFont.load_default(size=size)
+        return font_cache[key]
 
-    for text_value, x, y in lines:
-        draw.text((x, y), text_value, fill="black")
+    def text(x, y, value, size=28, color=white, bold=False, max_width=1000, right=False):
+        value = re.sub(r"\s+", " ", str(value)).strip()
+        size_min = min(size, 20)
+        while size > size_min and draw.textlength(value, font=font(size, bold)) > max_width:
+            size -= 1
+        used_font = font(size, bold)
+        if draw.textlength(value, font=used_font) > max_width:
+            while value and draw.textlength(value + "...", font=used_font) > max_width:
+                value = value[:-1]
+            value += "..."
+        if right:
+            x -= draw.textlength(value, font=used_font)
+        draw.text((x, y), value, font=used_font, fill=color)
 
+    def panel(top, bottom):
+        draw.rounded_rectangle((56, top, 1144, bottom), radius=26, fill="#17283F", outline="#2B405B", width=2)
+
+    def detail(x, y, label, value):
+        text(x, y, label.upper(), 19, muted, max_width=470)
+        text(x, y+32, value, 29, max_width=470, bold=True)
+
+    # Header and brand mark.
+    draw.rounded_rectangle((56, 48, 130, 122), radius=20, fill=cyan)
+    text(72, 64, "HN", 30, "#0B192B", True, 64)
+    text(150, 48, "HI NOTIFKU", 34, bold=True, max_width=600)
+    text(151, 96, "PREMIUM / BUKTI PEMBAYARAN" if receipt else "PREMIUM / TAGIHAN DIGITAL", 18, muted, max_width=600)
+    text(1144, 65, "KUITANSI" if receipt else "INVOICE", 39, cyan, True, 340, right=True)
+    # Keep the complete reference readable even for provider references up to
+    # 160 characters; never silently truncate the identifier needed for support.
+    reference_lines, line = [], ""
+    for char in data["reference"]:
+        if line and draw.textlength(line + char, font=font(20, True)) > 1088:
+            reference_lines.append(line)
+            line = ""
+        line += char
+    if line:
+        reference_lines.append(line)
+    for index, line in enumerate(reference_lines):
+        text(56, 152 + index*26, line, 20, bold=True, max_width=1088)
+    text(56, 236, "Layanan notifikasi untuk server Discord", 18, muted)
+
+    panel(270, 590)
+    detail(88, 300, "Order", "#" + data["order_id"])
+    detail(642, 300, "Status transaksi", data["status_label"])
+    detail(88, 390, "Server Discord ID", data["guild_id"])
+    detail(642, 390, "Pemesan Discord ID", data["requester_id"])
+    detail(88, 480, "Pembayaran tercatat" if receipt else "Dibuat", data["created"])
+    detail(642, 480, "Premium sampai" if receipt else "Batas pembayaran", data["deadline"])
+
+    panel(616, 954)
+    text(88, 644, "RINCIAN TAGIHAN", 21, cyan, True)
+    text(88, 700, f"Hi Notifku Premium / {data['days']} hari", 30, bold=True, max_width=650)
+    text(1110, 704, rupiah(data["price"]), 29, bold=True, max_width=390, right=True)
+    text(88, 762, "Kode unik pembayaran", 26, muted, max_width=650)
+    text(1110, 762, f"{data['unique_code']:03d}", 29, max_width=390, right=True)
+    draw.line((88, 820, 1110, 820), fill="#304862", width=2)
+    text(88, 864, "TOTAL TAGIHAN" if receipt else "TOTAL PEMBAYARAN", 22, cyan, True, 500)
+    text(1110, 851, rupiah(data["total"]), 52, white, True, 570, right=True)
+    text(88, 909, "Nominal sesuai invoice", 18, muted, max_width=500)
+
+    panel(980, 1246)
+    detail(88, 1007, "Metode pembayaran", data["method"])
+    received = "Belum tercatat" if data["received"] is None else rupiah(int(data["received"]))
+    detail(642, 1007, "Nominal diterima (tercatat)", received)
+    draw.line((88, 1101, 1110, 1101), fill="#304862", width=2)
+    text(88, 1125, "KONFIRMASI TRANSAKSI" if receipt else "PETUNJUK PEMBAYARAN", 20, cyan, True)
+    if receipt or data["status"] in {"active", "paid", "amount_verified", "processing"}:
+        instruction = ("Pembayaran tercatat. Ikuti status transaksi di panel bot.", "Tidak perlu membuat pembayaran kedua untuk invoice ini.")
+    elif data["status"] in {"rejected", "invoice_expired", "expired", "refunded", "refund_pending", "refund_failed"}:
+        instruction = ("Periksa status invoice di panel bot sebelum melakukan pembayaran.", "Hubungi admin bila membutuhkan bantuan terkait transaksi ini.")
+    else:
+        instruction = ("Bayar sesuai total tepat, lalu kirim bukti melalui panel bot.", "Gunakan tujuan pembayaran / QRIS yang ditampilkan di panel.")
+    text(88, 1165, instruction[0], 23, max_width=1022)
+    text(88, 1200, instruction[1], 23, muted, max_width=1022)
+
+    draw.rounded_rectangle((56, 1272, 1144, 1402), radius=24, fill="#10354A", outline="#24556C", width=2)
+    text(88, 1296, "Simpan nomor invoice untuk bantuan transaksi.", 26, bold=True, max_width=1022)
+    text(88, 1343, "Status mengikuti catatan sistem saat dokumen ini dibuat.", 23, muted, max_width=1022)
+    text(56, 1445, "HI NOTIFKU / PREMIUM BILLING", 20, muted)
+    text(1144, 1445, f"v{APP_VERSION}", 20, muted, max_width=200, right=True)
+    text(56, 1480, ("Kuitansi digital" if receipt else "Invoice digital") + " | Waktu Indonesia Barat (UTC+7)", 18, muted)
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
-
 
 async def send_payment_admin_log(
     title: str,
@@ -9295,7 +9475,7 @@ async def require_user_panel(
 ) -> bool:
     """Bind a user-facing view to the user who opened it."""
     if int(interaction.user.id) == int(viewer_id):
-        return True
+        return await require_support_membership(interaction)
     await safe_reply(interaction, message)
     return False
 
@@ -9324,6 +9504,10 @@ async def require_host_manager_scope(
         if guild_id is not None and int(host["guild_id"]) != int(guild_id):
             await safe_reply(interaction, "🔒 Host tidak berada pada server aksesmu.")
             return False
+        guild = bot.get_guild(int(host["guild_id"]))
+        if not guild or not await guild_owner_verified(guild):
+            await safe_reply(interaction, "🔒 Pemilik Server wajib terverifikasi sebelum pengaturan host dapat diubah.")
+            return False
         if permission and not host_manager_has_permission(uid, int(host_id), permission):
             await safe_reply(interaction, f"🔒 Izin Host Manager **{permission}** tidak tersedia.")
             return False
@@ -9331,6 +9515,11 @@ async def require_host_manager_scope(
     if guild_id is not None and not host_manager_has_guild_access(uid, int(guild_id)):
         await safe_reply(interaction, "🔒 Akses Host Manager untuk server ini sudah tidak aktif.")
         return False
+    if guild_id is not None:
+        guild = bot.get_guild(int(guild_id))
+        if not guild or not await guild_owner_verified(guild):
+            await safe_reply(interaction, "🔒 Pemilik Server belum terverifikasi.")
+            return False
     return True
 
 
@@ -9385,7 +9574,10 @@ async def require_server_owner(
         guild is not None
         and int(guild.owner_id) == int(interaction.user.id)
     ):
-        return guild
+        if await require_support_membership(interaction) and await guild_owner_verified(guild):
+            return guild
+        await safe_reply(interaction, "🔒 Verifikasi server belum berhasil. Hubungi owner bot bila konfigurasi server support belum siap.", view=StartVerifyView())
+        return None
 
     await safe_reply(
         interaction,
@@ -9441,7 +9633,10 @@ async def require_premium_purchaser(
 ) -> Optional[discord.Guild]:
     guild = bot.get_guild(int(guild_id))
     if guild and can_purchase_premium(interaction.user.id, guild_id):
-        return guild
+        if await require_support_membership(interaction) and await guild_owner_verified(guild):
+            return guild
+        await safe_reply(interaction, "🔒 Pemilik Server wajib terverifikasi sebelum checkout Premium.", view=StartVerifyView())
+        return None
 
     await safe_reply(
         interaction,
@@ -9479,7 +9674,7 @@ def access_role_label(
 
 async def is_user_in_required_guild(user_id: int) -> bool:
     if not REQUIRED_GUILD_ID:
-        return True
+        return False
 
     required = bot.get_guild(REQUIRED_GUILD_ID)
 
@@ -9489,9 +9684,6 @@ async def is_user_in_required_guild(user_id: int) -> bool:
             REQUIRED_GUILD_ID
         )
         return False
-
-    if required.get_member(user_id):
-        return True
 
     try:
         await required.fetch_member(user_id)
@@ -9834,8 +10026,8 @@ async def refresh_guild_owner_verification(
     user_active: bool = False
 ) -> bool:
     if not REQUIRED_GUILD_ID:
-        verified = True
-        reason = "REQUIRED_GUILD_ID tidak dikonfigurasi."
+        verified = False
+        reason = "REQUIRED_GUILD_ID belum dikonfigurasi; akses ditahan."
     else:
         verified = await is_user_in_required_guild(
             guild.owner_id
@@ -9872,6 +10064,7 @@ async def verify_owned_guilds_for_user(
             source="owner_manual_refresh",
             user_active=True
         ):
+            maybe_activate_premium_trial(guild.id, guild.owner_id, source="verified_support_join")
             verified_count += 1
 
     return verified_count, len(owned)
@@ -9908,6 +10101,8 @@ async def auto_verify_owned_guilds_for_member(
             ),
             user_active=bool(verified)
         )
+        if verified:
+            maybe_activate_premium_trial(guild.id, guild.owner_id, source="verified_support_join")
         updated += 1
 
     return updated
@@ -10067,6 +10262,20 @@ async def guild_owner_verified(guild: discord.Guild) -> bool:
         source="live_check",
         user_active=False
     )
+
+
+def required_guild_invite_url() -> str:
+    url = valid_public_http_url(REQUIRED_GUILD_INVITE)
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return ""
+    if parsed.hostname == "discord.gg" and parsed.path.strip("/"):
+        return url
+    if parsed.hostname in {"discord.com", "www.discord.com", "discordapp.com", "www.discordapp.com"} and parsed.path.startswith("/invite/") and parsed.path[8:].strip("/"):
+        return url
+    return ""
 
 
 def required_join_text() -> str:
@@ -11441,6 +11650,14 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
         except Exception:
             pass
     embed.add_field(name="Status", value=" • ".join(status_parts), inline=False)
+    # A second route remains visible if a Discord mobile client fails to open
+    # the message's URL buttons. These are standard HTTPS links, not callbacks.
+    if profile_url:
+        embed.add_field(
+            name="Tautan",
+            value=f"[▶️ Tonton LIVE]({live_url}) • [👤 Profil TikTok]({profile_url})",
+            inline=False
+        )
     if live_since:
         try:
             embed.add_field(name="Mulai LIVE", value=f"<t:{int(live_since)}:R>", inline=True)
@@ -11502,6 +11719,9 @@ async def _deliver_notification_now(
         content_parts.append(content_override)
 
     content = "\n".join(content_parts) if content_parts else None
+    guild_for_gate = bot.get_guild(int(host["guild_id"]))
+    if not guild_for_gate or not await guild_owner_verified(guild_for_gate):
+        return False
     success_any = False
     success_all = True
     sent_channels = set()
@@ -11720,6 +11940,11 @@ async def resend_notification_record(record_id: int) -> bool:
             json.loads(row["embed_json"])
         )
         host = get_host(int(row["host_id"])) if row["host_id"] else None
+        if not host:
+            return False
+        guild = bot.get_guild(int(host["guild_id"]))
+        if not guild or not await guild_owner_verified(guild):
+            return False
         link_view = notification_link_view(host, row["source_url"], row["event_type"]) if host else None
         await channel.send(
             content=row["content"],
@@ -14473,7 +14698,7 @@ async def monitor_loop():
                 )
                 return
 
-            if REQUIRED_GUILD_ID and not await guild_owner_verified(guild):
+            if not await guild_owner_verified(guild):
                 set_host_health(
                     host["id"],
                     "Owner server belum join Discord Owner/Support."
@@ -14598,6 +14823,11 @@ async def pending_notification_loop():
     for row in rows:
         if notifications_paused():
             break
+        host_for_gate = get_host(int(row["host_id"]))
+        if host_for_gate:
+            guild_for_gate = bot.get_guild(int(host_for_gate["guild_id"]))
+            if not guild_for_gate or not await guild_owner_verified(guild_for_gate):
+                continue
         if not claim_pending_notification(int(row["id"])):
             continue
         host = get_host(int(row["host_id"]))
@@ -17530,10 +17760,10 @@ def start_verify_embed(user_id: int, verified: bool):
             color=discord.Color.orange()
         )
 
-        if REQUIRED_GUILD_INVITE:
+        if required_guild_invite_url():
             embed.add_field(
                 name="Server Support",
-                value=REQUIRED_GUILD_INVITE,
+                value=required_guild_invite_url(),
                 inline=False
             )
 
@@ -17541,17 +17771,61 @@ def start_verify_embed(user_id: int, verified: bool):
     return embed
 
 
+async def require_support_membership(interaction: discord.Interaction) -> bool:
+    if is_global_owner(interaction.user.id):
+        return True
+    if await refresh_user_verification(interaction.user.id, source="access_live_check", mark_active=True):
+        return True
+    await safe_reply(interaction, "🔒 Join server resmi lalu tekan Verifikasi Join.",
+                     embed=start_verify_embed(interaction.user.id, False), view=StartVerifyView())
+    return False
+
+
+async def verify_support_button(interaction: discord.Interaction) -> bool:
+    """Bind verification to the clicking user; never grant access from a click alone."""
+    await defer_if_needed(interaction, ephemeral=True)
+    if not REQUIRED_GUILD_ID:
+        await safe_reply(interaction, "⚠️ Server wajib belum dikonfigurasi. Hubungi owner bot.")
+        return False
+    verified = await refresh_user_verification(interaction.user.id, source="join_button", mark_active=True)
+    if not verified:
+        await safe_reply(interaction, "❌ Keanggotaan belum terkonfirmasi. Join server support, lalu coba lagi.", view=StartVerifyView())
+        return False
+    count, total = await verify_owned_guilds_for_user(interaction.user.id)
+    embed = start_verify_embed(interaction.user.id, True)
+    embed.add_field(name="Server milikmu", value=f"{count}/{total} server terverifikasi. Gunakan /menu di DM.", inline=False)
+    await safe_reply(interaction, "", embed=embed)
+    return True
+
+
+class GuildJoinVerifyView(discord.ui.View):
+    """Persistent public onboarding; only the current server owner may unlock."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        invite = required_guild_invite_url()
+        if invite:
+            self.add_item(discord.ui.Button(label="Join Server Support", emoji="🔗", style=discord.ButtonStyle.link, url=invite))
+
+    @discord.ui.button(label="Verifikasi Join", emoji="✅", style=discord.ButtonStyle.success,
+                       custom_id="hi_notifku:guild_join_verify")
+    async def verify_join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or int(interaction.guild.owner_id) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Verifikasi server hanya boleh dilakukan oleh Pemilik Server saat ini.")
+            return
+        await verify_support_button(interaction)
+
+
 class StartVerifyView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-        if REQUIRED_GUILD_INVITE:
+        if required_guild_invite_url():
             self.add_item(
                 discord.ui.Button(
                     label="Join Server Support",
                     emoji="🔗",
                     style=discord.ButtonStyle.link,
-                    url=REQUIRED_GUILD_INVITE
+                    url=required_guild_invite_url()
                 )
             )
 
@@ -17566,37 +17840,7 @@ class StartVerifyView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
-        # Global owner bypass
-        if is_global_owner(interaction.user.id):
-            await interaction.response.edit_message(
-                embed=start_verify_embed(
-                    interaction.user.id,
-                    True
-                ),
-                view=None
-            )
-            return
-
-        verified = await is_user_in_required_guild(
-            interaction.user.id
-        )
-
-        if verified:
-            await interaction.response.edit_message(
-                embed=start_verify_embed(
-                    interaction.user.id,
-                    True
-                ),
-                view=None
-            )
-        else:
-            await safe_reply(
-                interaction,
-                (
-                    "❌ Kamu belum terdeteksi sebagai member Server Resmi Owner/Support.\n"
-                    "Join server terlebih dahulu lalu tekan **Verifikasi Join** lagi."
-                )
-            )
+        await verify_support_button(interaction)
 
 
 def user_server_embed(guild: discord.Guild):
@@ -20343,6 +20587,11 @@ class UserPremiumPackageSelect(discord.ui.Select):
         )
 
 
+def latest_user_premium_order(user_id: int, guild_id: int):
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM premium_orders WHERE requester_id=? AND guild_id=? ORDER BY id DESC LIMIT 1", (int(user_id), int(guild_id))).fetchone()
+
+
 def latest_open_premium_order(user_id: int, guild_id: int):
     open_statuses = (
         "pending", "proof_submitted", "underpaid", "overpaid",
@@ -20473,6 +20722,16 @@ class UserPremiumView(discord.ui.View):
             ),
             view=UserPremiumConfirmView(self.guild_id, self.user_id, days, price, quote_id=int(quote["id"]))
         )
+
+    @discord.ui.button(label="Transaksi Terakhir", emoji="💳", style=discord.ButtonStyle.primary, row=1)
+    async def last_transaction(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        order = latest_user_premium_order(self.user_id, self.guild_id)
+        if not order:
+            await safe_reply(interaction, "ℹ️ Belum ada transaksi untuk server ini.")
+            return
+        await interaction.response.edit_message(embed=payment_checkout_embed(order), attachments=[], view=PaymentConfirmView(int(order["id"])))
 
     @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
     async def history(self, interaction, button):
@@ -25825,10 +26084,13 @@ class PaymentMethodSelect(discord.ui.Select):
             await safe_reply(interaction, "❌ Ini bukan request milikmu.")
             return
 
-        assign_order_payment_method(
-            self.order_id,
-            method_id
-        )
+        if not await require_premium_purchaser(interaction, int(order["guild_id"])):
+            return
+        try:
+            assign_order_payment_method(self.order_id, method_id)
+        except ValueError as exc:
+            await safe_reply(interaction, f"❌ {exc}")
+            return
 
         order = get_premium_order(self.order_id)
         method = get_payment_method(method_id)
@@ -25944,6 +26206,11 @@ class PaymentProofDetailsModal(discord.ui.Modal):
             await safe_reply(interaction, "🔒 Invoice ini bukan milikmu.")
             return
 
+        if not payment_checkout_state(order)["can_pay"]:
+            await safe_reply(interaction, "❌ Invoice sudah diproses atau kedaluwarsa.")
+            return
+        if not await require_premium_purchaser(interaction, int(order["guild_id"])):
+            return
         raw_amount = (
             self.amount.value
             .strip()
@@ -25995,7 +26262,56 @@ class PaymentProofDetailsModal(discord.ui.Modal):
 class PaymentConfirmView(discord.ui.View):
     def __init__(self, order_id: int):
         super().__init__(timeout=900)
-        self.order_id = order_id
+        self.order_id = int(order_id)
+        order = get_premium_order(self.order_id)
+        state = payment_checkout_state(order) if order else {"can_pay": False, "can_receipt": False}
+        for child in self.children:
+            if child.label in {"Saya Sudah Bayar", "Metode / Bayar", "Kembali"}:
+                child.disabled = not state["can_pay"]
+            elif child.label == "Kuitansi":
+                child.disabled = not state["can_receipt"]
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        order = get_premium_order(self.order_id)
+        if not order or int(order["requester_id"]) != int(interaction.user.id):
+            await safe_reply(interaction, "🔒 Invoice ini bukan milikmu.")
+            return False
+        return True
+
+    @discord.ui.button(label="Cek Status", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if action_rate_limited(interaction.user.id, "payment_status"):
+            await safe_reply(interaction, "⏳ Tunggu beberapa detik sebelum memeriksa lagi.")
+            return
+        order = get_premium_order(self.order_id)
+        await interaction.response.edit_message(embed=payment_checkout_embed(order), attachments=[], view=PaymentConfirmView(self.order_id))
+
+    @discord.ui.button(label="Metode / Bayar", emoji="💳", style=discord.ButtonStyle.primary, row=0)
+    async def choose_method(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+        if not payment_checkout_state(order)["can_pay"]:
+            await safe_reply(interaction, "ℹ️ Invoice sudah diproses atau kedaluwarsa. Gunakan Cek Status.")
+            return
+        await interaction.response.edit_message(embed=payment_checkout_embed(order), attachments=[], view=PaymentMethodSelectView(self.order_id))
+
+    @discord.ui.button(label="Kuitansi", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
+    async def receipt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+        if not payment_receipt_eligible(order):
+            await safe_reply(interaction, "⏳ Kuitansi tersedia setelah pembayaran terkonfirmasi.")
+            return
+        await defer_if_needed(interaction, ephemeral=True)
+        try:
+            png = await asyncio.to_thread(payment_receipt_image_bytes, order)
+            await interaction.followup.send(embed=payment_receipt_embed(order), file=discord.File(io.BytesIO(png), filename=f"kuitansi-{self.order_id}.png"), ephemeral=True)
+        except Exception as exc:
+            await report_interaction_error(interaction, exc, context="payment_receipt_download")
+
+    @discord.ui.button(label="Bantuan", emoji="🆘", style=discord.ButtonStyle.secondary, row=1)
+    async def help_payment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = get_premium_order(self.order_id)
+        reference = order["invoice_ref"] or ensure_invoice_ref(order["id"])
+        await safe_reply(interaction, f"🆘 Bantuan invoice `{reference}`\nSertakan nomor invoice dan kendala saat membuat tiket.\nGunakan menu Bantuan untuk menghubungi tim support.", view=UserSupportView(interaction.user.id))
 
     @discord.ui.button(
         label="Saya Sudah Bayar",
@@ -26016,7 +26332,7 @@ class PaymentConfirmView(discord.ui.View):
             )
             return
 
-        if order["status"] != "pending":
+        if not payment_checkout_state(order)["can_pay"]:
             await safe_reply(
                 interaction,
                 f"ℹ️ Status request saat ini: **{order_status_label(order['status'])}**"
@@ -26030,6 +26346,8 @@ class PaymentConfirmView(discord.ui.View):
             )
             return
 
+        if not await require_premium_purchaser(interaction, int(order["guild_id"])):
+            return
         await interaction.response.send_modal(
             PaymentProofDetailsModal(self.order_id)
         )
@@ -26079,8 +26397,8 @@ class PaymentConfirmView(discord.ui.View):
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         order = get_premium_order(self.order_id)
 
-        if not order:
-            await safe_reply(interaction, "❌ Request tidak ditemukan.")
+        if not order or not payment_checkout_state(order)["can_pay"]:
+            await safe_reply(interaction, "ℹ️ Invoice tidak dapat diubah. Gunakan Cek Status.")
             return
 
         embed = discord.Embed(
@@ -33109,22 +33427,9 @@ async def menu_command(interaction: discord.Interaction):
                 )
                 return
 
-            verified = user_verification_is_active(
-                interaction.user.id
+            verified = await refresh_user_verification(
+                interaction.user.id, source="menu_live_check", mark_active=True
             )
-
-            if not verified:
-                # Recovery path: if cache expired/missing but user is still
-                # a Support member, verify automatically without manual approval.
-                verified = await refresh_user_verification(
-                    interaction.user.id,
-                    source="menu_auto_refresh",
-                    mark_active=True
-                )
-            else:
-                touch_user_verification_activity(
-                    interaction.user.id
-                )
 
             if verified:
                 await verify_owned_guilds_for_user(
@@ -33137,7 +33442,7 @@ async def menu_command(interaction: discord.Interaction):
                     (
                         "🔒 Kamu belum terverifikasi.\n"
                         "Join **Server Owner/Support** terlebih dahulu. "
-                        "Verifikasi akan aktif otomatis. Setelah terverifikasi, status user disimpan hingga 30 hari sejak aktivitas terakhir."
+                        "Tekan Verifikasi Join. Keanggotaan diperiksa kembali saat akses."
                     ),
                     embed=start_verify_embed(
                         interaction.user.id,
@@ -33837,9 +34142,7 @@ async def on_guild_update(
 async def on_guild_join(guild: discord.Guild):
     try:
         ensure_guild(guild.id)
-        trial_expires_at = maybe_activate_premium_trial(
-            guild.id, guild.owner_id, source="auto_join"
-        )
+        trial_expires_at = None
 
         verified = await refresh_guild_owner_verification(
             guild,
@@ -33847,13 +34150,19 @@ async def on_guild_join(guild: discord.Guild):
             user_active=True
         )
 
-        if REQUIRED_GUILD_ID and not verified:
+        if verified:
+            trial_expires_at = maybe_activate_premium_trial(guild.id, guild.owner_id, source="verified_join")
+        if not verified:
             channel = guild.system_channel
 
+            if channel is not None:
+                permissions = channel.permissions_for(guild.me)
+                if not (permissions.view_channel and permissions.send_messages and permissions.embed_links):
+                    channel = None
             if channel is None:
                 for candidate in guild.text_channels:
                     perms = candidate.permissions_for(guild.me)
-                    if perms.view_channel and perms.send_messages:
+                    if perms.view_channel and perms.send_messages and perms.embed_links:
                         channel = candidate
                         break
 
@@ -33870,11 +34179,15 @@ async def on_guild_join(guild: discord.Guild):
                     color=discord.Color.orange()
                 )
 
-                await channel.send(
-                    content=f"<@{guild.owner_id}>",
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions(users=True)
-                )
+                try:
+                    await channel.send(
+                        content=f"<@{guild.owner_id}>",
+                        embed=embed,
+                        view=GuildJoinVerifyView(),
+                        allowed_mentions=discord.AllowedMentions(users=True)
+                    )
+                except Exception:
+                    log.warning("Onboarding channel gagal guild_id=%s; coba DM owner", guild.id)
 
         try:
             owner_user = guild.owner or await guild.fetch_member(guild.owner_id)
@@ -33895,7 +34208,8 @@ async def on_guild_join(guild: discord.Guild):
                     f"Server: **{guild.name}** (`{guild.id}`)\n\n"
                     + required_join_text()
                     + "\n\nSetelah join Server Owner/Support, gunakan `/start` hanya jika ingin refresh manual "
-                    "di DM Hi Notifku. Notifier belum aktif sebelum verifikasi berhasil."
+                    "di DM Hi Notifku. Notifier belum aktif sebelum verifikasi berhasil.",
+                    view=StartVerifyView()
                 )
         except Exception:
             pass
@@ -34313,6 +34627,7 @@ async def on_ready():
         )
     try:
         bot.add_view(StartVerifyView())
+        bot.add_view(GuildJoinVerifyView())
         persistent_count = register_pending_persistent_views()
         log.info("Persistent request views registered: %s", persistent_count)
     except Exception:
