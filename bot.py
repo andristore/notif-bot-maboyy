@@ -46,8 +46,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.14.0"
-CURRENT_SCHEMA_VERSION = 27
+APP_VERSION = "1.14.4"
+CURRENT_SCHEMA_VERSION = 28
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -1290,6 +1290,28 @@ def migrate_database():
         add_column_if_missing(conn, "premium_orders", "activation_target_expires_at", "INTEGER")
         add_column_if_missing(conn, "premium_orders", "activation_effect_applied", "INTEGER NOT NULL DEFAULT 0")
 
+        # Short-lived payment quotes reserve the unique transfer code before an invoice is created.
+        # This lets the confirmation screen show the exact unique code and transfer total without
+        # risking a different amount when the user presses Create Invoice.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS premium_payment_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                days INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                unique_code INTEGER NOT NULL,
+                expected_amount INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed_at INTEGER
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_premium_payment_quotes_lookup
+            ON premium_payment_quotes(guild_id, user_id, expires_at, consumed_at)
+        """)
+
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_premium_orders_payment_reference
             ON premium_orders(payment_reference)
@@ -1955,8 +1977,12 @@ def migrate_database():
             expires = int(customer["current_expires_at"] or 0) or None
             active_now = False
             if settings_row:
-                effective_until = int(settings_row["premium_grace_until"] or settings_row["premium_expires_at"] or 0)
-                active_now = str(settings_row["plan"]) == "premium" and effective_until > int(time.time())
+                raw_expiry = settings_row["premium_expires_at"]
+                effective_until = int(settings_row["premium_grace_until"] or raw_expiry or 0)
+                active_now = (
+                    str(settings_row["plan"] or "free") == "premium"
+                    and (not raw_expiry or effective_until > int(time.time()))
+                )
             conn.execute("""
                 INSERT INTO premium_customers(
                     guild_id, guild_name, first_buyer_id, last_buyer_id,
@@ -4029,7 +4055,7 @@ async def notify_primary_owners_premium_request(
         description=(
             f"**{guild.name}** • **{days} hari** • **{rupiah(price)}**\n"
             f"Peminta: <@{requester.id}>\n"
-            "Buka `/owner` → **Request** untuk memproses."
+            "Buka `/owner` → **Payment** untuk memantau transaksi."
         ),
         color=discord.Color.gold()
     )
@@ -4618,8 +4644,9 @@ def record_premium_customer_activation(order_id: int, *, source: str = "payment"
             or 0
         )
         active_now = bool(
-            settings and str(settings["plan"]) == "premium"
-            and effective_until > int(time.time())
+            settings
+            and str(settings["plan"] or "free") == "premium"
+            and (not settings["premium_expires_at"] or effective_until > int(time.time()))
         )
 
         conn.execute("""
@@ -5740,11 +5767,93 @@ ORDER_STATUSES = {
 }
 
 
+PREMIUM_QUOTE_TTL_SECONDS = 15 * 60
+
+
+def get_or_create_premium_payment_quote(guild_id: int, user_id: int, days: int, price: int):
+    """Reserve an exact unique code/transfer total before invoice creation.
+
+    Reservation is persisted in SQLite and expires automatically, so the amount shown on
+    the confirmation screen is the same amount used by the invoice.
+    """
+    now = int(time.time())
+    guild_id = int(guild_id)
+    user_id = int(user_id)
+    days = int(days)
+    price = int(price)
+
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM premium_payment_quotes WHERE consumed_at IS NULL AND expires_at<=?",
+            (now,)
+        )
+
+        existing = conn.execute("""
+            SELECT * FROM premium_payment_quotes
+            WHERE guild_id=? AND user_id=? AND days=? AND price=?
+              AND consumed_at IS NULL AND expires_at>?
+            ORDER BY id DESC LIMIT 1
+        """, (guild_id, user_id, days, price, now)).fetchone()
+        if existing:
+            conn.commit()
+            return existing
+
+        reserved_amounts = {
+            int(row["expected_amount"])
+            for row in conn.execute("""
+                SELECT expected_amount FROM premium_payment_quotes
+                WHERE consumed_at IS NULL AND expires_at>?
+            """, (now,)).fetchall()
+        }
+        active_amounts = {
+            int(row["expected_amount"])
+            for row in conn.execute("""
+                SELECT expected_amount FROM premium_orders
+                WHERE expected_amount IS NOT NULL
+                  AND status IN ('pending','proof_submitted','amount_mismatch','underpaid','overpaid','amount_verified','paid','processing','late_payment','refund_pending')
+            """).fetchall()
+        }
+
+        chosen_code = None
+        expected_amount = None
+        for code_value in range(1, 1000):
+            candidate = price + code_value
+            if candidate not in reserved_amounts and candidate not in active_amounts:
+                chosen_code = code_value
+                expected_amount = candidate
+                break
+
+        if chosen_code is None:
+            conn.rollback()
+            raise RuntimeError("Semua kode unik 001-999 sedang digunakan. Coba lagi nanti.")
+
+        expires_at = now + PREMIUM_QUOTE_TTL_SECONDS
+        cur = conn.execute("""
+            INSERT INTO premium_payment_quotes(
+                guild_id,user_id,days,price,unique_code,expected_amount,created_at,expires_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+        """, (guild_id,user_id,days,price,chosen_code,expected_amount,now,expires_at))
+        quote_id = int(cur.lastrowid)
+        conn.commit()
+
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM premium_payment_quotes WHERE id=?", (quote_id,)).fetchone()
+
+
+def get_premium_payment_quote(quote_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM premium_payment_quotes WHERE id=?", (int(quote_id),)
+        ).fetchone()
+
+
 def create_premium_order(
     guild_id: int,
     requester_id: int,
     days: int,
-    price: int
+    price: int,
+    quote_id: Optional[int] = None
 ) -> int:
     """Create one active Premium invoice per server.
 
@@ -5760,16 +5869,63 @@ def create_premium_order(
         raise ValueError(reason)
 
     now = int(time.time())
-    unique_code, expected_amount = generate_collision_free_payment_code(int(price))
     deadline = now + (INVOICE_EXPIRE_MINUTES * 60)
     active_statuses = (
         "pending", "proof_submitted", "amount_mismatch",
-        "underpaid", "overpaid", "amount_verified", "paid", "processing"
+        "underpaid", "overpaid", "amount_verified", "paid", "processing",
+        "late_payment", "refund_pending"
     )
     placeholders = ",".join("?" for _ in active_statuses)
 
     with closing(db()) as conn:
         conn.execute("BEGIN IMMEDIATE")
+
+        quote = None
+        if quote_id is not None:
+            quote = conn.execute("SELECT * FROM premium_payment_quotes WHERE id=?", (int(quote_id),)).fetchone()
+            if not quote:
+                conn.rollback()
+                raise ValueError("Detail pembayaran sudah tidak tersedia. Buka ulang paket Premium.")
+            if int(quote["expires_at"] or 0) <= now or quote["consumed_at"] is not None:
+                conn.rollback()
+                raise ValueError("Kode unik sudah kedaluwarsa. Buka ulang paket Premium untuk mendapatkan kode baru.")
+            if (
+                int(quote["guild_id"]) != int(guild_id)
+                or int(quote["user_id"]) != int(requester_id)
+                or int(quote["days"]) != int(days)
+                or int(quote["price"]) != int(price)
+            ):
+                conn.rollback()
+                raise ValueError("Detail pembayaran tidak cocok. Buka ulang paket Premium.")
+            unique_code = int(quote["unique_code"])
+            expected_amount = int(quote["expected_amount"])
+        else:
+            # Compatibility path for owner/internal flows that create an invoice directly.
+            used_amounts = {
+                int(row["expected_amount"])
+                for row in conn.execute("""
+                    SELECT expected_amount FROM premium_orders
+                    WHERE expected_amount IS NOT NULL
+                      AND status IN ('pending','proof_submitted','amount_mismatch','underpaid','overpaid','amount_verified','paid','processing','late_payment','refund_pending')
+                """).fetchall()
+            }
+            used_amounts.update(
+                int(row["expected_amount"])
+                for row in conn.execute("""
+                    SELECT expected_amount FROM premium_payment_quotes
+                    WHERE consumed_at IS NULL AND expires_at>?
+                """, (now,)).fetchall()
+            )
+            unique_code = expected_amount = None
+            for code_value in range(1, 1000):
+                candidate = int(price) + code_value
+                if candidate not in used_amounts:
+                    unique_code, expected_amount = code_value, candidate
+                    break
+            if unique_code is None:
+                conn.rollback()
+                raise ValueError("Semua kode unik sedang digunakan. Coba lagi nanti.")
+
         existing = conn.execute(f"""
             SELECT id, requester_id, days, price
             FROM premium_orders
@@ -5807,10 +5963,44 @@ def create_premium_order(
             now, now, unique_code, expected_amount, deadline
         ))
         order_id = int(cur.lastrowid)
+        if quote_id is not None:
+            conn.execute(
+                "UPDATE premium_payment_quotes SET consumed_at=? WHERE id=?",
+                (now, int(quote_id))
+            )
         conn.commit()
 
     ensure_invoice_ref(order_id)
     return order_id
+
+
+def rollback_unpaid_premium_order(order_id: int, quote_id: Optional[int] = None) -> bool:
+    """Remove only a just-created untouched invoice after checkout preparation fails."""
+    now = int(time.time())
+    with closing(db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT * FROM premium_orders WHERE id=?", (int(order_id),)).fetchone()
+        if not order:
+            conn.rollback()
+            return False
+        safe = (
+            str(order["status"]) == "pending"
+            and not order["proof_url"]
+            and order["received_amount"] is None
+            and not order["activated_at"]
+            and not int(order["amount_verified"] or 0)
+        )
+        if not safe:
+            conn.rollback()
+            return False
+        conn.execute("DELETE FROM premium_orders WHERE id=?", (int(order_id),))
+        if quote_id is not None:
+            conn.execute(
+                "UPDATE premium_payment_quotes SET consumed_at=NULL WHERE id=? AND consumed_at IS NOT NULL AND expires_at>?",
+                (int(quote_id), now)
+            )
+        conn.commit()
+        return True
 
 
 def get_premium_order(order_id: int):
@@ -6114,7 +6304,89 @@ def mark_reminder_sent(guild_id: int, expires_at: int, days_before: int):
 # PAYMENT METHODS / QRIS / PROOFS
 # ============================================================
 
+def recover_payment_methods_if_empty():
+    """Best-effort recovery for legacy/static QRIS setups.
+
+    Older deployments could have a QRIS image/settings without a row in
+    payment_methods. Recover it automatically so Premium checkout does not
+    create a dead-end invoice.
+    """
+    try:
+        with closing(db()) as conn:
+            existing = conn.execute(
+                "SELECT COUNT(*) AS n FROM payment_methods"
+            ).fetchone()
+            if existing and int(existing["n"] or 0) > 0:
+                return
+
+            now = int(time.time())
+            legacy = None
+            if table_exists(conn, "payment_settings"):
+                legacy = conn.execute(
+                    "SELECT * FROM payment_settings WHERE id=1"
+                ).fetchone()
+
+            if legacy and (
+                legacy["method_name"]
+                or legacy["account_number"]
+                or legacy["qris_url"]
+            ):
+                method_type = "qris" if legacy["qris_url"] else "account"
+                conn.execute(
+                    """
+                    INSERT INTO payment_methods(
+                        method_type, method_name, account_name, account_number,
+                        payment_note, qris_image_url, qris_image_path, enabled,
+                        created_at, updated_at
+                    )
+                    VALUES(?,?,?,?,?,?,NULL,1,?,?)
+                    """,
+                    (
+                        method_type,
+                        legacy["method_name"] or (
+                            "QRIS Hi Notifku" if method_type == "qris" else "Pembayaran"
+                        ),
+                        legacy["account_name"],
+                        legacy["account_number"],
+                        legacy["payment_note"],
+                        legacy["qris_url"],
+                        now, now
+                    )
+                )
+                conn.commit()
+                return
+
+            # Last-resort recovery: reuse an existing QRIS image stored on the
+            # Railway volume even if its old DB row disappeared.
+            storage = Path(QRIS_STORAGE_DIR)
+            if storage.exists():
+                candidates = sorted(
+                    [x for x in storage.iterdir()
+                     if x.is_file() and x.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+                     and x.name.lower().startswith("qris")],
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True
+                )
+                if candidates:
+                    conn.execute(
+                        """
+                        INSERT INTO payment_methods(
+                            method_type, method_name, account_name, account_number,
+                            payment_note, qris_image_url, qris_image_path, enabled,
+                            created_at, updated_at
+                        )
+                        VALUES('qris','QRIS Hi Notifku','','',
+                               'Scan QRIS dan transfer tepat sesuai total invoice.',
+                               NULL,?,1,?,?)
+                        """,
+                        (str(candidates[0]), now, now)
+                    )
+                    conn.commit()
+    except Exception:
+        log.exception("Gagal memulihkan metode pembayaran legacy")
+
 def list_payment_methods(enabled_only: bool = True):
+    recover_payment_methods_if_empty()
     with closing(db()) as conn:
         if enabled_only:
             rows = conn.execute("""
@@ -6140,6 +6412,22 @@ def get_payment_method(method_id: int):
             (int(method_id),)
         ).fetchone()
 
+
+def payment_method_usable(method) -> bool:
+    """Return whether an enabled payment method can actually be shown/used."""
+    if not method or not int(method["enabled"] or 0):
+        return False
+    kind = str(method["method_type"] or "").lower()
+    if kind == "qris":
+        path_value = method["qris_image_path"] if "qris_image_path" in method.keys() else None
+        local_ready = bool(path_value and Path(path_value).exists() and Path(path_value).is_file())
+        remote_ready = bool(method["qris_image_url"])
+        return local_ready or remote_ready
+    return bool(str(method["account_number"] or "").strip())
+
+
+def list_usable_payment_methods():
+    return [m for m in list_payment_methods(True) if payment_method_usable(m)]
 
 
 def ensure_qris_storage_dir() -> Path:
@@ -6398,7 +6686,7 @@ def delete_payment_method(method_id: int):
 
 
 def payment_methods_ready() -> bool:
-    return bool(list_payment_methods(True))
+    return bool(list_usable_payment_methods())
 
 
 def payment_method_embed(method, order=None):
@@ -6534,8 +6822,8 @@ def payment_methods_overview_embed():
 def assign_order_payment_method(order_id: int, method_id: int):
     method = get_payment_method(method_id)
 
-    if not method or not method["enabled"]:
-        raise ValueError("Metode pembayaran tidak tersedia.")
+    if not payment_method_usable(method):
+        raise ValueError("Metode pembayaran belum siap digunakan.")
 
     with closing(db()) as conn:
         conn.execute("""
@@ -7086,6 +7374,20 @@ def save_payment_proof(
     scan_status = str(scan.get("status") or "review")
 
     with closing(db()) as conn:
+        current = conn.execute(
+            "SELECT status, amount_verified FROM premium_orders WHERE id=?",
+            (int(order_id),)
+        ).fetchone()
+        if not current:
+            raise ValueError("Invoice tidak ditemukan.")
+        current_status = str(current["status"] or "pending")
+        if int(current["amount_verified"] or 0) and current_status in {"amount_verified", "paid"}:
+            next_status = current_status
+        elif current_status == "late_payment":
+            next_status = "late_payment"
+        else:
+            next_status = "proof_submitted"
+
         duplicate = conn.execute("""
             SELECT id
             FROM premium_orders
@@ -7126,7 +7428,7 @@ def save_payment_proof(
                 proof_mime=?,
                 proof_edit_software=?,
                 proof_storage_path=?,
-                status='proof_submitted',
+                status=?,
                 updated_at=?
             WHERE id=?
         """, (
@@ -7148,6 +7450,7 @@ def save_payment_proof(
                 else None
             ),
             str(proof_storage_path)[:500] if proof_storage_path else None,
+            next_status,
             int(time.time()),
             int(order_id)
         ))
@@ -18378,14 +18681,24 @@ class UserPremiumPackageSelect(discord.ui.Select):
             await safe_reply(interaction, "⚠️ Paket berubah. Buka ulang menu Premium.")
             return
 
+        try:
+            quote = get_or_create_premium_payment_quote(
+                self.guild_id, self.user_id, days, price
+            )
+        except Exception as exc:
+            await safe_reply(interaction, f"⚠️ Gagal menyiapkan kode pembayaran: {exc}")
+            return
+
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title="⭐ Konfirmasi Premium",
                 description=(
                     f"Server: **{guild.name}**\n"
                     f"Paket: **{days} hari**\n"
-                    f"Harga: **{rupiah(price)}**\n\n"
-                    "Lanjutkan untuk membuat invoice pembayaran."
+                    f"Harga: **{rupiah(price)}**\n"
+                    f"Kode unik: **{int(quote['unique_code']):03d}**\n"
+                    f"💳 Total transfer: **{rupiah(int(quote['expected_amount']))}**\n\n"
+                    "Nominal di atas sudah termasuk kode unik dan akan tetap sama saat invoice dibuat."
                 ),
                 color=discord.Color.gold()
             ),
@@ -18393,7 +18706,8 @@ class UserPremiumPackageSelect(discord.ui.Select):
                 self.guild_id,
                 self.user_id,
                 days,
-                price
+                price,
+                quote_id=int(quote["id"])
             )
         )
 
@@ -18428,7 +18742,7 @@ async def open_user_premium_payment(interaction: discord.Interaction, order) -> 
     order_id = int(order["id"])
     if order["payment_method_id"]:
         method = get_payment_method(int(order["payment_method_id"]))
-        if method and method["enabled"]:
+        if payment_method_usable(method):
             embed = payment_method_embed(method, order)
             qris_file = apply_qris_attachment_image(embed, method)
             await interaction.response.edit_message(
@@ -18468,13 +18782,6 @@ class UserPremiumView(discord.ui.View):
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
             return None
         return await require_premium_purchaser(interaction, self.guild_id)
-
-    @discord.ui.button(label="Pembayaran", emoji="💳", style=discord.ButtonStyle.primary, row=1)
-    async def payment(self, interaction, button):
-        if not await self.valid(interaction):
-            return
-        order = latest_open_premium_order(self.user_id, self.guild_id)
-        await open_user_premium_payment(interaction, order)
 
     @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
     async def history(self, interaction, button):
@@ -18591,6 +18898,14 @@ class PremiumPromoModal(discord.ui.Modal):
             await safe_reply(interaction, f"❌ {exc}")
             return
 
+        try:
+            quote = get_or_create_premium_payment_quote(
+                self.guild_id, self.user_id, self.days, final_price
+            )
+        except Exception as exc:
+            await safe_reply(interaction, f"⚠️ Gagal menyiapkan kode pembayaran: {exc}")
+            return
+
         await interaction.response.edit_message(
             embed=discord.Embed(
                 title="🎟️ Promo Diterapkan",
@@ -18599,7 +18914,9 @@ class PremiumPromoModal(discord.ui.Modal):
                     f"Paket: **{self.days} hari**\n"
                     f"Harga awal: ~~{rupiah(self.base_price)}~~\n"
                     f"Diskon: **{rupiah(discount)}**\n"
-                    f"Total: **{rupiah(final_price)}**"
+                    f"Harga setelah promo: **{rupiah(final_price)}**\n"
+                    f"Kode unik: **{int(quote['unique_code']):03d}**\n"
+                    f"💳 Total transfer: **{rupiah(int(quote['expected_amount']))}**"
                 ),
                 color=discord.Color.green()
             ),
@@ -18609,7 +18926,8 @@ class PremiumPromoModal(discord.ui.Modal):
                 self.days,
                 final_price,
                 base_price=self.base_price,
-                coupon_code=code_value
+                coupon_code=code_value,
+                quote_id=int(quote["id"])
             )
         )
 
@@ -18625,7 +18943,8 @@ class UserPremiumConfirmView(discord.ui.View):
         price: int,
         *,
         base_price: Optional[int] = None,
-        coupon_code: Optional[str] = None
+        coupon_code: Optional[str] = None,
+        quote_id: Optional[int] = None
     ):
         super().__init__(timeout=180)
         self.guild_id = int(guild_id)
@@ -18636,6 +18955,7 @@ class UserPremiumConfirmView(discord.ui.View):
             base_price if base_price is not None else price
         )
         self.coupon_code = coupon_code
+        self.quote_id = int(quote_id) if quote_id is not None else None
 
     async def _create_invoice(self, interaction: discord.Interaction, *, prefer_qris: bool = False):
         if int(interaction.user.id) != self.user_id:
@@ -18662,21 +18982,32 @@ class UserPremiumConfirmView(discord.ui.View):
             await safe_reply(interaction, "⚠️ Paket berubah. Buka ulang menu Premium.")
             return
 
-        available_methods = list_payment_methods(True)
+        available_methods = list_usable_payment_methods()
         preferred_qris = next(
             (m for m in available_methods if m["method_type"] == "qris"),
             None
         )
+
+        # Never create a dead-end invoice. Payment must be ready first.
+        if not available_methods:
+            await safe_reply(
+                interaction,
+                "⚠️ Metode pembayaran belum dikonfigurasi. Invoice **belum dibuat**. "
+                "Silakan hubungi Global Owner agar QRIS diaktifkan."
+            )
+            return
+
         if prefer_qris and not preferred_qris:
             await safe_reply(
                 interaction,
-                "⚠️ QRIS belum tersedia. Gunakan **Buat Invoice** untuk memilih metode lain."
+                "⚠️ QRIS belum tersedia. Invoice **belum dibuat**."
             )
             return
 
         try:
             order_id = create_premium_order(
-                guild.id, interaction.user.id, self.days, self.price
+                guild.id, interaction.user.id, self.days, self.price,
+                quote_id=self.quote_id
             )
         except ValueError as exc:
             await safe_reply(interaction, f"⚠️ {exc}")
@@ -18691,9 +19022,11 @@ class UserPremiumConfirmView(discord.ui.View):
                     base_price=self.base_price
                 )
             except ValueError as exc:
+                rollback_unpaid_premium_order(order_id, self.quote_id)
                 await safe_reply(interaction, f"❌ Promo gagal: {exc}")
                 return
             if final_price != int(self.price):
+                rollback_unpaid_premium_order(order_id, self.quote_id)
                 await safe_reply(interaction, "⚠️ Nilai promo berubah. Buka ulang invoice Premium.")
                 return
             record_premium_event(
@@ -18701,25 +19034,10 @@ class UserPremiumConfirmView(discord.ui.View):
                 detail=f"{self.coupon_code} • diskon {rupiah(discount)}"
             )
 
-        await notify_primary_owners_premium_request(
-            guild, interaction.user, self.days, self.price, order_id
-        )
-
+        # Invoice checkout is automatic. Global Owner is notified only after
+        # proof/payment activity, not before the user can pay.
         order = get_premium_order(order_id)
         methods = available_methods
-        if not methods:
-            await interaction.response.edit_message(
-                embed=discord.Embed(
-                    title=f"✅ Invoice #{order_id} Dibuat",
-                    description=(
-                        "Metode pembayaran belum tersedia. "
-                        "Invoice tersimpan dan owner sudah diberi notifikasi."
-                    ),
-                    color=discord.Color.orange()
-                ),
-                view=UserPremiumHistoryView(self.guild_id, self.user_id)
-            )
-            return
 
         if prefer_qris:
             qris = preferred_qris
@@ -18734,9 +19052,10 @@ class UserPremiumConfirmView(discord.ui.View):
             )
             return
 
-        # If QRIS is the only active method, skip the extra selector automatically.
-        if len(methods) == 1 and methods[0]["method_type"] == "qris":
-            method = methods[0]
+        # Default checkout prefers QRIS automatically whenever it is available.
+        # This keeps the user flow: package -> invoice -> scan QRIS -> proof.
+        if preferred_qris:
+            method = preferred_qris
             assign_order_payment_method(order_id, int(method["id"]))
             order = get_premium_order(order_id)
             embed = payment_method_embed(method, order)
@@ -18744,6 +19063,17 @@ class UserPremiumConfirmView(discord.ui.View):
             await interaction.response.edit_message(
                 embed=embed,
                 attachments=[qris_file] if qris_file else [],
+                view=PaymentConfirmView(order_id)
+            )
+            return
+
+        # If there is only one non-QRIS method, open it directly too.
+        if len(methods) == 1:
+            method = methods[0]
+            assign_order_payment_method(order_id, int(method["id"]))
+            order = get_premium_order(order_id)
+            await interaction.response.edit_message(
+                embed=payment_method_embed(method, order),
                 view=PaymentConfirmView(order_id)
             )
             return
@@ -18763,13 +19093,9 @@ class UserPremiumConfirmView(discord.ui.View):
             embed=embed, view=PaymentMethodSelectView(order_id)
         )
 
-    @discord.ui.button(label="Buat Invoice", emoji="✅", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="Buat Invoice & Bayar", emoji="✅", style=discord.ButtonStyle.success, row=0)
     async def confirm(self, interaction, button):
         await self._create_invoice(interaction, prefer_qris=False)
-
-    @discord.ui.button(label="QRIS Otomatis", emoji="⚡", style=discord.ButtonStyle.primary, row=0)
-    async def auto_qris(self, interaction, button):
-        await self._create_invoice(interaction, prefer_qris=True)
 
     @discord.ui.button(label="Promo", emoji="🎟️", style=discord.ButtonStyle.secondary, row=0)
     async def promo(self, interaction, button):

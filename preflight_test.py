@@ -218,7 +218,9 @@ for required_text in {
     'CREATE TABLE IF NOT EXISTS auto_backup_state',
     'BEGIN IMMEDIATE',
     'label="Pembayaran"',
-    'label="QRIS Otomatis"',
+    'label="Buat Invoice & Bayar"',
+    'recover_payment_methods_if_empty',
+    'Invoice **belum dibuat**',
     'preferred_qris',
     'Auto backup owner DM dilewati untuk mencegah spam.',
 }:
@@ -226,6 +228,50 @@ for required_text in {
         fail(f"v1.14 regression guard missing: {required_text}")
 
 print("OK: Premium payment UX + auto-backup anti-spam v1.14 guards")
+
+
+# Premium quote/unique-code preview guards (v1.14.2).
+for required_def in {
+    "get_or_create_premium_payment_quote",
+    "get_premium_payment_quote",
+}:
+    if required_def not in defs:
+        fail(f"v1.14.2 quote function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS premium_payment_quotes',
+    'PREMIUM_QUOTE_TTL_SECONDS',
+    'Kode unik:',
+    'Total transfer:',
+    'quote_id=self.quote_id',
+    'consumed_at',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.14.2 quote regression guard missing: {required_text}")
+
+print("OK: Premium quote + unique-code preview v1.14.2 guards")
+
+
+# Premium audit hardening v1.14.4.
+for required_def in {
+    "payment_method_usable",
+    "list_usable_payment_methods",
+    "rollback_unpaid_premium_order",
+}:
+    if required_def not in defs:
+        fail(f"v1.14.4 Premium audit function missing: {required_def}")
+
+for required_text in {
+    "list_usable_payment_methods()",
+    "late_payment", "refund_pending",
+    "rollback_unpaid_premium_order(order_id, self.quote_id)",
+    "next_status = current_status",
+    'not settings["premium_expires_at"] or effective_until > int(time.time())',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.14.4 Premium audit guard missing: {required_text}")
+
+print("OK: Premium audit hardening v1.14.4 guards")
 
 # Ensure every explicitly declared Discord component custom_id is unique.
 custom_ids = re.findall(r'custom_id\s*=\s*["\']([^"\']+)["\']', bot_text)
