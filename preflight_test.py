@@ -358,10 +358,10 @@ for required_text in {
     if required_text not in bot_text:
         fail(f"v1.17 update center guard missing: {required_text}")
 
-if 'APP_VERSION = "1.18.0"' not in bot_text:
-    fail("v1.18 APP_VERSION missing")
-if 'CURRENT_SCHEMA_VERSION = 31' not in bot_text:
-    fail("v1.18 schema version missing")
+if 'APP_VERSION = "1.19.0"' not in bot_text:
+    fail("v1.19 APP_VERSION missing")
+if 'CURRENT_SCHEMA_VERSION = 32' not in bot_text:
+    fail("v1.19 schema version missing")
 
 print("OK: Owner Update Info Center v1.17 guards")
 
@@ -402,3 +402,33 @@ for required_text in {
         fail(f"v1.18 operations/support guard missing: {required_text}")
 
 print("OK: Operations, support, error-id and feature-maintenance v1.18 guards")
+
+# Runtime reliability hardening v1.19 guards.
+for required_def in {
+    "runtime_state_snapshot",
+    "mark_runtime_started",
+    "mark_runtime_ready",
+    "mark_runtime_clean_shutdown",
+    "notify_previous_unclean_runtime",
+}:
+    if required_def not in defs:
+        fail(f"v1.19 runtime function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS runtime_state',
+    'RUNTIME_SESSION_ID = hashlib.sha256',
+    'RUNTIME_RECOVERY_NOTICE_SENT = False',
+    '@tasks.loop(seconds=60)\nasync def runtime_heartbeat_loop',
+    'mark_runtime_started()',
+    'mark_runtime_ready()',
+    'mark_runtime_clean_shutdown()',
+    'runtime_heartbeat_loop.start()',
+    'runtime_heartbeat_loop,',
+    '"runtime_state",',
+    'storage_mode = "Persistent /data"',
+    'Heartbeat **{heartbeat_age}s**',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.19 runtime reliability guard missing: {required_text}")
+
+print("OK: Runtime heartbeat, recovery and storage-health v1.19 guards")

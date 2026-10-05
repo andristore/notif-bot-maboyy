@@ -47,8 +47,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.18.0"
-CURRENT_SCHEMA_VERSION = 31
+APP_VERSION = "1.19.0"
+CURRENT_SCHEMA_VERSION = 32
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -57,6 +57,12 @@ BUILD_ID = (
     os.getenv("RAILWAY_DEPLOYMENT_ID", "")
     or os.getenv("BUILD_ID", "")
 ).strip()
+RUNTIME_SESSION_ID = hashlib.sha256(
+    f"{time.time_ns()}:{os.getpid()}".encode("utf-8")
+).hexdigest()[:16]
+PREVIOUS_RUNTIME_UNCLEAN = False
+PREVIOUS_RUNTIME_LAST_SEEN = 0
+RUNTIME_RECOVERY_NOTICE_SENT = False
 FULL_BACKUP_HOURS = max(
     6,
     int(os.getenv("FULL_BACKUP_HOURS", "168"))
@@ -1032,6 +1038,21 @@ def migrate_database():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_interaction_errors_created ON interaction_errors(created_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_state (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                session_id TEXT,
+                started_at INTEGER,
+                ready_at INTEGER,
+                last_seen_at INTEGER,
+                clean_shutdown_at INTEGER,
+                last_version TEXT,
+                last_build_id TEXT,
+                updated_at INTEGER
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO runtime_state(id, updated_at) VALUES(1, ?)", (int(time.time()),))
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS host_plan_pause (
@@ -27974,6 +27995,12 @@ def owner_system_health_embed():
         recent_errors = int(conn.execute("SELECT COUNT(*) AS c FROM interaction_errors WHERE created_at>?", (int(time.time())-86400,)).fetchone()["c"] or 0)
     report = database_integrity_report()
     integrity_total = sum(int(v or 0) for v in report.values())
+    runtime = runtime_state_snapshot()
+    heartbeat_age = max(0, int(time.time()) - int(runtime["last_seen_at"] or 0)) if runtime and runtime["last_seen_at"] else None
+    storage_mode = "Persistent /data" if str(Path(DB_PATH)).startswith("/data/") else "Local container"
+    with closing(db()) as conn:
+        last_backup = conn.execute("SELECT MAX(created_at) AS ts FROM backup_log WHERE ok=1").fetchone()["ts"] if table_exists(conn, "backup_log") else None
+    backup_age = max(0, int(time.time()) - int(last_backup or 0)) if last_backup else None
     embed = discord.Embed(title="📊 System Health", color=discord.Color.green() if not host_errors and not recent_errors and not integrity_total else discord.Color.orange())
     embed.add_field(name="Server / Host", value=f"**{guild_count}** server • **{hosts}** host", inline=True)
     embed.add_field(name="Premium", value=f"**{premium}** server", inline=True)
@@ -27981,6 +28008,9 @@ def owner_system_health_embed():
     embed.add_field(name="Error 24 jam", value=f"**{recent_errors}**", inline=True)
     embed.add_field(name="Support Open", value=f"**{open_tickets}**", inline=True)
     embed.add_field(name="Integrity", value=f"**{integrity_total}** issue", inline=True)
+    embed.add_field(name="Runtime", value=(f"Heartbeat **{heartbeat_age}s**" if heartbeat_age is not None else "Belum ada heartbeat"), inline=True)
+    embed.add_field(name="Storage", value=storage_mode, inline=True)
+    embed.add_field(name="Backup", value=(f"**{backup_age // 3600} jam** lalu" if backup_age is not None else "Belum ada"), inline=True)
     embed.set_footer(text=release_info_text())
     return embed
 
@@ -32932,6 +32962,115 @@ def validate_storage_paths_before_db():
         )
 
 
+def runtime_state_snapshot():
+    try:
+        with closing(db()) as conn:
+            if not table_exists(conn, "runtime_state"):
+                return None
+            return conn.execute("SELECT * FROM runtime_state WHERE id=1").fetchone()
+    except Exception:
+        return None
+
+
+def mark_runtime_started() -> None:
+    global PREVIOUS_RUNTIME_UNCLEAN, PREVIOUS_RUNTIME_LAST_SEEN
+    now = int(time.time())
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM runtime_state WHERE id=1").fetchone()
+        prior_started = int(row["started_at"] or 0) if row else 0
+        prior_clean = int(row["clean_shutdown_at"] or 0) if row else 0
+        prior_seen = int(row["last_seen_at"] or 0) if row else 0
+        prior_session = str(row["session_id"] or "") if row else ""
+        PREVIOUS_RUNTIME_UNCLEAN = bool(prior_session and prior_started and prior_clean < prior_started)
+        PREVIOUS_RUNTIME_LAST_SEEN = prior_seen
+        conn.execute("""
+            INSERT INTO runtime_state(
+                id, session_id, started_at, ready_at, last_seen_at, clean_shutdown_at,
+                last_version, last_build_id, updated_at
+            ) VALUES(1,?,?,?,?,NULL,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                session_id=excluded.session_id,
+                started_at=excluded.started_at,
+                ready_at=NULL,
+                last_seen_at=excluded.last_seen_at,
+                clean_shutdown_at=NULL,
+                last_version=excluded.last_version,
+                last_build_id=excluded.last_build_id,
+                updated_at=excluded.updated_at
+        """, (RUNTIME_SESSION_ID, now, None, now, APP_VERSION, BUILD_ID, now))
+        conn.commit()
+
+
+def mark_runtime_ready() -> None:
+    now = int(time.time())
+    try:
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE runtime_state SET ready_at=?, last_seen_at=?, updated_at=? WHERE id=1 AND session_id=?",
+                (now, now, now, RUNTIME_SESSION_ID),
+            )
+            conn.commit()
+    except Exception:
+        log.exception("Gagal menandai runtime ready")
+
+
+def mark_runtime_clean_shutdown() -> None:
+    now = int(time.time())
+    try:
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE runtime_state SET clean_shutdown_at=?, last_seen_at=?, updated_at=? WHERE id=1 AND session_id=?",
+                (now, now, now, RUNTIME_SESSION_ID),
+            )
+            conn.commit()
+    except Exception:
+        log.exception("Gagal menandai graceful shutdown")
+
+
+@tasks.loop(seconds=60)
+async def runtime_heartbeat_loop():
+    now = int(time.time())
+    try:
+        with closing(db()) as conn:
+            conn.execute(
+                "UPDATE runtime_state SET last_seen_at=?, updated_at=? WHERE id=1 AND session_id=?",
+                (now, now, RUNTIME_SESSION_ID),
+            )
+            conn.commit()
+    except Exception:
+        log.exception("Runtime heartbeat gagal")
+
+
+@runtime_heartbeat_loop.before_loop
+async def before_runtime_heartbeat_loop():
+    await bot.wait_until_ready()
+
+
+async def notify_previous_unclean_runtime():
+    global RUNTIME_RECOVERY_NOTICE_SENT
+    if not PREVIOUS_RUNTIME_UNCLEAN or RUNTIME_RECOVERY_NOTICE_SENT:
+        return
+    RUNTIME_RECOVERY_NOTICE_SENT = True
+    age = max(0, int(time.time()) - int(PREVIOUS_RUNTIME_LAST_SEEN or 0)) if PREVIOUS_RUNTIME_LAST_SEEN else 0
+    detail = f"Heartbeat terakhir sekitar **{age // 60} menit** sebelum startup ini." if age else "Runtime sebelumnya tidak tercatat shutdown dengan bersih."
+    embed = discord.Embed(
+        title="⚠️ Runtime Recovery",
+        description=(
+            "Hi Notifku mendeteksi sesi sebelumnya berhenti tanpa graceful shutdown.\n"
+            + detail
+            + "\nDatabase dan queue akan dilanjutkan menggunakan recovery loop yang aktif."
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text=release_info_text())
+    for owner_id in primary_owner_ids():
+        try:
+            user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+            await user.send(embed=embed)
+        except Exception:
+            pass
+
+
 def startup_integrity_results() -> list[tuple[str, bool, str]]:
     results = []
 
@@ -32943,7 +33082,7 @@ def startup_integrity_results() -> list[tuple[str, bool, str]]:
         "payment_callback_events", "payment_event_dead_letter",
         "premium_coupons", "premium_coupon_redemptions", "schema_meta",
         "feature_maintenance", "support_settings", "support_tickets",
-        "interaction_errors",
+        "interaction_errors", "runtime_state",
     }
 
     try:
@@ -33145,6 +33284,12 @@ async def on_ready():
         bot.user.id
     )
 
+    mark_runtime_ready()
+    try:
+        await notify_previous_unclean_runtime()
+    except Exception:
+        log.exception("Runtime recovery notice gagal")
+
     SAFE_MODE, SAFE_MODE_REASON = evaluate_safe_mode()
 
     if SAFE_MODE:
@@ -33262,6 +33407,9 @@ async def on_ready():
     if not loop_lag_metrics.is_running():
         loop_lag_metrics.start()
 
+    if not runtime_heartbeat_loop.is_running():
+        runtime_heartbeat_loop.start()
+
 
 # ============================================================
 # MAIN
@@ -33278,6 +33426,7 @@ async def main():
 
     validate_storage_paths_before_db()
     migrate_database()
+    mark_runtime_started()
 
     try:
         await bot.start(DISCORD_TOKEN)
@@ -33310,6 +33459,7 @@ async def main():
             pending_notification_loop,
             event_cleanup_loop,
             loop_lag_metrics,
+            runtime_heartbeat_loop,
         ]
 
         for loop in loops:
@@ -33318,6 +33468,8 @@ async def main():
                     loop.cancel()
             except Exception:
                 pass
+
+        mark_runtime_clean_shutdown()
 
         try:
             with closing(db()) as conn:

@@ -1586,3 +1586,147 @@ Catatan: callback ini provider-agnostic. Jika provider pembayaran memakai payloa
 - backup restore smoke-test;
 - request recovery tiap jam;
 - preflight + runtime smoke-test scripts.
+
+## Operations Hardening v7
+
+- SQLite `busy_timeout`, WAL monitor, dan auto-checkpoint;
+- adaptive polling + deterministic jitter;
+- platform circuit breaker untuk outage massal;
+- webhook fallback ke primary channel jika webhook gagal;
+- DM alert ke owner jika semua jalur delivery gagal;
+- Incident Center untuk outage, DLQ, host error, dan ukuran SQLite;
+- Runtime Tuning tanpa redeploy untuk concurrency/retry/error threshold/circuit breaker;
+- Full System ZIP backup berisi SQLite snapshot + QRIS + config backup;
+- Server Owner dapat mengatur permission Host Manager per host;
+- pending approval continuity tetap diperkuat dengan recovery berkala.
+
+
+## Production Suite v8
+
+- schema version tracking + migration history;
+- persistent approval views untuk request pending;
+- Restore Center + preview/confirm restore;
+- GitHub Actions CI;
+- release tracking v1.8.0 + commit/build/schema;
+- Server Migration dengan rollback snapshot;
+- Host Clone lintas server;
+- Host Manager permission presets + expiry;
+- Incident History + status open/investigating/resolved/ignored;
+- encrypted Full System Backup (AES-GCM) + scheduled export.
+
+`FULL_BACKUP_HOURS=168` = full backup mingguan.
+Isi `BACKUP_ENCRYPTION_PASSWORD` di Railway Variables agar System Backup menjadi `.hnbak`.
+Jangan commit password backup ke GitHub.
+
+
+## FREE & Premium v2 (v1.9.1)
+
+Pemisahan plan sekarang memakai satu feature-gate pusat. Konfigurasi Premium tetap disimpan saat downgrade dan akan aktif kembali setelah Premium diperpanjang.
+
+- FREE: maksimal mengikuti `FREE_HOST_LIMIT`, analytics/riwayat 7 hari, channel/role utama, notifikasi standar, dan branding kecil Hi Notifku.
+- Premium: analytics 30 hari, priority checker, custom pesan, custom branding, jadwal/quiet hours, multi-channel/role, webhook delivery, dan limit host Premium.
+- Saat Premium habis, host di atas limit FREE dipause tanpa dihapus. Konfigurasi Premium tidak dihapus.
+- Runtime sekarang ikut mengecek plan aktif, sehingga konfigurasi Premium lama tidak bisa digunakan untuk bypass saat server kembali FREE.
+
+
+## Premium purchase access (v1.10.0)
+- `/menu` now includes a direct **Premium** entry.
+- A **Server Owner** or an active **Host Manager** can buy/renew Premium for an eligible server.
+- Premium is applied to the **server**, not only to the purchaser or one host.
+- Buying Premium does not grant extra server-management permissions to a Host Manager.
+- Host Manager also has a **Premium** shortcut in the Host Manager home menu.
+
+## Premium DB (v1.11.0)
+Global Owner kini memiliki menu **Payment → Premium DB**. Aktivasi Premium yang berhasil disimpan ke ledger permanen terpisah dari riwayat invoice, lalu diringkas per server (pembeli terakhir, jumlah aktivasi, total hari, total nilai paket, dan masa berlaku). Data aktivasi lama yang masih ada di `premium_orders` dibackfill otomatis saat migrasi database.
+
+
+## Premium reliability v1.12.0
+
+Premium is server-based. The production hardening layer now prevents more than one active invoice per server, requires uploaded proof to pass automated screening before proof-based auto activation, applies the Premium entitlement and invoice activation atomically in SQLite to prevent double extension after a crash/retry, and routes expired-plan runtime checks through the effective entitlement state. Premium customer ledger data remains separate from disposable invoice history.
+
+
+## Premium Stability Pack v1.13.0
+
+Premium sekarang memiliki health audit otomatis, recovery watchdog untuk invoice terverifikasi yang tersangkut setelah restart, status Active/Grace/Expired yang lebih jelas, downgrade preview, analytics penggunaan fitur Premium, penyimpanan bukti pembayaran ke persistent storage, anti-spam invoice dan batas upload bukti, reminder H-7/H-3/H-1 untuk owner dan pembeli terakhir, refund entitlement reconciliation, serta regression guards di preflight. Premium tetap berbasis server.
+
+Bukti pembayaran disimpan di subfolder `payment-proofs` di bawah `QRIS_STORAGE_DIR`, sehingga pada Railway Volume default berada di `/data/qris/payment-proofs`. File lama mengikuti `TRANSACTION_RETENTION_DAYS` saat transaksi sudah selesai/expired/refunded.
+
+## Premium Payment UX + Backup Anti-Spam v1.14.0
+
+- `/menu -> Premium` sekarang memiliki tombol **Pembayaran** untuk membuka invoice Premium aktif milik user pada server tersebut.
+- Konfirmasi Premium memiliki tombol **QRIS Otomatis**. Jika QRIS aktif tersedia, invoice langsung memakai QRIS tanpa langkah pilih metode tambahan.
+- Jika QRIS adalah satu-satunya metode pembayaran aktif, tombol **Buat Invoice** juga langsung membuka QRIS otomatis.
+- Auto backup memakai singleton lease/state di SQLite agar reconnect, redeploy, atau loop overlap tidak membuat backup/DM ganda.
+- DM auto backup ke Global Owner dibatasi maksimal satu kali per interval `AUTO_BACKUP_HOURS`.
+
+
+### v1.14.2
+- Menghapus tombol Pembayaran dari halaman Premium user agar tidak redundan dengan alur invoice/riwayat. Pembayaran tetap dilakukan langsung dari invoice/QRIS saat pembelian Premium.
+
+
+### Premium v1.14.2
+Konfirmasi paket Premium kini menampilkan kode unik dan total transfer sebelum invoice dibuat. Kode tersebut direservasi sementara agar nominal invoice tetap sama.
+
+
+## Premium Checkout v1.14.3
+- Invoice tidak dibuat jika metode pembayaran belum siap.
+- Checkout otomatis memprioritaskan QRIS yang aktif.
+- Global Owner baru diberi notifikasi ketika ada aktivitas pembayaran/bukti, bukan sebelum user dapat membayar.
+- Metode QRIS legacy dapat dipulihkan otomatis dari setting/file QRIS yang masih tersimpan.
+
+
+## v1.14.4 Premium audit hardening
+- Checkout hanya memakai metode pembayaran yang benar-benar siap digunakan.
+- Invoice server-wide juga mengunci transaksi late-payment/refund-pending.
+- Kegagalan promo tidak meninggalkan invoice kosong/nyangkut.
+- Upload bukti setelah nominal terverifikasi tidak menurunkan status transaksi.
+- Premium DB konsisten untuk Premium tanpa tanggal kedaluwarsa.
+
+
+## Payment Proof Strict Review v1.15.0
+- Payment Admin receives the actual proof image, not only amount metadata.
+- Technical scan is stricter and includes near-duplicate perceptual hashing.
+- A technical PASS never proves payment. Static QRIS Premium requires exact received amount plus explicit Payment Admin proof approval before activation.
+- Edited/too-small/low-detail proofs can be automatically rejected.
+
+
+## v1.16.0 — Role & Permission Separation
+- Global Owner Bot dipisahkan sebagai role internal `/owner`.
+- Pemilik Server dan Host Manager tetap role user/pembeli di `/menu`.
+- Pembelian Premium tidak pernah memberi atau memperluas hak kelola server/host.
+- User-facing view diikat ke user yang membuka panel dan akses dicek ulang saat tombol ditekan.
+- Host Manager yang aksesnya dicabut tidak dapat memakai panel lama.
+- Panel Global Owner memiliki backend guard tambahan pada browser/search/plan navigation.
+
+## Update Info Server Owner (v1.17)
+
+Global Owner dapat mengatur channel pengumuman update resmi pada server owner bot melalui:
+
+`/owner -> Operations -> Update Info`
+
+Fitur:
+- Set channel update berdasarkan Channel ID di `REQUIRED_GUILD_ID`.
+- Validasi permission View Channel, Send Messages, dan Embed Links.
+- Kirim pengumuman manual dengan versi, judul, dan isi update.
+- Test channel sebelum dipakai.
+- Auto Info Versi: saat versi `APP_VERSION` berubah, bot mengirim satu info versi otomatis ke channel yang dipilih.
+- Anti-spam versi: versi yang sama tidak diumumkan otomatis berulang saat reconnect/redeploy.
+- Riwayat pengumuman tersimpan di database.
+
+Pengumuman otomatis hanya dikirim ke server owner bot (`REQUIRED_GUILD_ID`), bukan ke server pelanggan.
+
+## v1.18.0 — Operations & Support Hardening
+- Support ticket langsung dari `/menu` dengan nomor tiket.
+- Channel support khusus di server owner bot.
+- Error ID kini disimpan di database dan bisa dicari dari Error Center.
+- Feature maintenance terpisah untuk Premium, Host Manager, Support, dan Notifications.
+- System Health dashboard untuk Global Owner.
+- Tombol Perpanjang Sama untuk Premium aktif.
+- Startup schema check mencakup tabel support/error/maintenance baru.
+
+## v1.19.0 — Runtime Reliability & Release Safety
+- Runtime heartbeat persisted in SQLite so Global Owner can see whether the process is alive and how fresh the last heartbeat is.
+- Detects a previous unclean shutdown/restart and sends one recovery notice per startup instead of repeating on reconnect.
+- System Health now shows runtime heartbeat age, storage mode (`/data` persistent vs local container), and age of the last successful backup.
+- Runtime state is included in startup integrity checks and is marked clean during graceful shutdown.
+- Preflight regression checks cover the new runtime state, heartbeat loop, recovery notice anti-spam, and shutdown marker.
