@@ -358,9 +358,47 @@ for required_text in {
     if required_text not in bot_text:
         fail(f"v1.17 update center guard missing: {required_text}")
 
-if 'APP_VERSION = "1.17.0"' not in bot_text:
-    fail("v1.17 APP_VERSION missing")
-if 'CURRENT_SCHEMA_VERSION = 30' not in bot_text:
-    fail("v1.17 schema version missing")
+if 'APP_VERSION = "1.18.0"' not in bot_text:
+    fail("v1.18 APP_VERSION missing")
+if 'CURRENT_SCHEMA_VERSION = 31' not in bot_text:
+    fail("v1.18 schema version missing")
 
 print("OK: Owner Update Info Center v1.17 guards")
+
+# Operations & Support hardening v1.18 guards.
+for required_def in {
+    "feature_maintenance_enabled",
+    "set_feature_maintenance",
+    "support_channel_id",
+    "set_support_channel",
+    "support_ticket_rows",
+    "recent_interaction_errors",
+    "owner_support_embed",
+    "owner_feature_maintenance_embed",
+    "owner_system_health_embed",
+}:
+    if required_def not in defs:
+        fail(f"v1.18 operations/support function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS feature_maintenance',
+    'CREATE TABLE IF NOT EXISTS support_tickets',
+    'CREATE TABLE IF NOT EXISTS support_settings',
+    'CREATE TABLE IF NOT EXISTS interaction_errors',
+    'class UserSupportModal',
+    'class OwnerSupportCenterView',
+    'class OwnerFeatureMaintenanceView',
+    'class OwnerSystemHealthView',
+    'class OwnerErrorLookupModal',
+    'label="Bantuan"',
+    'label="Maintenance"',
+    'label="Health"',
+    'label="Cari Error ID"',
+    'feature_maintenance_enabled("notifications")',
+    'def latest_activated_premium_package',
+    'label="Perpanjang Sama"',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.18 operations/support guard missing: {required_text}")
+
+print("OK: Operations, support, error-id and feature-maintenance v1.18 guards")

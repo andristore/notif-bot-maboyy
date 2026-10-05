@@ -11,6 +11,7 @@ import platform
 import sqlite3
 import shutil
 import socket
+import traceback
 from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
@@ -46,8 +47,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.17.0"
-CURRENT_SCHEMA_VERSION = 30
+APP_VERSION = "1.18.0"
+CURRENT_SCHEMA_VERSION = 31
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -976,6 +977,61 @@ def migrate_database():
                 VALUES(1,0,0,0,0)
             """)
 
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS feature_maintenance (
+                feature TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                reason TEXT,
+                updated_by INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        for _feature in ("premium", "host_manager", "support", "notifications"):
+            conn.execute(
+                "INSERT OR IGNORE INTO feature_maintenance(feature,enabled,updated_at) VALUES(?,0,?)",
+                (_feature, int(time.time()))
+            )
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                channel_id INTEGER,
+                updated_by INTEGER,
+                updated_at INTEGER
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO support_settings(id) VALUES(1)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_ref TEXT UNIQUE,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER,
+                category TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status, created_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS interaction_errors (
+                error_id TEXT PRIMARY KEY,
+                context TEXT NOT NULL,
+                user_id INTEGER,
+                guild_id INTEGER,
+                error_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                traceback TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_interaction_errors_created ON interaction_errors(created_at DESC)")
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS host_plan_pause (
@@ -8144,8 +8200,98 @@ async def defer_if_needed(interaction: discord.Interaction, *, ephemeral: bool =
     return False
 
 
+def feature_maintenance_enabled(feature: str) -> bool:
+    try:
+        with closing(db()) as conn:
+            if not table_exists(conn, "feature_maintenance"):
+                return False
+            row = conn.execute(
+                "SELECT enabled FROM feature_maintenance WHERE feature=?",
+                (str(feature),)
+            ).fetchone()
+            return bool(row and row["enabled"])
+    except sqlite3.Error:
+        return False
+
+
+def set_feature_maintenance(feature: str, enabled: bool, actor_id: int, reason: str = "") -> None:
+    feature = str(feature).strip().lower()
+    if feature not in {"premium", "host_manager", "support", "notifications"}:
+        raise ValueError("Feature maintenance tidak valid.")
+    with closing(db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO feature_maintenance(feature,enabled,reason,updated_by,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(feature) DO UPDATE SET
+                enabled=excluded.enabled, reason=excluded.reason,
+                updated_by=excluded.updated_by, updated_at=excluded.updated_at
+            """,
+            (feature, 1 if enabled else 0, str(reason)[:300], int(actor_id), int(time.time()))
+        )
+        conn.commit()
+
+
+def feature_maintenance_reason(feature: str) -> str:
+    try:
+        with closing(db()) as conn:
+            row = conn.execute(
+                "SELECT reason FROM feature_maintenance WHERE feature=?",
+                (str(feature),)
+            ).fetchone()
+            return str(row["reason"] or "Maintenance sementara.") if row else "Maintenance sementara."
+    except sqlite3.Error:
+        return "Maintenance sementara."
+
+
+async def require_feature_available(interaction: discord.Interaction, feature: str) -> bool:
+    if feature_maintenance_enabled(feature):
+        await safe_reply(interaction, f"🚧 Fitur **{feature}** sedang maintenance. {feature_maintenance_reason(feature)}")
+        return False
+    return True
+
+
+def support_channel_id() -> int:
+    try:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT channel_id FROM support_settings WHERE id=1").fetchone()
+            return int(row["channel_id"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def set_support_channel(channel_id: int, actor_id: int) -> None:
+    with closing(db()) as conn:
+        conn.execute(
+            "UPDATE support_settings SET channel_id=?,updated_by=?,updated_at=? WHERE id=1",
+            (int(channel_id), int(actor_id), int(time.time()))
+        )
+        conn.commit()
+
+
+def support_ticket_rows(limit: int = 20):
+    with closing(db()) as conn:
+        return conn.execute(
+            "SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(int(limit), 50)),)
+        ).fetchall()
+
+
+def recent_interaction_errors(limit: int = 20):
+    try:
+        with closing(db()) as conn:
+            if not table_exists(conn, "interaction_errors"):
+                return []
+            return conn.execute(
+                "SELECT * FROM interaction_errors ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(int(limit), 50)),)
+            ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
 def make_error_id() -> str:
-    return f"E{int(time.time()) % 1000000:06d}"
+    return f"E{int(time.time()) % 1000000:06d}{os.urandom(2).hex().upper()}"
 
 
 async def report_interaction_error(
@@ -8162,6 +8308,19 @@ async def report_interaction_error(
         error,
         exc_info=(type(error), error, error.__traceback__)
     )
+    try:
+        tb_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))[-12000:]
+        user_id = int(interaction.user.id) if interaction and interaction.user else None
+        guild_id = int(interaction.guild_id) if interaction and interaction.guild_id else None
+        with closing(db()) as conn:
+            if table_exists(conn, "interaction_errors"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO interaction_errors(error_id,context,user_id,guild_id,error_type,message,traceback,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (error_id, str(context)[:300], user_id, guild_id, type(error).__name__[:120], str(error)[:2000], tb_text, int(time.time()))
+                )
+                conn.commit()
+    except Exception:
+        log.exception("Gagal menyimpan interaction error %s", error_id)
 
     if interaction is not None:
         try:
@@ -11030,6 +11189,7 @@ async def send_notification(
     if (
         runtime_setting_enabled("notifications_paused")
         or runtime_setting_enabled("maintenance_all")
+        or feature_maintenance_enabled("notifications")
     ):
         log.warning(
             "Notifikasi ditahan oleh Emergency Mode host_id=%s",
@@ -14637,6 +14797,16 @@ def owner_error_center_embed():
         ),
         inline=False
     )
+    recent = recent_interaction_errors(5)
+    if recent:
+        embed.add_field(
+            name="Error ID Terbaru",
+            value="\n".join(
+                f"• `{r['error_id']}` • **{r['error_type']}** • <t:{int(r['created_at'])}:R>"
+                for r in recent
+            )[:1024],
+            inline=False,
+        )
     return embed
 
 
@@ -17601,6 +17771,111 @@ class ServerOwnerContactView(discord.ui.View):
 
 
 
+class UserSupportModal(discord.ui.Modal):
+    def __init__(self, user_id: int):
+        super().__init__(title="Hubungi Support", timeout=300)
+        self.user_id = int(user_id)
+        self.category = discord.ui.TextInput(
+            label="Kategori",
+            placeholder="Premium / Notifikasi / Host / Lainnya",
+            max_length=40,
+        )
+        self.subject = discord.ui.TextInput(
+            label="Judul singkat",
+            placeholder="Contoh: Premium belum aktif",
+            max_length=100,
+        )
+        self.body = discord.ui.TextInput(
+            label="Jelaskan masalah",
+            style=discord.TextStyle.paragraph,
+            max_length=1500,
+        )
+        self.server_id = discord.ui.TextInput(
+            label="Server ID (opsional)",
+            required=False,
+            max_length=24,
+        )
+        for item in (self.category, self.subject, self.body, self.server_id):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.user_id:
+            await safe_reply(interaction, "🔒 Form ini bukan milikmu.")
+            return
+        if not await require_feature_available(interaction, "support"):
+            return
+        raw_gid = str(self.server_id.value).strip()
+        guild_id = int(raw_gid) if raw_gid.isdigit() else None
+        now = int(time.time())
+        with closing(db()) as conn:
+            # Anti-spam: maksimal satu tiket baru per 60 detik per user.
+            recent = conn.execute(
+                "SELECT id FROM support_tickets WHERE user_id=? AND created_at>? LIMIT 1",
+                (self.user_id, now - 60)
+            ).fetchone()
+            if recent:
+                await safe_reply(interaction, "⏳ Tunggu sebentar sebelum mengirim tiket support baru.")
+                return
+            cur = conn.execute(
+                "INSERT INTO support_tickets(ticket_ref,user_id,guild_id,category,subject,body,status,created_at,updated_at) VALUES(NULL,?,?,?,?,?,'open',?,?)",
+                (self.user_id, guild_id, str(self.category.value)[:40], str(self.subject.value)[:100], str(self.body.value)[:1500], now, now)
+            )
+            ticket_id = int(cur.lastrowid)
+            ticket_ref = f"HN-S{ticket_id:06d}"
+            conn.execute("UPDATE support_tickets SET ticket_ref=? WHERE id=?", (ticket_ref, ticket_id))
+            conn.commit()
+
+        embed = discord.Embed(
+            title=f"🆘 Support Ticket {ticket_ref}",
+            description=str(self.body.value)[:3500],
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="User", value=f"<@{self.user_id}> • `{self.user_id}`", inline=False)
+        embed.add_field(name="Kategori", value=str(self.category.value)[:100], inline=True)
+        embed.add_field(name="Server", value=f"`{guild_id}`" if guild_id else "-", inline=True)
+        embed.add_field(name="Judul", value=str(self.subject.value)[:1024], inline=False)
+        delivered = False
+        channel_id = support_channel_id()
+        if channel_id and REQUIRED_GUILD_ID:
+            guild = bot.get_guild(int(REQUIRED_GUILD_ID))
+            channel = guild.get_channel(channel_id) if guild else None
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                    delivered = True
+                except Exception:
+                    log.exception("Support ticket channel send gagal")
+        if not delivered:
+            for owner_id in primary_owner_ids():
+                try:
+                    owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                    await owner.send(embed=embed)
+                    delivered = True
+                except Exception:
+                    pass
+        add_activity(guild_id, self.user_id, "Support Ticket Created", ticket_ref)
+        await safe_reply(interaction, f"✅ Laporan terkirim. Nomor tiket: `{ticket_ref}`")
+
+
+class UserSupportView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        self.user_id = int(user_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_user_panel(interaction, self.user_id)
+
+    @discord.ui.button(label="Buat Tiket", emoji="🆘", style=discord.ButtonStyle.primary, row=0)
+    async def create_ticket(self, interaction, button):
+        if not await require_feature_available(interaction, "support"):
+            return
+        await interaction.response.send_modal(UserSupportModal(self.user_id))
+
+    @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def home(self, interaction, button):
+        await interaction.response.edit_message(embed=dm_menu_home_embed(self.user_id), view=MenuRoleChoiceView(self.user_id))
+
+
 class MenuRoleChoiceView(discord.ui.View):
     """
     /menu root.
@@ -17735,6 +18010,8 @@ class MenuRoleChoiceView(discord.ui.View):
     ):
         if not await self.valid_user(interaction):
             return
+        if not await require_feature_available(interaction, "premium"):
+            return
 
         guild_ids = premium_purchase_guild_ids(self.user_id)
         if not guild_ids:
@@ -17752,6 +18029,28 @@ class MenuRoleChoiceView(discord.ui.View):
             embed=premium_purchase_home_embed(self.user_id),
             view=PremiumGuildPickerView(self.user_id)
         )
+
+    @discord.ui.button(
+        label="Bantuan",
+        emoji="🆘",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def support_menu(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self.valid_user(interaction):
+            return
+        if not await require_feature_available(interaction, "support"):
+            return
+        embed = discord.Embed(
+            title="🆘 Bantuan Hi Notifku",
+            description=(
+                "Laporkan masalah Premium, notifikasi, Host Manager, atau fitur lain.\n"
+                "Setelah dikirim kamu akan mendapat **nomor tiket** untuk referensi."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.edit_message(embed=embed, view=UserSupportView(self.user_id))
+
 
 
 def server_owner_menu_home_embed(
@@ -17939,7 +18238,8 @@ def dm_menu_home_embed(user_id: int):
             "Pilih menu sesuai kebutuhanmu.\n\n"
             "👑 **Pemilik Server** — kelola server sendiri.\n"
             "🎙️ **Host Manager** — kelola host yang diberikan.\n"
-            "⭐ **Premium** — beli/perpanjang Premium untuk server yang kamu kelola.\n\n"
+            "⭐ **Premium** — beli/perpanjang Premium untuk server yang kamu kelola.\n"
+            "🆘 **Bantuan** — kirim tiket support langsung ke tim Hi Notifku.\n\n"
             "🔐 **Akses dipisahkan:** pembelian Premium tidak mengubah role atau izin.\n"
             "🛡️ Global Owner Bot tetap khusus `/owner`."
         ),
@@ -17956,7 +18256,7 @@ def dm_menu_home_embed(user_id: int):
         inline=True
     )
     embed.set_footer(
-        text="/menu • Server Owner • Host Manager • Premium"
+        text="/menu • Server Owner • Host Manager • Premium • Support"
     )
     return embed
 
@@ -18979,6 +19279,20 @@ async def open_user_premium_payment(interaction: discord.Interaction, order) -> 
     )
 
 
+def latest_activated_premium_package(guild_id: int):
+    with closing(db()) as conn:
+        return conn.execute(
+            """
+            SELECT days, price
+            FROM premium_orders
+            WHERE guild_id=? AND activated_at IS NOT NULL
+            ORDER BY activated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (int(guild_id),)
+        ).fetchone()
+
+
 class UserPremiumView(discord.ui.View):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=900)
@@ -18988,6 +19302,8 @@ class UserPremiumView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not await require_user_panel(interaction, self.user_id):
+            return False
+        if not await require_feature_available(interaction, "premium"):
             return False
         if not can_purchase_premium(self.user_id, self.guild_id):
             await safe_reply(interaction, "🔒 Akses Premium untuk server ini sudah tidak aktif.")
@@ -18999,6 +19315,42 @@ class UserPremiumView(discord.ui.View):
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
             return None
         return await require_premium_purchaser(interaction, self.guild_id)
+
+    @discord.ui.button(label="Perpanjang Sama", emoji="🔁", style=discord.ButtonStyle.success, row=1)
+    async def renew_same(self, interaction, button):
+        guild = await self.valid(interaction)
+        if not guild:
+            return
+        if not premium_access_effective(self.guild_id):
+            await safe_reply(interaction, "ℹ️ Belum ada paket Premium aktif. Pilih paket terlebih dahulu.")
+            return
+        row = latest_activated_premium_package(self.guild_id)
+        if not row:
+            await safe_reply(interaction, "ℹ️ Paket terakhir tidak ditemukan. Pilih paket dari daftar.")
+            return
+        days, price = int(row["days"]), int(row["price"] or 0)
+        current = {int(d): int(p) for d, p in get_premium_packages()}
+        if days not in current:
+            await safe_reply(interaction, "⚠️ Paket lama sudah tidak tersedia. Pilih paket baru.")
+            return
+        price = current[days]
+        try:
+            quote = get_or_create_premium_payment_quote(self.guild_id, self.user_id, days, price)
+        except Exception as exc:
+            await safe_reply(interaction, f"⚠️ Gagal menyiapkan pembayaran: {exc}")
+            return
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="🔁 Perpanjang Premium",
+                description=(
+                    f"Server: **{guild.name}**\nPaket: **{days} hari**\n"
+                    f"Harga: **{rupiah(price)}**\nKode unik: **{int(quote['unique_code']):03d}**\n"
+                    f"💳 Total transfer: **{rupiah(int(quote['expected_amount']))}**"
+                ),
+                color=discord.Color.gold(),
+            ),
+            view=UserPremiumConfirmView(self.guild_id, self.user_id, days, price, quote_id=int(quote["id"]))
+        )
 
     @discord.ui.button(label="Riwayat", emoji="🧾", style=discord.ButtonStyle.secondary, row=1)
     async def history(self, interaction, button):
@@ -23140,6 +23492,8 @@ class HostManagerHomeView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not await require_user_panel(interaction, self.user_id):
+            return False
+        if not await require_feature_available(interaction, "host_manager"):
             return False
         if not host_manager_guild_ids(self.user_id):
             await safe_reply(interaction, "🔒 Akses Host Manager-mu sudah tidak aktif.")
@@ -27517,6 +27871,127 @@ class OwnerOpsHomeView(discord.ui.View):
         )
 
 
+def owner_support_embed():
+    rows = support_ticket_rows(15)
+    lines = []
+    for row in rows:
+        icon = "🟢" if row["status"] == "open" else "✅"
+        lines.append(
+            f"{icon} `{row['ticket_ref']}` • <@{row['user_id']}> • **{row['category']}**\n"
+            f"↳ {row['subject'][:80]} • <t:{int(row['created_at'])}:R>"
+        )
+    cid = support_channel_id()
+    embed = discord.Embed(
+        title="🆘 Support Center",
+        description="\n".join(lines) if lines else "Belum ada tiket support.",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Channel", value=f"<#{cid}>" if cid else "Belum diatur", inline=False)
+    return embed
+
+
+class OwnerSupportChannelModal(discord.ui.Modal, title="Set Channel Support"):
+    channel_id_input = discord.ui.TextInput(label="Channel ID", max_length=24)
+    def __init__(self, viewer_id: int):
+        super().__init__()
+        self.viewer_id = int(viewer_id)
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "server_admin"):
+            return
+        raw = str(self.channel_id_input.value).strip().replace("<#", "").replace(">", "")
+        if not raw.isdigit() or not REQUIRED_GUILD_ID:
+            await safe_reply(interaction, "❌ Channel ID / REQUIRED_GUILD_ID tidak valid.")
+            return
+        guild = bot.get_guild(int(REQUIRED_GUILD_ID))
+        channel = guild.get_channel(int(raw)) if guild else None
+        if not isinstance(channel, discord.TextChannel):
+            await safe_reply(interaction, "❌ Pilih text channel di server owner bot.")
+            return
+        me = guild.me
+        perms = channel.permissions_for(me) if me else None
+        if not perms or not (perms.view_channel and perms.send_messages and perms.embed_links):
+            await safe_reply(interaction, "❌ Bot perlu View Channel + Send Messages + Embed Links.")
+            return
+        set_support_channel(channel.id, interaction.user.id)
+        add_activity(None, interaction.user.id, "Support Channel Changed", str(channel.id))
+        await interaction.response.edit_message(embed=owner_support_embed(), view=OwnerSupportCenterView(self.viewer_id))
+
+
+class OwnerSupportCenterView(OwnerBasicBackView):
+    @discord.ui.button(label="Set Channel", emoji="📍", style=discord.ButtonStyle.primary, row=0)
+    async def set_channel_button(self, interaction, button):
+        if not await self.valid(interaction) or not await require_owner_level(interaction, "server_admin"):
+            return
+        await interaction.response.send_modal(OwnerSupportChannelModal(self.viewer_id))
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(embed=owner_support_embed(), view=OwnerSupportCenterView(self.viewer_id))
+
+
+def owner_feature_maintenance_embed():
+    lines = []
+    for feature in ("premium", "host_manager", "support", "notifications"):
+        active = feature_maintenance_enabled(feature)
+        lines.append(f"{'🔴 MAINTENANCE' if active else '🟢 AKTIF'} • **{feature}**")
+    return discord.Embed(
+        title="🚧 Feature Maintenance",
+        description="\n".join(lines) + "\n\nToggle hanya mematikan fitur terkait, bukan seluruh bot.",
+        color=discord.Color.orange(),
+    )
+
+
+class OwnerFeatureMaintenanceView(OwnerBasicBackView):
+    async def toggle_feature(self, interaction, feature: str):
+        if not await self.valid(interaction) or not is_primary_owner(interaction.user.id):
+            if not is_primary_owner(interaction.user.id):
+                await safe_reply(interaction, "🔒 Hanya Primary Global Owner.")
+            return
+        new_state = not feature_maintenance_enabled(feature)
+        set_feature_maintenance(feature, new_state, interaction.user.id, "Diatur dari /owner")
+        add_activity(None, interaction.user.id, "Feature Maintenance", f"{feature}={new_state}")
+        await interaction.response.edit_message(embed=owner_feature_maintenance_embed(), view=OwnerFeatureMaintenanceView(self.viewer_id))
+
+    @discord.ui.button(label="Premium", emoji="⭐", style=discord.ButtonStyle.secondary, row=0)
+    async def premium(self, interaction, button): await self.toggle_feature(interaction, "premium")
+    @discord.ui.button(label="Host Manager", emoji="🎙️", style=discord.ButtonStyle.secondary, row=0)
+    async def host(self, interaction, button): await self.toggle_feature(interaction, "host_manager")
+    @discord.ui.button(label="Support", emoji="🆘", style=discord.ButtonStyle.secondary, row=0)
+    async def support(self, interaction, button): await self.toggle_feature(interaction, "support")
+    @discord.ui.button(label="Notifications", emoji="🔔", style=discord.ButtonStyle.secondary, row=0)
+    async def notifications(self, interaction, button): await self.toggle_feature(interaction, "notifications")
+
+
+def owner_system_health_embed():
+    with closing(db()) as conn:
+        guild_count = len(bot.guilds)
+        hosts = int(conn.execute("SELECT COUNT(*) AS c FROM hosts").fetchone()["c"] or 0)
+        host_errors = int(conn.execute("SELECT COUNT(*) AS c FROM hosts WHERE last_error IS NOT NULL OR error_count>0").fetchone()["c"] or 0)
+        premium = int(conn.execute("SELECT COUNT(*) AS c FROM guild_settings WHERE plan='premium'").fetchone()["c"] or 0)
+        open_tickets = int(conn.execute("SELECT COUNT(*) AS c FROM support_tickets WHERE status='open'").fetchone()["c"] or 0)
+        recent_errors = int(conn.execute("SELECT COUNT(*) AS c FROM interaction_errors WHERE created_at>?", (int(time.time())-86400,)).fetchone()["c"] or 0)
+    report = database_integrity_report()
+    integrity_total = sum(int(v or 0) for v in report.values())
+    embed = discord.Embed(title="📊 System Health", color=discord.Color.green() if not host_errors and not recent_errors and not integrity_total else discord.Color.orange())
+    embed.add_field(name="Server / Host", value=f"**{guild_count}** server • **{hosts}** host", inline=True)
+    embed.add_field(name="Premium", value=f"**{premium}** server", inline=True)
+    embed.add_field(name="Host Error", value=f"**{host_errors}**", inline=True)
+    embed.add_field(name="Error 24 jam", value=f"**{recent_errors}**", inline=True)
+    embed.add_field(name="Support Open", value=f"**{open_tickets}**", inline=True)
+    embed.add_field(name="Integrity", value=f"**{integrity_total}** issue", inline=True)
+    embed.set_footer(text=release_info_text())
+    return embed
+
+
+class OwnerSystemHealthView(OwnerBasicBackView):
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.edit_message(embed=owner_system_health_embed(), view=OwnerSystemHealthView(self.viewer_id))
+
+
 class OwnerOpsAdvancedView(discord.ui.View):
     def __init__(self, viewer_id: int):
         super().__init__(timeout=900)
@@ -27573,6 +28048,21 @@ class OwnerOpsAdvancedView(discord.ui.View):
             ),
             view=OwnerDiagnosticsView(self.viewer_id)
         )
+
+    @discord.ui.button(label="Support", emoji="🆘", style=discord.ButtonStyle.secondary, row=1)
+    async def support_center(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.edit_message(embed=owner_support_embed(), view=OwnerSupportCenterView(self.viewer_id))
+
+    @discord.ui.button(label="Maintenance", emoji="🚧", style=discord.ButtonStyle.secondary, row=1)
+    async def feature_maintenance(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"): return
+        await interaction.response.edit_message(embed=owner_feature_maintenance_embed(), view=OwnerFeatureMaintenanceView(self.viewer_id))
+
+    @discord.ui.button(label="Health", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
+    async def system_health(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.edit_message(embed=owner_system_health_embed(), view=OwnerSystemHealthView(self.viewer_id))
 
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction, button):
@@ -27902,10 +28392,38 @@ class OwnerErrorHostSelect(discord.ui.Select):
         )
 
 
+class OwnerErrorLookupModal(discord.ui.Modal, title="Cari Error ID"):
+    error_id_input = discord.ui.TextInput(label="Error ID", placeholder="Contoh: E123456ABCD", max_length=32)
+    def __init__(self, viewer_id: int):
+        super().__init__()
+        self.viewer_id = int(viewer_id)
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "read_only"):
+            return
+        key = str(self.error_id_input.value).strip().upper()
+        with closing(db()) as conn:
+            row = conn.execute("SELECT * FROM interaction_errors WHERE UPPER(error_id)=?", (key,)).fetchone()
+        if not row:
+            await safe_reply(interaction, "❌ Error ID tidak ditemukan.")
+            return
+        embed = discord.Embed(title=f"🚨 Error {row['error_id']}", color=discord.Color.red())
+        embed.add_field(name="Context", value=f"`{row['context']}`"[:1024], inline=False)
+        embed.add_field(name="Type", value=f"`{row['error_type']}`", inline=True)
+        embed.add_field(name="User / Guild", value=f"`{row['user_id'] or '-'}` / `{row['guild_id'] or '-'}`", inline=True)
+        embed.add_field(name="Message", value=f"```{str(row['message'])[:900]}```", inline=False)
+        embed.set_footer(text=f"Created {datetime.fromtimestamp(int(row['created_at']), tz=timezone.utc).isoformat()}")
+        await safe_reply(interaction, "", embed=embed)
+
+
 class OwnerErrorCenterView(OwnerBasicBackView):
     def __init__(self, viewer_id: int):
         super().__init__(viewer_id)
         self.add_item(OwnerErrorHostSelect(viewer_id))
+
+    @discord.ui.button(label="Cari Error ID", emoji="🔎", style=discord.ButtonStyle.primary, row=1)
+    async def lookup_error(self, interaction, button):
+        if not await self.valid(interaction): return
+        await interaction.response.send_modal(OwnerErrorLookupModal(self.viewer_id))
 
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction, button):
@@ -32424,6 +32942,8 @@ def startup_integrity_results() -> list[tuple[str, bool, str]]:
         "pending_notifications", "notification_dead_letter",
         "payment_callback_events", "payment_event_dead_letter",
         "premium_coupons", "premium_coupon_redemptions", "schema_meta",
+        "feature_maintenance", "support_settings", "support_tickets",
+        "interaction_errors",
     }
 
     try:
