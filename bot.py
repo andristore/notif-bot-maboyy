@@ -47,7 +47,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.20.0"
+APP_VERSION = "1.20.1"
 CURRENT_SCHEMA_VERSION = 32
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
@@ -15322,10 +15322,8 @@ class BulkImportModal(discord.ui.Modal):
         placeholder=(
             "tiktok,username\n"
             "youtube,UCxxxxxxxx\n"
-            "twitch,username\n"
-            "kick,username\n"
             "instagram,username\n"
-            "facebook,https://facebook.com/namapage"
+            "facebook,URL"
         ),
         style=discord.TextStyle.paragraph,
         max_length=4000

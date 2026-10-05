@@ -357,8 +357,8 @@ for required_text in {
     if required_text not in bot_text:
         fail(f"v1.17 update center guard missing: {required_text}")
 
-if 'APP_VERSION = "1.20.0"' not in bot_text:
-    fail("v1.20 APP_VERSION missing")
+if 'APP_VERSION = "1.20.1"' not in bot_text:
+    fail("v1.20.1 APP_VERSION missing")
 if 'CURRENT_SCHEMA_VERSION = 32' not in bot_text:
     fail("v1.19 schema version missing")
 
@@ -454,3 +454,68 @@ for required_text in {
         fail(f"v1.19 runtime reliability guard missing: {required_text}")
 
 print("OK: Runtime heartbeat, recovery and storage-health v1.19 guards")
+
+
+# Discord component payload limit audit v1.20.1.
+# Discord rejects a whole interaction response when UI text exceeds component limits.
+def _static_str(node):
+    try:
+        value = ast.literal_eval(node)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+component_errors = []
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call):
+        continue
+    func_name = ""
+    if isinstance(node.func, ast.Attribute):
+        func_name = node.func.attr
+    elif isinstance(node.func, ast.Name):
+        func_name = node.func.id
+    kws = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+
+    # Conservative limits used by Discord components.
+    checks = []
+    if func_name in {"TextInput", "Select", "ChannelSelect", "RoleSelect", "UserSelect", "MentionableSelect"}:
+        checks.append(("placeholder", 100))
+    if func_name == "TextInput":
+        checks.append(("label", 45))
+    if func_name in {"SelectOption"}:
+        checks.extend((("label", 100), ("description", 100), ("value", 100)))
+    if func_name in {"Button"}:
+        checks.append(("label", 80))
+    if func_name in {"Modal"}:
+        checks.append(("title", 45))
+
+    for key, limit in checks:
+        if key not in kws:
+            continue
+        value = _static_str(kws[key])
+        if value is not None and len(value) > limit:
+            component_errors.append(
+                f"line {getattr(node, 'lineno', '?')}: {func_name}.{key}={len(value)}>{limit}"
+            )
+
+# Also inspect @discord.ui.button decorator labels.
+for node in ast.walk(tree):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call) or not isinstance(dec.func, ast.Attribute):
+            continue
+        if dec.func.attr != "button":
+            continue
+        for kw in dec.keywords:
+            if kw.arg == "label":
+                value = _static_str(kw.value)
+                if value is not None and len(value) > 80:
+                    component_errors.append(
+                        f"line {getattr(dec, 'lineno', '?')}: button.label={len(value)}>80"
+                    )
+
+if component_errors:
+    fail("Discord component payload limits invalid: " + "; ".join(component_errors))
+
+print("OK: Discord component payload limits v1.20.1")

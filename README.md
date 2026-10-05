@@ -1724,9 +1724,19 @@ Pengumuman otomatis hanya dikirim ke server owner bot (`REQUIRED_GUILD_ID`), buk
 - Tombol Perpanjang Sama untuk Premium aktif.
 - Startup schema check mencakup tabel support/error/maintenance baru.
 
-## v1.19.0 — Runtime Reliability & Release Safety
+## v1.20.0 — Runtime Reliability & Release Safety
 - Runtime heartbeat persisted in SQLite so Global Owner can see whether the process is alive and how fresh the last heartbeat is.
 - Detects a previous unclean shutdown/restart and sends one recovery notice per startup instead of repeating on reconnect.
 - System Health now shows runtime heartbeat age, storage mode (`/data` persistent vs local container), and age of the last successful backup.
 - Runtime state is included in startup integrity checks and is marked clean during graceful shutdown.
 - Preflight regression checks cover the new runtime state, heartbeat loop, recovery notice anti-spam, and shutdown marker.
+
+
+## Channel Picker v1.20
+Semua pengaturan channel Discord utama sekarang memakai pilihan nama channel/pagination, bukan input ID manual. Berlaku untuk default channel, log channel, channel host, tambah host Server Owner/Host Manager, channel update, support, dan channel tambahan delivery Premium.
+
+
+## v1.20.1 — Discord Component Reliability
+- Memperbaiki placeholder Import Host yang melebihi batas payload Discord dan menyebabkan HTTP 400 / error 50035.
+- Preflight sekarang mengaudit batas panjang komponen Discord (placeholder, label, option, button) agar error serupa tertahan sebelum deploy.
+- Channel Picker v1.20 tetap dipertahankan.
