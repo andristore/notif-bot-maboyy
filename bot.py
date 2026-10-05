@@ -47,8 +47,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.20.1"
-CURRENT_SCHEMA_VERSION = 32
+APP_VERSION = "1.21.0"
+CURRENT_SCHEMA_VERSION = 33
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -109,6 +109,20 @@ NOTIFICATION_MAX_RETRIES = max(
 NOTIFICATION_RETRY_SECONDS = max(
     15,
     min(3600, int(os.getenv("NOTIFICATION_RETRY_SECONDS", "60")))
+)
+# Reliability Pack v1.21: confirm LIVE transitions before announcing them and
+# reclaim queued deliveries safely after a Railway restart/redeploy.
+SMART_LIVE_CONFIRMATIONS = max(
+    1,
+    min(5, int(os.getenv("SMART_LIVE_CONFIRMATIONS", "2")))
+)
+NOTIFICATION_CLAIM_TIMEOUT_SECONDS = max(
+    60,
+    min(1800, int(os.getenv("NOTIFICATION_CLAIM_TIMEOUT_SECONDS", "300")))
+)
+DB_HEALTH_CHECK_HOURS = max(
+    1,
+    min(24, int(os.getenv("DB_HEALTH_CHECK_HOURS", "6")))
 )
 VERIFICATION_WARNING_DAYS = max(
     1,
@@ -1924,6 +1938,53 @@ def migrate_database():
             CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_notifications_event_unique
             ON pending_notifications(host_id, event_key, event_type)
             WHERE event_key IS NOT NULL
+        """)
+
+        # Reliability Pack v1.21 -------------------------------------------------
+        add_column_if_missing(conn, "pending_notifications", "claimed_at", "INTEGER")
+        add_column_if_missing(conn, "pending_notifications", "claim_token", "TEXT")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                host_id INTEGER,
+                event_type TEXT,
+                event_key TEXT,
+                attempt_no INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL,
+                error TEXT,
+                latency_ms INTEGER,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_notification_delivery_attempts_recent
+            ON notification_delivery_attempts(created_at DESC)
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_observation_guard (
+                host_id INTEGER PRIMARY KEY,
+                observed_state INTEGER NOT NULL,
+                observed_key TEXT,
+                streak INTEGER NOT NULL DEFAULT 1,
+                first_seen_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS database_health_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                quick_check TEXT,
+                db_bytes INTEGER NOT NULL DEFAULT 0,
+                wal_bytes INTEGER NOT NULL DEFAULT 0,
+                pending_notifications INTEGER NOT NULL DEFAULT 0,
+                dead_letters INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
         """)
 
         # Permanent Premium customer database. This is intentionally separate
@@ -8808,6 +8869,21 @@ async def before_db_maintenance():
     await bot.wait_until_ready()
 
 
+@tasks.loop(hours=DB_HEALTH_CHECK_HOURS)
+async def database_health_loop():
+    try:
+        report = await asyncio.to_thread(database_health_snapshot, True)
+        if report.get("status") != "ok":
+            log.error("Database health check gagal: %s", report.get("quick_check"))
+    except Exception:
+        log.exception("Database health loop gagal")
+
+
+@database_health_loop.before_loop
+async def before_database_health_loop():
+    await bot.wait_until_ready()
+
+
 # ============================================================
 # ACCESS CONTROL
 # ============================================================
@@ -10385,6 +10461,150 @@ def release_notification_event(
         conn.commit()
 
 
+def record_delivery_attempt(
+    *, guild_id: int, host_id: Optional[int], event_type: str,
+    event_key: Optional[str], attempt_no: int, status: str,
+    error: Optional[str] = None, latency_ms: Optional[int] = None
+):
+    """Append-only delivery audit used by the owner health center."""
+    try:
+        with closing(db()) as conn:
+            conn.execute("""
+                INSERT INTO notification_delivery_attempts(
+                    guild_id, host_id, event_type, event_key, attempt_no,
+                    status, error, latency_ms, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+            """, (
+                int(guild_id), int(host_id) if host_id is not None else None,
+                str(event_type or "notification")[:80],
+                str(event_key)[:300] if event_key else None,
+                max(1, int(attempt_no)), str(status)[:30],
+                str(error)[:1000] if error else None,
+                int(latency_ms) if latency_ms is not None else None,
+                int(time.time())
+            ))
+            conn.commit()
+    except Exception:
+        log.exception("Gagal mencatat delivery attempt")
+
+
+def live_transition_confirmed(host, desired_live: bool, live_key: Optional[str] = None) -> bool:
+    """Require repeated observations before a LIVE start/end state transition.
+
+    Existing stable state is returned immediately. Only transitions are gated,
+    which reduces false LIVE/end alerts caused by one flaky platform response.
+    """
+    threshold = SMART_LIVE_CONFIRMATIONS
+    if threshold <= 1:
+        return True
+
+    previous = get_live_state(int(host["guild_id"]), str(host["platform"]), str(host["target"]).lstrip("@"))
+    current_live = bool(previous and previous["is_live"])
+    current_key = str(previous["live_key"] or "") if previous else ""
+    desired_key = str(live_key or "")
+
+    # Stable state does not need reconfirmation. A changed live key does.
+    if current_live == bool(desired_live):
+        if not desired_live or not desired_key or current_key == desired_key:
+            with closing(db()) as conn:
+                conn.execute("DELETE FROM live_observation_guard WHERE host_id=?", (int(host["id"]),))
+                conn.commit()
+            return True
+
+    now = int(time.time())
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM live_observation_guard WHERE host_id=?",
+            (int(host["id"]),)
+        ).fetchone()
+        same = bool(
+            row
+            and bool(row["observed_state"]) == bool(desired_live)
+            and str(row["observed_key"] or "") == desired_key
+        )
+        streak = int(row["streak"] or 0) + 1 if same else 1
+        first_seen = int(row["first_seen_at"] or now) if same else now
+        conn.execute("""
+            INSERT INTO live_observation_guard(
+                host_id, observed_state, observed_key, streak, first_seen_at, updated_at
+            ) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(host_id) DO UPDATE SET
+                observed_state=excluded.observed_state,
+                observed_key=excluded.observed_key,
+                streak=excluded.streak,
+                first_seen_at=excluded.first_seen_at,
+                updated_at=excluded.updated_at
+        """, (int(host["id"]), 1 if desired_live else 0, desired_key or None, streak, first_seen, now))
+        if streak >= threshold:
+            conn.execute("DELETE FROM live_observation_guard WHERE host_id=?", (int(host["id"]),))
+        conn.commit()
+    return streak >= threshold
+
+
+def claim_pending_notification(row_id: int) -> bool:
+    """Lease a queued notification so overlapping deploys cannot double-send it."""
+    now = int(time.time())
+    stale_before = now - NOTIFICATION_CLAIM_TIMEOUT_SECONDS
+    with closing(db()) as conn:
+        cur = conn.execute("""
+            UPDATE pending_notifications
+            SET claimed_at=?, claim_token=?
+            WHERE id=?
+              AND (claimed_at IS NULL OR claimed_at<? OR claim_token=?)
+        """, (now, RUNTIME_SESSION_ID, int(row_id), stale_before, RUNTIME_SESSION_ID))
+        conn.commit()
+        return int(cur.rowcount or 0) == 1
+
+
+def release_pending_claim(row_id: int):
+    with closing(db()) as conn:
+        conn.execute("""
+            UPDATE pending_notifications
+            SET claimed_at=NULL, claim_token=NULL
+            WHERE id=? AND claim_token=?
+        """, (int(row_id), RUNTIME_SESSION_ID))
+        conn.commit()
+
+
+def database_health_snapshot(write_log: bool = True) -> dict:
+    """Fast SQLite health check safe enough for periodic Railway monitoring."""
+    stats = sqlite_storage_stats()
+    result = {"status": "ok", "quick_check": "ok", **stats, "pending": 0, "dead_letters": 0}
+    try:
+        with closing(db()) as conn:
+            quick = conn.execute("PRAGMA quick_check").fetchone()[0]
+            result["quick_check"] = str(quick)
+            if str(quick).lower() != "ok":
+                result["status"] = "error"
+            result["pending"] = int(conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0] or 0)
+            result["dead_letters"] = int(conn.execute("SELECT COUNT(*) FROM notification_dead_letter WHERE resolved_at IS NULL").fetchone()[0] or 0)
+            if write_log:
+                conn.execute("""
+                    INSERT INTO database_health_log(
+                        status, quick_check, db_bytes, wal_bytes,
+                        pending_notifications, dead_letters, created_at
+                    ) VALUES(?,?,?,?,?,?,?)
+                """, (
+                    result["status"], result["quick_check"][:500],
+                    int(result["db_bytes"]), int(result["wal_bytes"]),
+                    result["pending"], result["dead_letters"], int(time.time())
+                ))
+                conn.execute("DELETE FROM database_health_log WHERE created_at<?", (int(time.time()) - 30 * 86400,))
+                conn.commit()
+    except Exception as exc:
+        result["status"] = "error"
+        result["quick_check"] = f"{type(exc).__name__}: {exc}"[:500]
+    return result
+
+
+def latest_database_health() -> Optional[sqlite3.Row]:
+    try:
+        with closing(db()) as conn:
+            return conn.execute("SELECT * FROM database_health_log ORDER BY id DESC LIMIT 1").fetchone()
+    except Exception:
+        return None
+
+
 def record_notification_history(
     *,
     guild_id: int,
@@ -10746,6 +10966,21 @@ async def _deliver_notification_now(
     content = "\n".join(content_parts) if content_parts else None
     success_any = False
     start_ts = time.perf_counter()
+    attempt_no = 1
+    if event_key:
+        try:
+            with closing(db()) as conn:
+                attempt_no = int(conn.execute(
+                    "SELECT COUNT(*) FROM notification_delivery_attempts WHERE host_id=? AND event_key=? AND event_type=?",
+                    (int(host["id"]), str(event_key)[:300], str(event_type)[:80])
+                ).fetchone()[0] or 0) + 1
+        except Exception:
+            attempt_no = 1
+    record_delivery_attempt(
+        guild_id=int(host["guild_id"]), host_id=int(host["id"]),
+        event_type=event_type, event_key=event_key, attempt_no=attempt_no,
+        status="sending"
+    )
 
     # Optional webhook replaces the primary-channel delivery. Extra channels still receive normal sends.
     webhook_url = (
@@ -10896,6 +11131,14 @@ async def _deliver_notification_now(
             except Exception:
                 pass
 
+    total_latency = int((time.perf_counter() - start_ts) * 1000)
+    record_delivery_attempt(
+        guild_id=int(host["guild_id"]), host_id=int(host["id"]),
+        event_type=event_type, event_key=event_key, attempt_no=attempt_no,
+        status="sent" if success_any else "failed",
+        error=None if success_any else "Semua jalur delivery gagal.",
+        latency_ms=total_latency
+    )
     return success_any
 
 
@@ -11417,6 +11660,8 @@ async def check_youtube_live(host):
     )
 
     if not ids:
+        if previous and previous["is_live"] and not live_transition_confirmed(host, False):
+            return
         if previous and previous["is_live"]:
             await maybe_send_live_end(host, name, "YouTube")
         update_live_state(
@@ -11446,6 +11691,8 @@ async def check_youtube_live(host):
     )
 
     if not live_video:
+        if previous and previous["is_live"] and not live_transition_confirmed(host, False):
+            return
         if previous and previous["is_live"]:
             await maybe_send_live_end(host, name, "YouTube")
 
@@ -11469,6 +11716,8 @@ async def check_youtube_live(host):
     )
 
     if not same_live:
+        if not live_transition_confirmed(host, True, video_id):
+            return
         creator = snippet.get("channelTitle", name)
 
         embed = discord.Embed(
@@ -11711,6 +11960,8 @@ async def check_generic_live(host):
     )
 
     if not data:
+        if previous and previous["is_live"] and not live_transition_confirmed(host, False):
+            return False
         if (
             previous
             and previous["is_live"]
@@ -11757,6 +12008,9 @@ async def check_generic_live(host):
         and previous["is_live"]
         and previous["live_key"] == data["id"]
     ):
+        return True
+
+    if not live_transition_confirmed(host, True, data["id"]):
         return True
 
     embed = discord.Embed(
@@ -11983,6 +12237,8 @@ async def check_tiktok_live(host):
         live = bool(fallback)
 
     if live:
+        if (not previous or not previous["is_live"]) and not live_transition_confirmed(host, True, username):
+            return
         if not previous or not previous["is_live"]:
             url = f"https://www.tiktok.com/@{username}/live"
 
@@ -12018,6 +12274,8 @@ async def check_tiktok_live(host):
         )
 
     else:
+        if previous and previous["is_live"] and not live_transition_confirmed(host, False):
+            return
         if previous and previous["is_live"]:
             await maybe_send_live_end(
                 host,
@@ -13698,11 +13956,14 @@ async def pending_notification_loop():
             SELECT *
             FROM pending_notifications
             WHERE release_after<=?
+              AND (claimed_at IS NULL OR claimed_at<? OR claim_token=?)
             ORDER BY id ASC
             LIMIT 50
-        """, (now,)).fetchall()
+        """, (now, now - NOTIFICATION_CLAIM_TIMEOUT_SECONDS, RUNTIME_SESSION_ID)).fetchall()
 
     for row in rows:
+        if not claim_pending_notification(int(row["id"])):
+            continue
         host = get_host(int(row["host_id"]))
 
         if not host:
@@ -13763,7 +14024,8 @@ async def pending_notification_loop():
                     UPDATE pending_notifications
                     SET retry_count=?,
                         release_after=?,
-                        last_error=?
+                        last_error=?,
+                        claimed_at=NULL, claim_token=NULL
                     WHERE id=?
                 """, (
                     retry_count,
@@ -13793,7 +14055,8 @@ async def pending_notification_loop():
                         UPDATE pending_notifications
                         SET retry_count=?,
                             release_after=?,
-                            last_error=?
+                            last_error=?,
+                        claimed_at=NULL, claim_token=NULL
                         WHERE id=?
                     """, (
                         retry_count,
@@ -13821,6 +14084,14 @@ async def event_cleanup_loop():
         conn.execute(
             "DELETE FROM notification_history WHERE created_at<?",
             (cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM notification_delivery_attempts WHERE created_at<?",
+            (cutoff,)
+        )
+        conn.execute(
+            "DELETE FROM live_observation_guard WHERE updated_at<?",
+            (int(time.time()) - 86400,)
         )
         conn.execute(
             "DELETE FROM api_usage WHERE day<?",
@@ -27844,6 +28115,29 @@ def owner_system_health_embed():
     embed.add_field(name="Runtime", value=(f"Heartbeat **{heartbeat_age}s**" if heartbeat_age is not None else "Belum ada heartbeat"), inline=True)
     embed.add_field(name="Storage", value=storage_mode, inline=True)
     embed.add_field(name="Backup", value=(f"**{backup_age // 3600} jam** lalu" if backup_age is not None else "Belum ada"), inline=True)
+    db_health = latest_database_health()
+    with closing(db()) as conn:
+        pending_count = int(conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0] or 0)
+        dead_count = int(conn.execute("SELECT COUNT(*) FROM notification_dead_letter WHERE resolved_at IS NULL").fetchone()[0] or 0)
+        attempts_24h = conn.execute("""
+            SELECT COUNT(*) total,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
+            FROM notification_delivery_attempts WHERE created_at>?
+        """, (int(time.time()) - 86400,)).fetchone()
+    embed.add_field(
+        name="Delivery Engine v2",
+        value=(f"Queue **{pending_count}** • Dead **{dead_count}**\n"
+               f"Attempt 24j **{int(attempts_24h['total'] or 0)}** • gagal **{int(attempts_24h['failed'] or 0)}**"),
+        inline=False
+    )
+    embed.add_field(
+        name="Database Health",
+        value=(
+            f"**{str(db_health['status']).upper()}** • quick_check `{str(db_health['quick_check'])[:80]}` • <t:{int(db_health['created_at'])}:R>"
+            if db_health else "Belum ada pemeriksaan periodik."
+        ),
+        inline=False
+    )
     embed.set_footer(text=release_info_text())
     return embed
 
@@ -28033,6 +28327,9 @@ def diagnostic_bundle_bytes() -> bytes:
         "premium_host_limit": PREMIUM_HOST_LIMIT,
         "verification_retention_days": VERIFICATION_RETENTION_DAYS,
         "notification_max_retries": NOTIFICATION_MAX_RETRIES,
+        "smart_live_confirmations": SMART_LIVE_CONFIRMATIONS,
+        "notification_claim_timeout_seconds": NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
+        "db_health_check_hours": DB_HEALTH_CHECK_HOURS,
     }
 
     loops = {
@@ -28041,6 +28338,7 @@ def diagnostic_bundle_bytes() -> bytes:
         "backup": auto_backup_loop.is_running(),
         "invoice": invoice_expiry_loop.is_running(),
         "pending_notification": pending_notification_loop.is_running(),
+        "database_health": database_health_loop.is_running(),
         "verification_cleanup": verification_retention_cleanup_loop.is_running(),
         "host_validation": host_target_validation_loop.is_running(),
     }
@@ -33144,6 +33442,9 @@ def evaluate_safe_mode() -> tuple[bool, str]:
             "user_verifications",
             "notification_history",
             "pending_notifications",
+            "notification_delivery_attempts",
+            "live_observation_guard",
+            "database_health_log",
         }
 
         with closing(db()) as conn:
@@ -33290,6 +33591,9 @@ async def on_ready():
     if not db_maintenance_loop.is_running():
         db_maintenance_loop.start()
 
+    if not database_health_loop.is_running():
+        database_health_loop.start()
+
     if not sqlite_wal_monitor_loop.is_running():
         sqlite_wal_monitor_loop.start()
 
@@ -33350,6 +33654,7 @@ async def main():
             payment_event_retry_loop,
             invoice_expiry_loop,
             db_maintenance_loop,
+            database_health_loop,
             sqlite_wal_monitor_loop,
             pending_notification_loop,
             event_cleanup_loop,

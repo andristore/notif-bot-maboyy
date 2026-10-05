@@ -1,3 +1,21 @@
+# Hi Notifku v1.21.0 — Reliability Upgrade
+
+## Update v1.21.0
+
+Versi ini mempertahankan seluruh fitur lama dan memperkuat mesin notifikasi tanpa membuat menu/command ganda.
+
+- Delivery Engine v2: setiap percobaan pengiriman dicatat (`sending/sent/failed`) untuk diagnosis owner.
+- Queue lease/recovery: pending notification dikunci per runtime dan otomatis dapat diambil kembali setelah deploy/restart, mengurangi risiko double-send.
+- Smart LIVE confirmation: perubahan LIVE dan LIVE selesai dikonfirmasi beberapa kali (default 2x) untuk mengurangi false alert.
+- Database Health: `PRAGMA quick_check`, ukuran DB/WAL, jumlah queue dan dead-letter dicatat berkala.
+- Owner System Health: menampilkan queue, dead-letter, delivery attempts, failure 24 jam, dan hasil database health terbaru.
+- Schema database naik otomatis ke v33. Database lama tidak perlu dihapus.
+- Tidak ada dependency Python baru.
+
+> Untuk update dari versi lama, baca `UPDATE-v1.21.0.txt`.
+
+---
+
 # Hi Notifku Complete V4 — DM Only
 
 Versi ini menggabungkan seluruh 15 pengembangan ke satu kode agar tidak ada patch/fitur ganda.
