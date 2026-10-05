@@ -120,7 +120,7 @@ for required_text in {
     'INSERT OR IGNORE INTO premium_customer_ledger',
     'class PremiumGuildPickerView',
     'class PremiumGuildSelect',
-    'return host_manager_has_guild_access(int(user_id), int(guild_id))',
+    'snapshot = user_access_snapshot(int(user_id), int(guild_id))',
 }:
     if required_text not in bot_text:
         fail(f"Premium purchase regression guard missing: {required_text}")
@@ -273,6 +273,21 @@ for required_text in {
 
 print("OK: Premium audit hardening v1.14.4 guards")
 
+strict_needles = [
+    'proof_manual_approved',
+    'proof_reviewed_by',
+    'proof_perceptual_hash',
+    'approve_payment_proof_manually',
+    'label="Lihat Bukti"',
+    'label="Bukti Valid & Aktif"',
+    'Screening otomatis hanya memeriksa kualitas/indikator teknis',
+    'distance <= 4',
+]
+for needle in strict_needles:
+    if needle not in bot_text:
+        fail(f"Premium strict payment guard missing: {needle}")
+print("OK: Premium strict payment review v1.15 guards")
+
 # Ensure every explicitly declared Discord component custom_id is unique.
 custom_ids = re.findall(r'custom_id\s*=\s*["\']([^"\']+)["\']', bot_text)
 seen = set()
@@ -286,3 +301,66 @@ if duplicate_custom_ids:
 
 print("OK: Premium Stability Pack v1.13 guards")
 print("OK: explicit custom_id uniqueness")
+
+# Role & Permission Separation v1.16 guards.
+for required_def in {
+    "user_access_snapshot",
+    "require_user_panel",
+    "require_host_manager_scope",
+}:
+    if required_def not in defs:
+        fail(f"v1.16 access separation function missing: {required_def}")
+
+for required_text in {
+    '"premium_purchaser": bool(server_owner or host_manager)',
+    'snapshot = user_access_snapshot(int(user_id), int(guild_id))',
+    'Akses dipisahkan:',
+    'async def interaction_check(self, interaction: discord.Interaction) -> bool:',
+    'Akses Host Manager-mu sudah tidak aktif.',
+    'pembelian Premium tidak mengubah role atau izin',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.16 access separation guard missing: {required_text}")
+
+print("OK: Role & Permission Separation v1.16 guards")
+
+
+# Owner Update Info Center v1.17 guards.
+for required_def in {
+    "get_bot_update_settings",
+    "set_bot_update_channel",
+    "bot_update_target_channel",
+    "bot_update_embed",
+    "send_bot_update_announcement",
+    "announce_current_version_if_needed",
+    "owner_update_center_embed",
+}:
+    if required_def not in defs:
+        fail(f"v1.17 update center function missing: {required_def}")
+
+for required_text in {
+    'CREATE TABLE IF NOT EXISTS bot_update_settings',
+    'CREATE TABLE IF NOT EXISTS bot_update_history',
+    'class OwnerUpdateCenterView',
+    'class OwnerUpdateChannelModal',
+    'class OwnerUpdateAnnouncementModal',
+    'label="Update Info"',
+    'label="Set Channel"',
+    'label="Kirim Update"',
+    'label="Test Channel"',
+    'label="Auto Versi"',
+    'await announce_current_version_if_needed()',
+    'last_announced_version',
+    'pending_version',
+    'REQUIRED_GUILD_ID',
+    'Informasi Update Resmi',
+}:
+    if required_text not in bot_text:
+        fail(f"v1.17 update center guard missing: {required_text}")
+
+if 'APP_VERSION = "1.17.0"' not in bot_text:
+    fail("v1.17 APP_VERSION missing")
+if 'CURRENT_SCHEMA_VERSION = 30' not in bot_text:
+    fail("v1.17 schema version missing")
+
+print("OK: Owner Update Info Center v1.17 guards")

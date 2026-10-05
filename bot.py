@@ -46,8 +46,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.14.4"
-CURRENT_SCHEMA_VERSION = 28
+APP_VERSION = "1.17.0"
+CURRENT_SCHEMA_VERSION = 30
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -1274,6 +1274,10 @@ def migrate_database():
         add_column_if_missing(conn, "premium_orders", "proof_image_height", "INTEGER")
         add_column_if_missing(conn, "premium_orders", "proof_mime", "TEXT")
         add_column_if_missing(conn, "premium_orders", "proof_edit_software", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_perceptual_hash", "TEXT")
+        add_column_if_missing(conn, "premium_orders", "proof_manual_approved", "INTEGER NOT NULL DEFAULT 0")
+        add_column_if_missing(conn, "premium_orders", "proof_reviewed_by", "INTEGER")
+        add_column_if_missing(conn, "premium_orders", "proof_reviewed_at", "INTEGER")
         add_column_if_missing(conn, "premium_orders", "payment_reference", "TEXT")
         add_column_if_missing(conn, "premium_orders", "payment_source", "TEXT")
         add_column_if_missing(conn, "premium_orders", "paid_at", "INTEGER")
@@ -2008,6 +2012,49 @@ def migrate_database():
                 int(customer["total_spent"] or 0), int(last_row["order_id"]),
                 "active" if active_now else "expired", int(time.time())
             ))
+
+        # Owner update announcement center (support/owner server only)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_update_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                guild_id INTEGER,
+                channel_id INTEGER,
+                auto_announce INTEGER NOT NULL DEFAULT 1,
+                last_announced_version TEXT,
+                pending_version TEXT,
+                pending_since INTEGER,
+                updated_by INTEGER,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_update_settings(
+                id, guild_id, channel_id, auto_announce,
+                last_announced_version, pending_version, pending_since,
+                updated_by, updated_at
+            ) VALUES(1, ?, NULL, 1, NULL, NULL, NULL, NULL, ?)
+        """, (REQUIRED_GUILD_ID or None, int(time.time())))
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_update_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER,
+                sent_by INTEGER,
+                automatic INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                error TEXT,
+                sent_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_update_history_sent
+            ON bot_update_history(sent_at DESC)
+        """)
 
         if not table_exists(conn, "api_usage"):
             conn.execute("""
@@ -6204,11 +6251,21 @@ def premium_order_embed(order):
                 f"Scan: {str(order['proof_scan_detail'])[:500]}"
             )
 
+        manual_ok = int(order["proof_manual_approved"] or 0) if "proof_manual_approved" in order.keys() else 0
+        detail_lines.append(
+            "Review Payment Admin: **✅ disetujui**" if manual_ok else "Review Payment Admin: **⏳ belum disetujui**"
+        )
         embed.add_field(
             name="Screening Bukti",
             value="\n".join(detail_lines)[:1024],
             inline=False
         )
+        # Show the actual transfer proof to Payment Admin instead of only metadata.
+        # The locally persisted file is also attached when the proof is forwarded.
+        try:
+            embed.set_image(url=str(order["proof_url"]))
+        except Exception:
+            pass
     if order["rejection_reason"]:
         embed.add_field(
             name="Penolakan",
@@ -6997,6 +7054,8 @@ def scan_payment_proof_bytes(
     height = None
     edit_software = None
     entropy = None
+    perceptual_hash = None
+    hard_reject = False
 
     if Image is not None:
         try:
@@ -7004,9 +7063,16 @@ def scan_payment_proof_bytes(
                 width, height = img.size
                 fmt = (img.format or "").upper()
 
-                if width < 300 or height < 300:
+                if width < 600 or height < 600:
+                    score -= 50
+                    reasons.append("Resolusi bukti terlalu kecil untuk verifikasi ketat.")
+                    hard_reject = True
+
+                ratio = max(width, height) / max(1, min(width, height))
+                if ratio > 4.5:
                     score -= 35
-                    reasons.append("Resolusi terlalu kecil.")
+                    reasons.append("Rasio gambar tidak wajar untuk screenshot transaksi utuh.")
+                    hard_reject = True
 
                 if width > 12000 or height > 12000:
                     score -= 20
@@ -7014,12 +7080,13 @@ def scan_payment_proof_bytes(
 
                 try:
                     entropy = float(img.convert("L").entropy())
-                    if entropy < 2.0:
-                        score -= 40
-                        reasons.append("Gambar terlalu polos/kosong.")
-                    elif entropy < 3.0:
-                        score -= 15
-                        reasons.append("Detail visual sangat rendah.")
+                    if entropy < 2.5:
+                        score -= 55
+                        reasons.append("Gambar terlalu polos/kosong untuk bukti transaksi.")
+                        hard_reject = True
+                    elif entropy < 3.5:
+                        score -= 25
+                        reasons.append("Detail visual rendah; perlu review manual.")
                 except Exception:
                     entropy = None
 
@@ -7044,9 +7111,10 @@ def scan_payment_proof_bytes(
                             term in edit_software.lower()
                             for term in suspicious_terms
                         ):
-                            score -= 30
+                            score -= 70
+                            hard_reject = True
                             reasons.append(
-                                "Metadata menunjukkan software editing."
+                                "Metadata menunjukkan software editing; bukti ditolak otomatis."
                             )
                 except Exception:
                     pass
@@ -7055,14 +7123,25 @@ def scan_payment_proof_bytes(
                     score -= 30
                     reasons.append("Format gambar tidak umum.")
 
+                # Lightweight perceptual hash catches resized/recompressed reuse of old proofs.
+                try:
+                    tiny = img.convert("L").resize((8, 8))
+                    vals = list(tiny.getdata())
+                    avg = sum(vals) / max(1, len(vals))
+                    bits = "".join("1" if v >= avg else "0" for v in vals)
+                    perceptual_hash = f"{int(bits, 2):016x}"
+                except Exception:
+                    perceptual_hash = None
+
         except Exception as exc:
             raise ValueError(
                 f"Gambar bukti tidak dapat dibaca: {type(exc).__name__}."
             )
 
-    if size < 15 * 1024:
-        score -= 20
-        reasons.append("Ukuran file sangat kecil.")
+    if size < 25 * 1024:
+        score -= 35
+        reasons.append("Ukuran file terlalu kecil untuk bukti pembayaran yang jelas.")
+        hard_reject = True
 
     if not content_type.startswith("image/"):
         score -= 10
@@ -7070,12 +7149,14 @@ def scan_payment_proof_bytes(
 
     score = max(0, min(100, int(score)))
 
-    if score >= 75:
-        status = "passed"
-    elif score >= 40:
-        status = "review"
-    else:
+    if hard_reject or score < 55:
         status = "rejected"
+    elif score >= 85:
+        # PASSED means only technical image integrity/quality passed.
+        # It NEVER proves that money was received. Payment Admin approval is still mandatory.
+        status = "passed"
+    else:
+        status = "review"
 
     if not reasons:
         reasons.append("Tidak ditemukan indikator teknis mencurigakan.")
@@ -7091,6 +7172,7 @@ def scan_payment_proof_bytes(
         "edit_software": edit_software,
         "entropy": entropy,
         "filename": lowered_name[:200],
+        "perceptual_hash": perceptual_hash,
     }
 
 
@@ -7242,8 +7324,14 @@ async def activate_verified_premium_order(
 
     if require_proof and scan_status != "passed":
         return False, (
-            "Bukti pembayaran belum lulus screening otomatis. "
-            "Status review harus diperiksa Payment Admin sebelum Premium diaktifkan."
+            "Bukti pembayaran belum lulus screening teknis. "
+            "Status review/rejected wajib diperiksa Payment Admin."
+        )
+
+    if require_proof and not int(order["proof_manual_approved"] or 0):
+        return False, (
+            "Bukti pembayaran belum disetujui Payment Admin. "
+            "Screening otomatis hanya memeriksa kualitas/indikator teknis dan tidak membuktikan dana masuk."
         )
 
     if not claim_order_for_activation(
@@ -7404,6 +7492,29 @@ def save_payment_proof(
                 f"Bukti pembayaran sudah pernah dipakai pada request #{duplicate['id']}."
             )
 
+        # Near-duplicate detection using perceptual hash; catches resized/recompressed proof reuse.
+        phash = str(scan.get("perceptual_hash") or "").strip().lower()
+        if phash:
+            rows = conn.execute(
+                "SELECT id, proof_perceptual_hash FROM premium_orders WHERE id<>? AND proof_perceptual_hash IS NOT NULL ORDER BY id DESC LIMIT 500",
+                (int(order_id),)
+            ).fetchall()
+            try:
+                cur_int = int(phash, 16)
+                for row in rows:
+                    old = str(row["proof_perceptual_hash"] or "").strip().lower()
+                    if not old:
+                        continue
+                    distance = (cur_int ^ int(old, 16)).bit_count()
+                    if distance <= 4:
+                        raise ValueError(
+                            f"Bukti sangat mirip dengan bukti yang pernah dipakai pada request #{row['id']}."
+                        )
+            except ValueError:
+                raise
+            except Exception:
+                pass
+
         if scan_status == "rejected":
             raise ValueError(
                 "Bukti gagal screening otomatis. Kirim screenshot asli sesuai instruksi: "
@@ -7428,6 +7539,10 @@ def save_payment_proof(
                 proof_mime=?,
                 proof_edit_software=?,
                 proof_storage_path=?,
+                proof_perceptual_hash=?,
+                proof_manual_approved=0,
+                proof_reviewed_by=NULL,
+                proof_reviewed_at=NULL,
                 status=?,
                 updated_at=?
             WHERE id=?
@@ -7450,10 +7565,29 @@ def save_payment_proof(
                 else None
             ),
             str(proof_storage_path)[:500] if proof_storage_path else None,
+            str(scan.get("perceptual_hash") or "")[:32] or None,
             next_status,
             int(time.time()),
             int(order_id)
         ))
+        conn.commit()
+
+
+def approve_payment_proof_manually(order_id: int, reviewer_id: int) -> None:
+    now = int(time.time())
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT proof_url, proof_scan_status FROM premium_orders WHERE id=?",
+            (int(order_id),)
+        ).fetchone()
+        if not row or not row["proof_url"]:
+            raise ValueError("Bukti pembayaran belum tersedia.")
+        if str(row["proof_scan_status"] or "") != "passed":
+            raise ValueError("Bukti belum lulus screening teknis; jangan disetujui manual.")
+        conn.execute(
+            "UPDATE premium_orders SET proof_manual_approved=1, proof_reviewed_by=?, proof_reviewed_at=?, updated_at=? WHERE id=?",
+            (int(reviewer_id), now, now, int(order_id))
+        )
         conn.commit()
 
 
@@ -8517,6 +8651,73 @@ async def require_global_owner(interaction: discord.Interaction) -> bool:
     return False
 
 
+def user_access_snapshot(user_id: int, guild_id: Optional[int] = None) -> dict:
+    """Single source of truth for buyer/user role separation.
+
+    Global Owner is an internal bot role. Server Owner and Host Manager are
+    customer/user roles. Premium purchase never grants management privileges.
+    """
+    uid = int(user_id)
+    gid = int(guild_id) if guild_id is not None else None
+    server_owner = bool(gid is not None and is_server_owner(uid, gid))
+    host_manager = bool(gid is not None and host_manager_has_guild_access(uid, gid))
+    return {
+        "user_id": uid,
+        "guild_id": gid,
+        "global_owner": is_global_owner(uid),
+        "server_owner": server_owner,
+        "host_manager": host_manager,
+        "premium_purchaser": bool(server_owner or host_manager),
+    }
+
+
+async def require_user_panel(
+    interaction: discord.Interaction,
+    viewer_id: int,
+    *,
+    message: str = "🔒 Menu ini bukan milikmu."
+) -> bool:
+    """Bind a user-facing view to the user who opened it."""
+    if int(interaction.user.id) == int(viewer_id):
+        return True
+    await safe_reply(interaction, message)
+    return False
+
+
+async def require_host_manager_scope(
+    interaction: discord.Interaction,
+    *,
+    user_id: int,
+    guild_id: Optional[int] = None,
+    host_id: Optional[int] = None,
+    permission: Optional[str] = None,
+) -> bool:
+    """Backend authorization for Host Manager actions.
+
+    A Host Manager must still have an active assignment at click/submit time.
+    Paying for Premium does not grant or widen this access.
+    """
+    if not await require_user_panel(interaction, user_id):
+        return False
+    uid = int(user_id)
+    if host_id is not None:
+        host = get_host(int(host_id))
+        if not host or not host_is_assigned_to_manager(uid, int(host_id)):
+            await safe_reply(interaction, "🔒 Akses Host Manager untuk host ini sudah tidak aktif.")
+            return False
+        if guild_id is not None and int(host["guild_id"]) != int(guild_id):
+            await safe_reply(interaction, "🔒 Host tidak berada pada server aksesmu.")
+            return False
+        if permission and not host_manager_has_permission(uid, int(host_id), permission):
+            await safe_reply(interaction, f"🔒 Izin Host Manager **{permission}** tidak tersedia.")
+            return False
+        return True
+    if guild_id is not None and not host_manager_has_guild_access(uid, int(guild_id)):
+        await safe_reply(interaction, "🔒 Akses Host Manager untuk server ini sudah tidak aktif.")
+        return False
+    return True
+
+
 async def require_owner_level(
     interaction: discord.Interaction,
     minimum: str = "read_only"
@@ -8605,16 +8806,15 @@ def can_purchase_premium(user_id: int, guild_id: int) -> bool:
     guild = bot.get_guild(int(guild_id))
     if guild is None:
         return False
-    if int(guild.owner_id) == int(user_id):
-        return True
-    return host_manager_has_guild_access(int(user_id), int(guild_id))
+    snapshot = user_access_snapshot(int(user_id), int(guild_id))
+    return bool(snapshot["premium_purchaser"])
 
 
 def premium_purchase_role_label(user_id: int, guild_id: int) -> str:
-    guild = bot.get_guild(int(guild_id))
-    if guild and int(guild.owner_id) == int(user_id):
+    snapshot = user_access_snapshot(int(user_id), int(guild_id))
+    if snapshot["server_owner"]:
         return "Pemilik Server"
-    if host_manager_has_guild_access(int(user_id), int(guild_id)):
+    if snapshot["host_manager"]:
         return "Host Manager"
     return "Tidak ada akses"
 
@@ -8643,15 +8843,17 @@ def access_role_label(
     guild_id: Optional[int] = None
 ) -> str:
     roles = []
+    uid = int(user_id)
 
-    if is_global_owner(int(user_id)):
+    if is_global_owner(uid):
         roles.append("🛡️ Global Owner Bot")
 
-    if guild_id is not None and is_server_owner(
-        int(user_id),
-        int(guild_id)
-    ):
-        roles.append("👑 Pemilik Server")
+    if guild_id is not None:
+        gid = int(guild_id)
+        if is_server_owner(uid, gid):
+            roles.append("👑 Pemilik Server")
+        if host_manager_has_guild_access(uid, gid):
+            roles.append("🎙️ Host Manager")
 
     if roles:
         return " • ".join(roles)
@@ -17409,6 +17611,9 @@ class MenuRoleChoiceView(discord.ui.View):
         super().__init__(timeout=900)
         self.user_id = int(user_id)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_user_panel(interaction, self.user_id)
+
     async def valid_user(
         self,
         interaction: discord.Interaction
@@ -17735,6 +17940,7 @@ def dm_menu_home_embed(user_id: int):
             "👑 **Pemilik Server** — kelola server sendiri.\n"
             "🎙️ **Host Manager** — kelola host yang diberikan.\n"
             "⭐ **Premium** — beli/perpanjang Premium untuk server yang kamu kelola.\n\n"
+            "🔐 **Akses dipisahkan:** pembelian Premium tidak mengubah role atau izin.\n"
             "🛡️ Global Owner Bot tetap khusus `/owner`."
         ),
         color=discord.Color.blue()
@@ -17851,6 +18057,9 @@ class PremiumGuildPickerView(discord.ui.View):
         super().__init__(timeout=900)
         self.user_id = int(user_id)
         self.add_item(PremiumGuildSelect(self.user_id))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_user_panel(interaction, self.user_id)
 
     @discord.ui.button(
         label="Kembali",
@@ -18777,6 +18986,14 @@ class UserPremiumView(discord.ui.View):
         self.user_id = int(user_id)
         self.add_item(UserPremiumPackageSelect(self.guild_id, self.user_id))
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await require_user_panel(interaction, self.user_id):
+            return False
+        if not can_purchase_premium(self.user_id, self.guild_id):
+            await safe_reply(interaction, "🔒 Akses Premium untuk server ini sudah tidak aktif.")
+            return False
+        return True
+
     async def valid(self, interaction):
         if int(interaction.user.id) != self.user_id:
             await safe_reply(interaction, "🔒 Menu ini bukan milikmu.")
@@ -18833,6 +19050,9 @@ class UserPremiumHistoryView(discord.ui.View):
         super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_user_panel(interaction, self.user_id)
 
     @discord.ui.button(label="Kembali", emoji="⬅️", style=discord.ButtonStyle.secondary, row=0)
     async def back(self, interaction, button):
@@ -18956,6 +19176,14 @@ class UserPremiumConfirmView(discord.ui.View):
         )
         self.coupon_code = coupon_code
         self.quote_id = int(quote_id) if quote_id is not None else None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await require_user_panel(interaction, self.user_id):
+            return False
+        if not can_purchase_premium(self.user_id, self.guild_id):
+            await safe_reply(interaction, "🔒 Akses pembelian Premium untuk server ini sudah tidak aktif.")
+            return False
+        return True
 
     async def _create_invoice(self, interaction: discord.Interaction, *, prefer_qris: bool = False):
         if int(interaction.user.id) != self.user_id:
@@ -19458,6 +19686,9 @@ class UserServerMenuView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=900)
         self.guild_id = int(guild_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return bool(await require_server_owner(interaction, self.guild_id))
 
     async def valid_owner(self, interaction):
         return await require_server_owner(interaction, self.guild_id)
@@ -22907,6 +23138,14 @@ class HostManagerHomeView(discord.ui.View):
             )
         )
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await require_user_panel(interaction, self.user_id):
+            return False
+        if not host_manager_guild_ids(self.user_id):
+            await safe_reply(interaction, "🔒 Akses Host Manager-mu sudah tidak aktif.")
+            return False
+        return True
+
     @discord.ui.button(
         label="Notif Terakhir",
         emoji="🔔",
@@ -24726,6 +24965,8 @@ class ServerSearchModal(discord.ui.Modal):
         super().__init__(title="Cari Server", timeout=300)
 
     async def on_submit(self, interaction: discord.Interaction):
+        if not await require_global_owner(interaction):
+            return
         q = self.query.value.strip()
         guilds = [
             g for g in bot.guilds
@@ -24753,6 +24994,9 @@ class ServerBrowserView(discord.ui.View):
         self.page = max(0, page)
         self.query = query
         self.add_item(GuildSelect(self.page, self.query))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_global_owner(interaction)
 
     @discord.ui.button(label="Sebelumnya", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -24878,6 +25122,9 @@ def plan_overview_embed():
 class PlanOverviewView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_global_owner(interaction)
 
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -25445,7 +25692,7 @@ class PremiumOrderManageView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Terima & Aktif",
+        label="Bukti Valid & Aktif",
         emoji="✅",
         style=discord.ButtonStyle.success,
         row=0
@@ -25462,6 +25709,9 @@ class PremiumOrderManageView(discord.ui.View):
         await defer_if_needed(interaction, ephemeral=True)
 
         try:
+            # Clicking this button is the explicit human visual approval of the proof.
+            # Amount verification is already required by get_actionable().
+            approve_payment_proof_manually(self.order_id, interaction.user.id)
             ok, message = await activate_verified_premium_order(
                 self.order_id,
                 actor_id=interaction.user.id,
@@ -25485,6 +25735,30 @@ class PremiumOrderManageView(discord.ui.View):
                 exc,
                 context="premium_activation"
             )
+
+    @discord.ui.button(
+        label="Lihat Bukti",
+        emoji="🖼️",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def view_proof(self, interaction: discord.Interaction, button: discord.ui.Button):
+        order = await self.get_actionable(interaction, require_proof=True)
+        if not order:
+            return
+        local_path = str(order["proof_storage_path"] or "") if "proof_storage_path" in order.keys() else ""
+        embed = premium_order_embed(order)
+        embed.title = f"🖼️ Bukti Pembayaran #{self.order_id}"
+        if local_path and Path(local_path).exists():
+            filename = Path(local_path).name
+            embed.set_image(url=f"attachment://{filename}")
+            await interaction.response.send_message(
+                file=discord.File(local_path, filename=filename),
+                embed=embed,
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(
         label="Tolak",
@@ -26664,6 +26938,421 @@ class HostCloneModal(discord.ui.Modal):
         await safe_reply(interaction, f"✅ Host berhasil di-clone sebagai Host **#{clone_id}**.")
 
 
+
+# ============================================================
+# OWNER UPDATE ANNOUNCEMENT CENTER
+# ============================================================
+
+def get_bot_update_settings():
+    defaults = {
+        "guild_id": REQUIRED_GUILD_ID or None,
+        "channel_id": None,
+        "auto_announce": 1,
+        "last_announced_version": None,
+        "pending_version": None,
+        "pending_since": None,
+        "updated_by": None,
+        "updated_at": 0,
+    }
+    try:
+        with closing(db()) as conn:
+            if not table_exists(conn, "bot_update_settings"):
+                return defaults
+            row = conn.execute(
+                "SELECT * FROM bot_update_settings WHERE id=1"
+            ).fetchone()
+            if not row:
+                return defaults
+            return {k: row[k] for k in row.keys()}
+    except sqlite3.OperationalError:
+        return defaults
+
+
+def set_bot_update_channel(channel_id: int, actor_id: int, auto_announce: bool = True):
+    now = int(time.time())
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO bot_update_settings(
+                id, guild_id, channel_id, auto_announce,
+                last_announced_version, pending_version, pending_since,
+                updated_by, updated_at
+            ) VALUES(1,?,?,?,?,NULL,NULL,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                guild_id=excluded.guild_id,
+                channel_id=excluded.channel_id,
+                auto_announce=excluded.auto_announce,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+        """, (
+            REQUIRED_GUILD_ID or None,
+            int(channel_id),
+            1 if auto_announce else 0,
+            None,
+            int(actor_id),
+            now,
+        ))
+        conn.commit()
+
+
+def toggle_bot_update_auto(actor_id: int) -> bool:
+    now = int(time.time())
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT auto_announce FROM bot_update_settings WHERE id=1"
+        ).fetchone()
+        current = bool(row["auto_announce"]) if row else True
+        new_value = 0 if current else 1
+        conn.execute("""
+            INSERT INTO bot_update_settings(id,guild_id,channel_id,auto_announce,updated_by,updated_at)
+            VALUES(1,?,NULL,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+                auto_announce=excluded.auto_announce,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+        """, (REQUIRED_GUILD_ID or None, new_value, int(actor_id), now))
+        conn.commit()
+    return bool(new_value)
+
+
+def bot_update_target_channel():
+    settings = get_bot_update_settings()
+    guild_id = int(settings.get("guild_id") or REQUIRED_GUILD_ID or 0)
+    channel_id = int(settings.get("channel_id") or 0)
+    if not guild_id or not channel_id:
+        return None, "Channel update belum dipilih."
+    if REQUIRED_GUILD_ID and guild_id != int(REQUIRED_GUILD_ID):
+        return None, "Channel update harus berada di server owner bot (REQUIRED_GUILD_ID)."
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return None, "Server owner bot tidak ditemukan atau bot sudah keluar dari server."
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return None, "Channel update tidak ditemukan atau bukan text/announcement channel."
+    me = guild.me
+    if me is None:
+        return None, "Member bot tidak ditemukan di server owner."
+    perms = channel.permissions_for(me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        return None, "Bot membutuhkan View Channel, Send Messages, dan Embed Links di channel update."
+    return channel, None
+
+
+def bot_update_embed(version: str, title: str, body: str, automatic: bool = False):
+    version = str(version or APP_VERSION).strip().lstrip("vV")
+    title = (str(title or "Update Hi Notifku").strip() or "Update Hi Notifku")[:200]
+    body = (str(body or "Peningkatan stabilitas dan fitur Hi Notifku.").strip())[:3900]
+    embed = discord.Embed(
+        title=f"🚀 {title}",
+        description=body,
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Versi", value=f"**v{version}**", inline=True)
+    embed.add_field(
+        name="Status",
+        value="🤖 Otomatis" if automatic else "📢 Pengumuman Owner",
+        inline=True,
+    )
+    embed.set_footer(text="Hi Notifku • Informasi Update Resmi")
+    return embed
+
+
+def record_bot_update_history(version: str, title: str, body: str, channel_id: int,
+                              sent_by: int | None, automatic: bool, status: str,
+                              message_id: int | None = None, error: str | None = None):
+    with closing(db()) as conn:
+        conn.execute("""
+            INSERT INTO bot_update_history(
+                version,title,body,guild_id,channel_id,message_id,sent_by,
+                automatic,status,error,sent_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            str(version), str(title), str(body), int(REQUIRED_GUILD_ID or 0),
+            int(channel_id), int(message_id) if message_id else None,
+            int(sent_by) if sent_by else None, 1 if automatic else 0,
+            str(status), str(error)[:1000] if error else None, int(time.time())
+        ))
+        conn.commit()
+
+
+def owner_update_center_embed():
+    settings = get_bot_update_settings()
+    channel_id = int(settings.get("channel_id") or 0)
+    channel_text = f"<#{channel_id}> (`{channel_id}`)" if channel_id else "Belum dipilih"
+    auto_text = "🟢 Aktif" if bool(settings.get("auto_announce")) else "⚪ Nonaktif"
+    last_version = settings.get("last_announced_version") or "belum ada"
+    rows = []
+    try:
+        with closing(db()) as conn:
+            if table_exists(conn, "bot_update_history"):
+                rows = conn.execute("""
+                    SELECT version,status,sent_at,automatic
+                    FROM bot_update_history
+                    ORDER BY id DESC LIMIT 5
+                """).fetchall()
+    except Exception:
+        rows = []
+    history = "\n".join(
+        f"• v{r['version']} • {'AUTO' if r['automatic'] else 'MANUAL'} • {r['status']} • <t:{int(r['sent_at'])}:R>"
+        for r in rows
+    ) or "Belum ada pengumuman."
+    return discord.Embed(
+        title="📢 Update Info",
+        description="Kirim informasi versi/update resmi ke channel pilihan di server owner bot.",
+        color=discord.Color.blurple(),
+    ).add_field(
+        name="Versi Bot",
+        value=f"**v{APP_VERSION}** • schema **{CURRENT_SCHEMA_VERSION}**",
+        inline=False,
+    ).add_field(
+        name="Channel Update",
+        value=channel_text,
+        inline=False,
+    ).add_field(
+        name="Auto Info Versi",
+        value=f"{auto_text}\nTerakhir diumumkan: **{last_version}**",
+        inline=False,
+    ).add_field(
+        name="Riwayat Terbaru",
+        value=history,
+        inline=False,
+    )
+
+
+async def send_bot_update_announcement(version: str, title: str, body: str,
+                                       actor_id: int | None = None,
+                                       automatic: bool = False):
+    channel, error = bot_update_target_channel()
+    if error:
+        return False, error, None
+    embed = bot_update_embed(version, title, body, automatic=automatic)
+    try:
+        message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        record_bot_update_history(
+            version, title, body, channel.id, actor_id, automatic,
+            "sent", message_id=message.id
+        )
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE bot_update_settings
+                SET last_announced_version=?, pending_version=NULL, pending_since=NULL,
+                    updated_by=COALESCE(?,updated_by), updated_at=?
+                WHERE id=1
+            """, (str(version).strip().lstrip("vV"), actor_id, int(time.time())))
+            conn.commit()
+        return True, None, message
+    except Exception as exc:
+        try:
+            record_bot_update_history(
+                version, title, body, channel.id, actor_id, automatic,
+                "failed", error=f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
+        return False, f"{type(exc).__name__}: {exc}", None
+
+
+async def announce_current_version_if_needed():
+    settings = get_bot_update_settings()
+    if not bool(settings.get("auto_announce")):
+        return
+    if not settings.get("channel_id"):
+        return
+    current = APP_VERSION.strip().lstrip("vV")
+    if str(settings.get("last_announced_version") or "").strip().lstrip("vV") == current:
+        return
+    now = int(time.time())
+    pending = str(settings.get("pending_version") or "").strip().lstrip("vV")
+    pending_since = int(settings.get("pending_since") or 0)
+    if pending == current and pending_since and now - pending_since < 600:
+        return
+    try:
+        with closing(db()) as conn:
+            conn.execute("""
+                UPDATE bot_update_settings
+                SET pending_version=?, pending_since=?, updated_at=?
+                WHERE id=1
+            """, (current, now, now))
+            conn.commit()
+        body = (
+            f"Hi Notifku telah diperbarui ke **v{current}**.\n\n"
+            "Pembaruan versi ini membawa penyempurnaan fitur, stabilitas, dan keamanan sistem. "
+            "Detail perubahan dapat diumumkan kembali oleh Global Owner melalui menu **Update Info**."
+        )
+        ok, error, _ = await send_bot_update_announcement(
+            current, "Hi Notifku Diperbarui", body, actor_id=None, automatic=True
+        )
+        if not ok:
+            with closing(db()) as conn:
+                conn.execute("""
+                    UPDATE bot_update_settings
+                    SET pending_version=NULL,pending_since=NULL,updated_at=?
+                    WHERE id=1 AND pending_version=?
+                """, (int(time.time()), current))
+                conn.commit()
+            log.warning("Auto update announcement gagal: %s", error)
+    except Exception:
+        log.exception("Auto update announcement error")
+
+
+class OwnerUpdateChannelModal(discord.ui.Modal, title="Pilih Channel Update"):
+    channel_id_input = discord.ui.TextInput(
+        label="Channel ID",
+        placeholder="Contoh: 123456789012345678",
+        max_length=24,
+    )
+    auto_input = discord.ui.TextInput(
+        label="Auto info versi baru?",
+        placeholder="ya / tidak",
+        default="ya",
+        max_length=8,
+    )
+
+    def __init__(self, viewer_id: int):
+        super().__init__()
+        self.viewer_id = int(viewer_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "server_admin"):
+            return
+        if not REQUIRED_GUILD_ID:
+            await safe_reply(interaction, "❌ `REQUIRED_GUILD_ID` belum diisi. Server owner bot belum ditentukan.")
+            return
+        raw = str(self.channel_id_input.value).strip().replace("<#", "").replace(">", "")
+        if not raw.isdigit():
+            await safe_reply(interaction, "❌ Channel ID tidak valid.")
+            return
+        guild = bot.get_guild(int(REQUIRED_GUILD_ID))
+        if not guild:
+            await safe_reply(interaction, "❌ Bot tidak menemukan server owner bot dari `REQUIRED_GUILD_ID`.")
+            return
+        channel = guild.get_channel(int(raw))
+        if not isinstance(channel, discord.TextChannel):
+            await safe_reply(interaction, "❌ Channel harus text/announcement channel di server owner bot.")
+            return
+        me = guild.me
+        perms = channel.permissions_for(me) if me else None
+        if not perms or not (perms.view_channel and perms.send_messages and perms.embed_links):
+            await safe_reply(interaction, "❌ Bot belum punya izin View Channel + Send Messages + Embed Links di channel tersebut.")
+            return
+        auto = str(self.auto_input.value).strip().lower() in {"ya", "yes", "y", "1", "true", "aktif", "on"}
+        set_bot_update_channel(channel.id, interaction.user.id, auto_announce=auto)
+        await interaction.response.edit_message(
+            embed=owner_update_center_embed(),
+            view=OwnerUpdateCenterView(self.viewer_id)
+        )
+
+
+class OwnerUpdateAnnouncementModal(discord.ui.Modal):
+    def __init__(self, viewer_id: int):
+        super().__init__(title="Kirim Info Update")
+        self.viewer_id = int(viewer_id)
+        self.version_input = discord.ui.TextInput(
+            label="Versi",
+            default=APP_VERSION,
+            max_length=32,
+        )
+        self.title_input = discord.ui.TextInput(
+            label="Judul",
+            default="Update Hi Notifku",
+            max_length=100,
+        )
+        self.body_input = discord.ui.TextInput(
+            label="Isi update",
+            placeholder="• Fitur baru ...\n• Perbaikan ...\n• Peningkatan stabilitas ...",
+            style=discord.TextStyle.paragraph,
+            max_length=3500,
+        )
+        self.add_item(self.version_input)
+        self.add_item(self.title_input)
+        self.add_item(self.body_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id or not await require_owner_level(interaction, "server_admin"):
+            return
+        version = str(self.version_input.value).strip().lstrip("vV") or APP_VERSION
+        title = str(self.title_input.value).strip() or "Update Hi Notifku"
+        body = str(self.body_input.value).strip()
+        if not body:
+            await safe_reply(interaction, "❌ Isi update tidak boleh kosong.")
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, error, message = await send_bot_update_announcement(
+            version, title, body, actor_id=interaction.user.id, automatic=False
+        )
+        if not ok:
+            await interaction.followup.send(f"❌ Gagal mengirim update: {error}", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"✅ Update **v{version}** dikirim ke <#{message.channel.id}>.",
+            ephemeral=True,
+        )
+
+
+class OwnerUpdateCenterView(OwnerBasicBackView):
+    async def valid(self, interaction, minimum="read_only"):
+        if int(interaction.user.id) != self.viewer_id:
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return False
+        return await require_owner_level(interaction, minimum)
+
+    @discord.ui.button(label="Set Channel", emoji="📍", style=discord.ButtonStyle.primary, row=0)
+    async def set_channel(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.send_modal(OwnerUpdateChannelModal(self.viewer_id))
+
+    @discord.ui.button(label="Kirim Update", emoji="📢", style=discord.ButtonStyle.success, row=0)
+    async def send_update(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        channel, error = bot_update_target_channel()
+        if error:
+            await safe_reply(interaction, f"❌ {error}")
+            return
+        await interaction.response.send_modal(OwnerUpdateAnnouncementModal(self.viewer_id))
+
+    @discord.ui.button(label="Test Channel", emoji="🧪", style=discord.ButtonStyle.secondary, row=0)
+    async def test_channel(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        channel, error = bot_update_target_channel()
+        if error:
+            await safe_reply(interaction, f"❌ {error}")
+            return
+        try:
+            await channel.send(
+                embed=discord.Embed(
+                    title="✅ Test Channel Update",
+                    description=f"Channel ini siap menerima info update **Hi Notifku v{APP_VERSION}**.",
+                    color=discord.Color.green(),
+                ),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await safe_reply(interaction, f"✅ Test berhasil dikirim ke {channel.mention}.")
+        except Exception as exc:
+            await safe_reply(interaction, f"❌ Test gagal: `{type(exc).__name__}: {exc}`")
+
+    @discord.ui.button(label="Auto Versi", emoji="🤖", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_auto(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        enabled = toggle_bot_update_auto(interaction.user.id)
+        await interaction.response.edit_message(
+            embed=owner_update_center_embed(),
+            view=OwnerUpdateCenterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=owner_update_center_embed(),
+            view=OwnerUpdateCenterView(self.viewer_id)
+        )
+
+
 class OwnerOpsHomeView(discord.ui.View):
     def __init__(self, viewer_id: int):
         super().__init__(timeout=900)
@@ -26785,6 +27474,15 @@ class OwnerOpsHomeView(discord.ui.View):
         await interaction.response.edit_message(
             embed=dead_letter_embed(),
             view=OwnerDeadLetterView(self.viewer_id)
+        )
+
+    @discord.ui.button(label="Update Info", emoji="📢", style=discord.ButtonStyle.secondary, row=3)
+    async def update_info(self, interaction, button):
+        if not await self.valid(interaction, "server_admin"):
+            return
+        await interaction.response.edit_message(
+            embed=owner_update_center_embed(),
+            view=OwnerUpdateCenterView(self.viewer_id)
         )
 
     @discord.ui.button(label="Advanced", emoji="⚙️", style=discord.ButtonStyle.primary, row=4)
@@ -27948,6 +28646,9 @@ class OwnerHomeView(discord.ui.View):
 class BackHomeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_global_owner(interaction)
 
     @discord.ui.button(label="Menu Awal", emoji="🏠", style=discord.ButtonStyle.secondary)
     async def home(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -31195,10 +31896,27 @@ async def on_message(message: discord.Message):
                 for owner_id in primary_owner_ids():
                     try:
                         owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
-                        await owner.send(
-                            embed=embed,
-                            view=PremiumOrderManageView(int(order["id"]))
-                        )
+                        local_path = str(updated_order["proof_storage_path"] or "") if "proof_storage_path" in updated_order.keys() else ""
+                        if local_path and Path(local_path).exists():
+                            filename = Path(local_path).name
+                            owner_embed = premium_order_embed(updated_order)
+                            owner_embed.title = f"📎 Bukti Pembayaran #{order['id']}"
+                            owner_embed.description = (
+                                f"Bukti pembayaran baru dari <@{message.author.id}>.\n"
+                                f"{payment_proof_scan_label(updated_order)}\n"
+                                "⚠️ Screening otomatis hanya pemeriksaan teknis. Cocokkan gambar dan nominal sebelum aktivasi."
+                            )
+                            owner_embed.set_image(url=f"attachment://{filename}")
+                            await owner.send(
+                                file=discord.File(local_path, filename=filename),
+                                embed=owner_embed,
+                                view=PremiumOrderManageView(int(order["id"]))
+                            )
+                        else:
+                            await owner.send(
+                                embed=embed,
+                                view=PremiumOrderManageView(int(order["id"]))
+                            )
                     except Exception:
                         log.exception(
                             "Gagal meneruskan bukti pembayaran ke owner_id=%s",
@@ -31936,6 +32654,11 @@ async def on_ready():
         await notify_startup_integrity()
     except Exception:
         log.exception("Startup integrity check gagal")
+
+    try:
+        await announce_current_version_if_needed()
+    except Exception:
+        log.exception("Auto info update versi gagal")
 
     try:
         await start_payment_webhook_server()
