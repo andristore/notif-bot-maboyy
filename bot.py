@@ -47,8 +47,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
-APP_VERSION = "1.23.0"
-CURRENT_SCHEMA_VERSION = 34
+APP_VERSION = "1.24.0"
+CURRENT_SCHEMA_VERSION = 35
 GIT_COMMIT = (
     os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
     or os.getenv("GIT_COMMIT", "")
@@ -129,6 +129,13 @@ DB_HEALTH_CHECK_HOURS = max(
     1,
     min(24, int(os.getenv("DB_HEALTH_CHECK_HOURS", "6")))
 )
+# v1.24 Railway resource protection + anti-abuse burst guard.
+RESOURCE_GUARD_MINUTES = max(1, min(30, int(os.getenv("RESOURCE_GUARD_MINUTES", "5"))))
+MEMORY_WARN_MB = max(128, int(os.getenv("MEMORY_WARN_MB", "400")))
+MEMORY_CRITICAL_MB = max(MEMORY_WARN_MB + 32, int(os.getenv("MEMORY_CRITICAL_MB", "480")))
+WAL_WARN_MB = max(16, int(os.getenv("WAL_WARN_MB", "64")))
+USER_BURST_LIMIT = max(3, min(30, int(os.getenv("USER_BURST_LIMIT", "8"))))
+USER_BURST_WINDOW_SECONDS = max(5, min(120, int(os.getenv("USER_BURST_WINDOW_SECONDS", "15"))))
 VERIFICATION_WARNING_DAYS = max(
     1,
     min(14, int(os.getenv("VERIFICATION_WARNING_DAYS", "7")))
@@ -255,7 +262,9 @@ STARTED_AT = int(time.time())
 pending_qris_uploads = {}
 
 user_action_cooldowns = {}
+user_burst_events = {}
 pending_restore_previews = {}
+RESOURCE_ALERT_LAST_AT = 0
 
 notification_send_semaphore = asyncio.Semaphore(NOTIFICATION_SEND_CONCURRENCY)
 SAFE_MODE = False
@@ -270,6 +279,9 @@ runtime_metrics = {
     "checker_runs": 0,
     "checker_errors": 0,
     "last_loop_lag_ms": 0.0,
+    "memory_rss_mb": 0.0,
+    "resource_guard_runs": 0,
+    "resource_warnings": 0,
 }
 
 
@@ -1636,6 +1648,11 @@ def migrate_database():
             conn.execute("DROP TABLE hosts")
             conn.execute("ALTER TABLE hosts_social_v2 RENAME TO hosts")
 
+        # v1.24 host observability fields. Added after any legacy table rebuild.
+        add_column_if_missing(conn, "hosts", "last_success_at", "INTEGER")
+        add_column_if_missing(conn, "hosts", "last_live_at", "INTEGER")
+        add_column_if_missing(conn, "hosts", "last_notification_at", "INTEGER")
+
         if not table_exists(conn, "social_content_state"):
             conn.execute("""
                 CREATE TABLE social_content_state (
@@ -2155,6 +2172,32 @@ def migrate_database():
                 int(customer["total_spent"] or 0), int(last_row["order_id"]),
                 "active" if active_now else "expired", int(time.time())
             ))
+
+        # v1.24 operational telemetry. Kept compact by maintenance cleanup.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS resource_health_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rss_mb REAL NOT NULL DEFAULT 0,
+                db_mb REAL NOT NULL DEFAULT 0,
+                wal_mb REAL NOT NULL DEFAULT 0,
+                queue_count INTEGER NOT NULL DEFAULT 0,
+                dead_letter_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'ok',
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_resource_health_created ON resource_health_log(created_at DESC)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                guild_id INTEGER,
+                event_type TEXT NOT NULL,
+                detail TEXT,
+                created_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_security_events_created ON security_events(created_at DESC)")
 
         # Owner update announcement center (support/owner server only)
         conn.execute("""
@@ -3648,11 +3691,12 @@ def set_host_health(
             conn.execute("""
                 UPDATE hosts SET
                     last_check=?,
+                    last_success_at=?,
                     last_error=NULL,
                     error_count=0,
                     cooldown_until=NULL
                 WHERE id=?
-            """, (now, host_id))
+            """, (now, now, host_id))
         else:
             errors = int(row["error_count"] or 0) + 1
             cooldown = None
@@ -3740,6 +3784,11 @@ def update_live_state(
             int(is_live),
             live_key
         ))
+        if is_live:
+            conn.execute(
+                "UPDATE hosts SET last_live_at=? WHERE guild_id=? AND platform=? AND target=?",
+                (int(time.time()), int(guild_id), str(platform), str(target))
+            )
         conn.commit()
 
 
@@ -7907,10 +7956,31 @@ OWNER_ROLE_LEVELS = {
 }
 
 
+def log_security_event(user_id: Optional[int], event_type: str, detail: str, guild_id: Optional[int] = None):
+    try:
+        with closing(db()) as conn:
+            conn.execute(
+                "INSERT INTO security_events(user_id,guild_id,event_type,detail,created_at) VALUES(?,?,?,?,?)",
+                (int(user_id) if user_id else None, int(guild_id) if guild_id else None, str(event_type)[:80], str(detail)[:1000], int(time.time()))
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def action_rate_limited(user_id: int, action: str) -> bool:
     now = time.time()
-    key = (int(user_id), str(action))
+    uid = int(user_id)
+    key = (uid, str(action))
     last = user_action_cooldowns.get(key, 0.0)
+
+    # Burst guard catches rapid button/action spam across different actions.
+    events = [ts for ts in user_burst_events.get(uid, []) if now - ts <= USER_BURST_WINDOW_SECONDS]
+    events.append(now)
+    user_burst_events[uid] = events[-(USER_BURST_LIMIT + 3):]
+    if len(events) > USER_BURST_LIMIT:
+        log_security_event(uid, "burst_rate_limit", f"action={action}; count={len(events)}")
+        return True
 
     if now - last < USER_RATE_LIMIT_SECONDS:
         return True
@@ -8527,6 +8597,19 @@ def make_error_id() -> str:
     return f"E{int(time.time()) % 1000000:06d}{os.urandom(2).hex().upper()}"
 
 
+def redact_secrets(value) -> str:
+    text = str(value or "")
+    secret_values = [DISCORD_TOKEN, YOUTUBE_API_KEY, PAYMENT_WEBHOOK_SECRET, BACKUP_ENCRYPTION_PASSWORD, AUDIT_WEBHOOK_URL]
+    for secret in secret_values:
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "[REDACTED]")
+    # Discord bot tokens commonly have dot-separated token segments.
+    import re
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*(?:bot\s+)?)\S+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(token|secret|api[_-]?key|password)(\s*[:=]\s*)[^\s,;]+", r"\1\2[REDACTED]", text)
+    return text
+
+
 async def report_interaction_error(
     interaction: Optional[discord.Interaction],
     error: Exception,
@@ -8542,14 +8625,14 @@ async def report_interaction_error(
         exc_info=(type(error), error, error.__traceback__)
     )
     try:
-        tb_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))[-12000:]
+        tb_text = redact_secrets("".join(traceback.format_exception(type(error), error, error.__traceback__))[-12000:])
         user_id = int(interaction.user.id) if interaction and interaction.user else None
         guild_id = int(interaction.guild_id) if interaction and interaction.guild_id else None
         with closing(db()) as conn:
             if table_exists(conn, "interaction_errors"):
                 conn.execute(
                     "INSERT OR REPLACE INTO interaction_errors(error_id,context,user_id,guild_id,error_type,message,traceback,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (error_id, str(context)[:300], user_id, guild_id, type(error).__name__[:120], str(error)[:2000], tb_text, int(time.time()))
+                    (error_id, str(context)[:300], user_id, guild_id, type(error).__name__[:120], redact_secrets(error)[:2000], tb_text, int(time.time()))
                 )
                 conn.commit()
     except Exception:
@@ -8570,7 +8653,7 @@ async def report_interaction_error(
             await user.send(
                 "🚨 **Hi Notifku Error** `" + error_id + "`\n"
                 "Konteks: `" + context + "`\n"
-                "`" + type(error).__name__ + ": " + str(error)[:1200] + "`"
+                "`" + type(error).__name__ + ": " + redact_secrets(error)[:1200] + "`"
             )
         except Exception:
             pass
@@ -8727,7 +8810,7 @@ async def audit_webhook(
         "🧾 **" + action + "**\n"
         "Actor: `" + str(actor_id or "-") + "` • "
         "Guild: `" + str(guild_id or "-") + "`\n"
-        + detail[:1500]
+        + redact_secrets(detail)[:1500]
     )
 
     try:
@@ -10060,21 +10143,30 @@ def reset_host_error_state(host_id: int):
 
 def host_health_score(host) -> int:
     score = 100
+    now = int(time.time())
 
     if not host["enabled"]:
         score -= 20
 
     errors = int(host["error_count"] or 0)
-    score -= min(60, errors * 8)
+    score -= min(55, errors * 8)
 
     if host["last_error"]:
         score -= 15
 
-    if (
-        host["cooldown_until"]
-        and int(host["cooldown_until"]) > int(time.time())
-    ):
+    if host["cooldown_until"] and int(host["cooldown_until"]) > now:
         score -= 15
+
+    # A host that has not been checked for a long time is degraded even when
+    # no explicit exception was recorded. New hosts are not penalized.
+    last_check = int(host["last_check"] or 0)
+    if last_check:
+        expected = max(60, int(host["check_interval"] or DEFAULT_CHECK_INTERVAL))
+        age = now - last_check
+        if age > max(1800, expected * 8):
+            score -= 20
+        elif age > max(900, expected * 4):
+            score -= 10
 
     return max(0, min(100, score))
 
@@ -10800,6 +10892,11 @@ def record_notification_history(
             json.dumps(embed.to_dict(), ensure_ascii=False) if embed else None,
             int(time.time())
         ))
+        if host_id is not None and str(status).lower() == "sent":
+            conn.execute(
+                "UPDATE hosts SET last_notification_at=? WHERE id=?",
+                (int(time.time()), int(host_id))
+            )
         conn.commit()
 
 
@@ -11170,6 +11267,21 @@ def build_tiktok_live_embed(host, username: str, data: Optional[dict] = None, *,
     else:
         embed.set_author(name=author_name[:256], url=profile_url)
 
+    live_since = data.get("timestamp")
+    viewers = data.get("concurrent_view_count")
+    status_parts = ["🔴 **LIVE SEKARANG**"]
+    if viewers not in (None, ""):
+        try:
+            status_parts.append(f"👥 **{int(viewers):,}** penonton".replace(",", "."))
+        except Exception:
+            pass
+    embed.add_field(name="Status", value=" • ".join(status_parts), inline=False)
+    if live_since:
+        try:
+            embed.add_field(name="Mulai LIVE", value=f"<t:{int(live_since)}:R>", inline=True)
+        except Exception:
+            pass
+    embed.set_footer(text=f"Hi Notifku • TikTok LIVE • v{APP_VERSION}")
     return embed
 
 
@@ -12044,6 +12156,8 @@ def _tiktok_live_fallback_sync(username: str):
         or f"https://www.tiktok.com/@{username}/live",
         "thumbnail": thumbnail,
         "uploader": info.get("uploader") or info.get("channel") or info.get("creator"),
+        "timestamp": info.get("timestamp") or info.get("release_timestamp"),
+        "concurrent_view_count": info.get("concurrent_view_count") or info.get("view_count"),
     }
 
 
@@ -15544,31 +15658,30 @@ def owner_risk_embed():
 
 def owner_backup_center_embed():
     last_at = last_successful_auto_backup_at()
-    due = (
-        int(last_at) + int(AUTO_BACKUP_HOURS * 3600)
-        if last_at else None
-    )
+    due = int(last_at) + int(AUTO_BACKUP_HOURS * 3600) if last_at else None
+    integrity_text = "Belum ada file backup"
+    backup_count = 0
+    try:
+        folder = Path(AUTO_BACKUP_DIR)
+        files = sorted(folder.glob("hi-notifku-auto-*.json"), key=lambda x: x.stat().st_mtime, reverse=True) if folder.exists() else []
+        backup_count = len(files)
+        if files:
+            payload = json.loads(files[0].read_text(encoding="utf-8"))
+            ok, detail = verify_backup_payload(payload)
+            integrity_text = f"{'✅ VALID' if ok else '❌ INVALID'} • {str(detail)[:120]}"
+    except Exception as exc:
+        integrity_text = f"⚠️ Tidak dapat diverifikasi • {type(exc).__name__}"
 
-    return discord.Embed(
-        title="🗄️ Backup Center",
-        description=(
-            "Backup manual **tidak mengubah jadwal auto backup 48 jam**."
-        ),
+    embed = discord.Embed(
+        title="🗄️ Backup & Recovery Center v3",
+        description="Backup manual tidak mengubah jadwal auto backup. Restore tetap melalui preview + konfirmasi.",
         color=discord.Color.blurple()
-    ).add_field(
-        name="Auto Backup",
-        value=(
-            f"Terakhir: {f'<t:{last_at}:R>' if last_at else 'belum ada'}\n"
-            f"Berikutnya: {f'<t:{due}:R>' if due else 'menunggu backup pertama'}"
-        ),
-        inline=False
-    ).add_field(
-        name="Storage",
-        value=f"`{AUTO_BACKUP_DIR}`",
-        inline=False
     )
-
-
+    embed.add_field(name="Auto Backup", value=f"Terakhir: {f'<t:{last_at}:R>' if last_at else 'belum ada'}\nBerikutnya: {f'<t:{due}:R>' if due else 'menunggu backup pertama'}", inline=False)
+    embed.add_field(name="Integrity Terbaru", value=integrity_text, inline=False)
+    embed.add_field(name="Storage", value=f"`{AUTO_BACKUP_DIR}`\nFile auto backup: **{backup_count}/{AUTO_BACKUP_KEEP}**", inline=False)
+    embed.add_field(name="Proteksi Restore", value="✅ SHA-256 checksum • Preview sebelum restore • Backup rusak ditolak • Database lama tidak dihapus otomatis", inline=False)
+    return embed
 
 
 def release_info_text() -> str:
@@ -15589,10 +15702,59 @@ def schema_history_rows(limit: int = 10):
         """, (max(1, min(50, int(limit))),)).fetchall()
 
 
+def current_rss_mb() -> float:
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8", errors="ignore")
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                return round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    return 0.0
+
+
+def resource_snapshot() -> dict:
+    storage = sqlite_storage_stats()
+    rss = current_rss_mb()
+    pending = 0
+    dlq = 0
+    try:
+        with closing(db()) as conn:
+            pending = int(conn.execute("SELECT COUNT(*) FROM pending_notifications").fetchone()[0] or 0)
+            dlq = int(conn.execute("SELECT COUNT(*) FROM notification_dead_letter WHERE resolved_at IS NULL").fetchone()[0] or 0)
+    except Exception:
+        pass
+    status = "critical" if rss >= MEMORY_CRITICAL_MB else "warning" if rss >= MEMORY_WARN_MB else "ok"
+    return {
+        "rss_mb": rss,
+        "db_mb": round(storage["db_bytes"] / 1024 / 1024, 1),
+        "wal_mb": round(storage["wal_bytes"] / 1024 / 1024, 1),
+        "pending": pending,
+        "dlq": dlq,
+        "status": status,
+    }
+
+
+def record_resource_snapshot(snapshot: dict):
+    try:
+        with closing(db()) as conn:
+            conn.execute(
+                "INSERT INTO resource_health_log(rss_mb,db_mb,wal_mb,queue_count,dead_letter_count,status,created_at) VALUES(?,?,?,?,?,?,?)",
+                (snapshot["rss_mb"], snapshot["db_mb"], snapshot["wal_mb"], snapshot["pending"], snapshot["dlq"], snapshot["status"], int(time.time()))
+            )
+            # Keep telemetry small: 14 days is enough for diagnostics.
+            conn.execute("DELETE FROM resource_health_log WHERE created_at<?", (int(time.time()) - 14 * 86400,))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def owner_home_embed():
     free_count = len(guilds_by_plan("free"))
     premium_count = len(guilds_by_plan("premium"))
     stats = global_access_stats()
+    notif, _ = global_notification_stats()
+    resource = resource_snapshot()
 
     hosts = []
     for guild in bot.guilds:
@@ -15602,45 +15764,45 @@ def owner_home_embed():
             pass
 
     errors = sum(1 for host in hosts if host["last_error"])
+    live_count = 0
+    platform_counts = {}
+    for host in hosts:
+        platform = str(host["platform"])
+        platform_counts[platform] = platform_counts.get(platform, 0) + 1
+        try:
+            state = get_live_state(int(host["guild_id"]), platform, str(host["target"]))
+            live_count += 1 if state and int(state["is_live"] or 0) else 0
+        except Exception:
+            pass
 
+    try:
+        with closing(db()) as conn:
+            trial_active = int(conn.execute("SELECT COUNT(*) FROM premium_trials WHERE status='active' AND expires_at>?", (int(time.time()),)).fetchone()[0] or 0)
+    except Exception:
+        trial_active = 0
+
+    member_ids = set()
+    for guild in bot.guilds:
+        for member in getattr(guild, "members", []):
+            if not getattr(member, "bot", False):
+                member_ids.add(int(member.id))
+
+    memory_icon = "🔴" if resource["status"] == "critical" else "🟡" if resource["status"] == "warning" else "🟢"
     embed = discord.Embed(
         title="🛡️ Hi Notifku • Global Owner",
-        description="Panel utama administrasi bot.",
-        color=discord.Color.blue()
+        description=f"Control Center v2 • **v{APP_VERSION}**",
+        color=discord.Color.blue() if resource["status"] == "ok" else discord.Color.orange()
     )
-    embed.add_field(
-        name="Server",
-        value=(
-            f"**{len(bot.guilds)}** total • 🆓 **{free_count}** • ⭐ **{premium_count}**"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Notifier",
-        value=(
-            f"Host **{len(hosts)}** • Error **{errors}** • Ping **{round(bot.latency * 1000)} ms**"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Akses",
-        value=(
-            f"Owner **{stats['global_owners']}** • Server Owner **{stats['server_owners']}** • "
-            f"Manager **{stats['host_managers']}**"
-        ),
-        inline=False
-    )
-    embed.add_field(
-        name="Status",
-        value=(
-            f"Request Manager **{stats['pending_access']}** • Host **{stats['pending_hosts']}** • "
-            f"Uptime <t:{STARTED_AT}:R>"
-        ),
-        inline=False
-    )
-    embed.set_footer(
-        text=f"v{APP_VERSION} • schema {CURRENT_SCHEMA_VERSION} • /owner • DM only"
-    )
+    embed.add_field(name="Server & User", value=f"Server **{len(bot.guilds)}** • User **{len(member_ids)}**\n🆓 **{free_count}** • ⭐ **{premium_count}** • 🎁 Trial **{trial_active}**", inline=True)
+    embed.add_field(name="Host", value=f"Total **{len(hosts)}** • 🔴 LIVE **{live_count}**\nError **{errors}** • Ping **{round(bot.latency * 1000)} ms**", inline=True)
+    embed.add_field(name="Notifikasi 24 Jam", value=f"✅ **{int(notif['sent'] or 0)}** • ❌ **{int(notif['failed'] or 0)}**\nQueue **{resource['pending']}** • DLQ **{resource['dlq']}**", inline=True)
+    embed.add_field(name="Resource Railway", value=f"{memory_icon} RAM **{resource['rss_mb']:.1f} MB**\nDB **{resource['db_mb']:.1f} MB** • WAL **{resource['wal_mb']:.1f} MB**", inline=True)
+    embed.add_field(name="Akses", value=f"Owner **{stats['global_owners']}** • Server Owner **{stats['server_owners']}** • Manager **{stats['host_managers']}**", inline=True)
+    platform_text = " • ".join(f"{platform_icon(k)} {v}" for k,v in sorted(platform_counts.items())) or "Belum ada host"
+    embed.add_field(name="Platform", value=platform_text[:1024], inline=True)
+    last_backup = last_successful_auto_backup_at()
+    embed.add_field(name="Operasional", value=f"Backup **{f'<t:{last_backup}:R>' if last_backup else 'belum ada'}** • Uptime <t:{STARTED_AT}:R>\nRequest **{stats['pending_access']}** • Pending Host **{stats['pending_hosts']}**", inline=False)
+    embed.set_footer(text=f"schema {CURRENT_SCHEMA_VERSION} • /owner • DM only")
     return embed
 
 def server_embed(guild: discord.Guild):
@@ -21903,10 +22065,17 @@ def host_manager_detail_embed(host, user_id: int):
         inline=False
     )
     health_icon, health_text = host_health_label(host)
+    score = host_health_score(host)
     embed.add_field(
         name="Health",
-        value=f"{health_icon} **{health_text}**",
-        inline=True
+        value=(
+            f"{health_icon} **{health_text} • {score}/100**\n"
+            f"Check: {fmt_time(host['last_check'])}\n"
+            f"Sukses: {fmt_time(host['last_success_at'])}\n"
+            f"LIVE: {fmt_time(host['last_live_at'])}\n"
+            f"Notif: {fmt_time(host['last_notification_at'])}"
+        ),
+        inline=False
     )
     embed.add_field(
         name="Permission",
@@ -22164,7 +22333,11 @@ def host_manager_readonly_detail_embed(
     embed.add_field(
         name="Monitor",
         value=(
+            f"Health: **{host_health_score(host)}/100**\n"
             f"Last check: {fmt_time(host['last_check'])}\n"
+            f"Last success: {fmt_time(host['last_success_at'])}\n"
+            f"Last LIVE: {fmt_time(host['last_live_at'])}\n"
+            f"Last notif: {fmt_time(host['last_notification_at'])}\n"
             f"Error: **{host['error_count'] or 0}**"
         ),
         inline=False
@@ -28431,6 +28604,15 @@ def owner_system_health_embed():
         ),
         inline=False
     )
+    resource = resource_snapshot()
+    embed.add_field(
+        name="Railway Resource Guard",
+        value=(
+            f"RAM **{resource['rss_mb']:.1f} MB** • DB **{resource['db_mb']:.1f} MB** • WAL **{resource['wal_mb']:.1f} MB**\n"
+            f"Status **{resource['status'].upper()}** • Guard tiap **{RESOURCE_GUARD_MINUTES} menit**"
+        ),
+        inline=False
+    )
     embed.set_footer(text=release_info_text())
     return embed
 
@@ -28548,7 +28730,63 @@ class OwnerSelfTestView(OwnerBasicBackView):
         )
 
 
+class OwnerNotificationHistorySelect(discord.ui.Select):
+    def __init__(self, viewer_id: int):
+        self.viewer_id = int(viewer_id)
+        _, rows = global_notification_stats()
+        options = []
+        for row in rows[:20]:
+            label = str(row["display_name"] or row["target"] or f"Host {row['host_id']}")[:60]
+            status = "SENT" if row["status"] == "sent" else "FAILED" if row["status"] == "failed" else str(row["status"]).upper()
+            options.append(discord.SelectOption(label=f"{status} • {label}"[:100], value=str(row["id"]), description=str(row["event_type"] or "notification")[:100]))
+        if not options:
+            options = [discord.SelectOption(label="Belum ada history", value="0")]
+        super().__init__(placeholder="Pilih notifikasi untuk detail/resend...", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if int(interaction.user.id) != self.viewer_id or not is_global_owner(interaction.user.id):
+            await safe_reply(interaction, "🔒 Panel ini bukan milikmu.")
+            return
+        record_id = int(self.values[0])
+        if not record_id:
+            await safe_reply(interaction, "Belum ada history.")
+            return
+        row = get_notification_record(record_id)
+        if not row:
+            await safe_reply(interaction, "❌ History tidak ditemukan.")
+            return
+        embed = discord.Embed(title=f"🧾 Notification #{record_id}", color=discord.Color.green() if row["status"] == "sent" else discord.Color.orange())
+        embed.description = f"Status **{row['status']}**\nEvent **{row['event_type']}**\nHost **#{row['host_id']}**\nChannel `{row['channel_id'] or '-'}`\nLatency **{row['latency_ms'] or 0} ms**\n<t:{int(row['created_at'])}:F>"
+        await interaction.response.edit_message(embed=embed, view=OwnerNotificationDetailView(self.viewer_id, record_id))
+
+
+class OwnerNotificationDetailView(OwnerBasicBackView):
+    def __init__(self, viewer_id: int, record_id: int):
+        super().__init__(viewer_id)
+        self.record_id = int(record_id)
+
+    @discord.ui.button(label="Kirim Ulang", emoji="🔁", style=discord.ButtonStyle.primary, row=0)
+    async def resend(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        if action_rate_limited(interaction.user.id, f"owner_resend:{self.record_id}"):
+            await safe_reply(interaction, "⏳ Tunggu sebentar sebelum kirim ulang.")
+            return
+        ok = await resend_notification_record(self.record_id)
+        add_activity(None, interaction.user.id, "Owner Resend Notification", f"record_id={self.record_id}; ok={ok}")
+        await safe_reply(interaction, "✅ Notifikasi dikirim ulang." if ok else "❌ Gagal mengirim ulang.")
+
+    @discord.ui.button(label="Notification Center", emoji="🔔", style=discord.ButtonStyle.secondary, row=0)
+    async def center(self, interaction, button):
+        if not await self.valid(interaction):
+            return
+        await interaction.response.edit_message(embed=owner_notification_center_embed(), view=OwnerNotificationCenterView(self.viewer_id))
+
+
 class OwnerNotificationCenterView(OwnerBasicBackView):
+    def __init__(self, viewer_id: int):
+        super().__init__(viewer_id)
+        self.add_item(OwnerNotificationHistorySelect(viewer_id))
     @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def refresh(self, interaction, button):
         if not await self.valid(interaction):
@@ -28623,6 +28861,12 @@ def diagnostic_bundle_bytes() -> bytes:
         "smart_live_confirmations": SMART_LIVE_CONFIRMATIONS,
         "notification_claim_timeout_seconds": NOTIFICATION_CLAIM_TIMEOUT_SECONDS,
         "db_health_check_hours": DB_HEALTH_CHECK_HOURS,
+        "resource_guard_minutes": RESOURCE_GUARD_MINUTES,
+        "memory_warn_mb": MEMORY_WARN_MB,
+        "memory_critical_mb": MEMORY_CRITICAL_MB,
+        "wal_warn_mb": WAL_WARN_MB,
+        "user_burst_limit": USER_BURST_LIMIT,
+        "resource_snapshot": resource_snapshot(),
     }
 
     loops = {
@@ -33927,6 +34171,51 @@ async def on_ready():
     if not runtime_heartbeat_loop.is_running():
         runtime_heartbeat_loop.start()
 
+    if not resource_guard_loop.is_running():
+        resource_guard_loop.start()
+
+
+@tasks.loop(minutes=RESOURCE_GUARD_MINUTES)
+async def resource_guard_loop():
+    global RESOURCE_ALERT_LAST_AT
+    snapshot = resource_snapshot()
+    runtime_metrics["memory_rss_mb"] = snapshot["rss_mb"]
+    runtime_metrics["resource_guard_runs"] += 1
+    record_resource_snapshot(snapshot)
+
+    # Large WAL files are checkpointed proactively. This is safe and does not
+    # delete the database or user data.
+    if snapshot["wal_mb"] >= WAL_WARN_MB:
+        try:
+            with closing(db()) as conn:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                conn.commit()
+        except Exception:
+            log.exception("Resource guard WAL checkpoint gagal")
+
+    if snapshot["status"] in {"warning", "critical"}:
+        runtime_metrics["resource_warnings"] += 1
+        now = int(time.time())
+        log.warning("Resource guard: RAM %.1f MB, DB %.1f MB, WAL %.1f MB", snapshot["rss_mb"], snapshot["db_mb"], snapshot["wal_mb"])
+        # DM at most once/hour to avoid owner spam.
+        if now - int(RESOURCE_ALERT_LAST_AT or 0) >= 3600:
+            RESOURCE_ALERT_LAST_AT = now
+            for owner_id in primary_owner_ids():
+                try:
+                    user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                    await user.send(
+                        f"{'🔴' if snapshot['status']=='critical' else '🟡'} **Railway Resource Alert**\n"
+                        f"RAM **{snapshot['rss_mb']:.1f} MB** • DB **{snapshot['db_mb']:.1f} MB** • WAL **{snapshot['wal_mb']:.1f} MB**\n"
+                        f"Queue **{snapshot['pending']}** • DLQ **{snapshot['dlq']}**"
+                    )
+                except Exception:
+                    pass
+
+
+@resource_guard_loop.before_loop
+async def before_resource_guard_loop():
+    await bot.wait_until_ready()
+
 
 # ============================================================
 # MAIN
@@ -33978,6 +34267,7 @@ async def main():
             event_cleanup_loop,
             loop_lag_metrics,
             runtime_heartbeat_loop,
+            resource_guard_loop,
         ]
 
         for loop in loops:
